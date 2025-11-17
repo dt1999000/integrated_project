@@ -1,0 +1,13 @@
+v1.0-mini.tgz
+v1.0-trainval_meta.tgz
+v1.0-trainval01_blobs.tgz
+/v1.0-mini
+/v1.0-trainval_meta
+
+detection_comparisons/
+detection_results/
+
+.venv/
+__pycache__/
+
+*.png
