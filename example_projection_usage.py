@@ -5,13 +5,13 @@ Example script showing how to use the 2D to 3D projection with nuScenes dataset.
 import numpy as np
 from nuscenes.nuscenes import NuScenes
 from nuscenes_dataset_loader import NuScenesDatasetLoader
-from pointcloud_projection import Projection2DTo3D, PointCloudVisualizer
+from pointcloud_projection import Projection2DTo3D, PointCloudVisualizer, PointCloud, visualize_image_with_pixels
 from bounding_boxes import BoundingBoxes
 from typing import Optional
 
 
 
-def get_bounding_box_corners(bbox_extractor: BoundingBoxes, sample_token: str, 
+def get_bounding_box_pixels(bbox_extractor: BoundingBoxes, sample_token: str, 
                              camera_channel: str = "CAM_FRONT",
                              max_boxes: Optional[int] = None) -> np.ndarray:
     """
@@ -26,6 +26,7 @@ def get_bounding_box_corners(bbox_extractor: BoundingBoxes, sample_token: str,
     Returns:
         Nx2 array of pixel coordinates (corners of all bounding boxes)
     """
+    bbox_extractor.get_boxes_for_sample(sample_token, camera_channel, max_boxes)
     bb_pixels = bbox_extractor.get_all_bb_pixels(
         sample_token=sample_token,
         camera_channel=camera_channel,
@@ -55,7 +56,8 @@ def main():
     
     # Get first sample
     sample_token = nusc.sample[0]['token']
-    
+    print("Sample token:")
+    print(sample_token)
     print("Loading nuScenes data...")
     dataset_loader = NuScenesDatasetLoader(
         dataroot=dataroot,
@@ -63,27 +65,26 @@ def main():
         verbose=True
     )
     dataset_loader.load_dataset()
-    data = dataset_loader.load_nuscenes_data(sample_token, camera_channel="CAM_FRONT")
+    data = dataset_loader.load_nuscenes_data(sample_token)
+    print(data['image_path'])
     
     # Create visualizer first to remove ground plane
     print("Creating point cloud visualizer and removing ground plane...")
     coord_systems_temp = None  # Will get from projector later
-    visualizer_temp = PointCloudVisualizer(
-        point_cloud=data['point_cloud'],
-        coordinate_systems=coord_systems_temp,
-        remove_ground=True  # Remove ground using RANSAC
-    )
-    
-    # Get ground-removed point cloud
-    filtered_point_cloud = visualizer_temp.point_cloud
-    
+    pointcloud = PointCloud(data['point_cloud'], coordinate_systems=coord_systems_temp)
+
+    visualizer = PointCloudVisualizer(point_cloud=pointcloud)
+    visualizer.visualize_point_cloud(points=None, rays=None, clusters=None, title="Point Cloud original")
+    pointcloud.remove_ground_plane_ransac()
+    visualizer_without_ground = PointCloudVisualizer(point_cloud=pointcloud)
+    visualizer_without_ground.visualize_point_cloud(points=None, rays=None, clusters=None, title="Point Cloud ground removed")
     # Create projection object with ground-removed point cloud
     print("Creating projection object with ground-removed point cloud...")
     projector = Projection2DTo3D(
         camera_intrinsic=data['camera_intrinsic'],
         camera_extrinsic=data['camera_extrinsic'],
         camera_to_lidar_transform=data['camera_to_lidar_transform'],
-        point_cloud=filtered_point_cloud
+        point_cloud=pointcloud.point_cloud_plane_removed
     )
     
     # Create bounding box extractor
@@ -92,63 +93,69 @@ def main():
     
     # Get corner pixels from bounding boxes
     print("Extracting bounding box corner pixels from nuScenes annotations...")
-    pixels = get_bounding_box_corners(
+    pixels = get_bounding_box_pixels(
         bbox_extractor=bbox_extractor,
         sample_token=sample_token,
-        camera_channel="CAM_FRONT",
-        max_boxes=1
+        camera_channel="CAM_FRONT"
     )
     
-    print(f"Found {len(pixels)} corner pixels from bounding boxes")
-    
+    print(f"Found {len(pixels)} pixels from bounding boxes")
+
     print("Projecting pixels to 3D...")
-    result = projector.project_pixels_to_3d(pixels, max_distance=100.0, distance_threshold=1.0)
+    result_all_pixels = projector.project_pixels_to_3d(pixels, max_distance=100.0, distance_threshold=1.0)
+    rays = projector.pixel_to_ray(pixels)
     
-    print(f"Projected {len(result['projected_points'])} points")
-    print("Projected 3D points:")
-    for i, point in enumerate(result['projected_points']):
-        print(f"  Pixel {pixels[i]}: 3D point {point}")
-    
-    # Get coordinate systems from projector and update visualizer
-    print("Finalizing visualization...")
-    coord_systems = projector.get_coordinate_systems()
-    visualizer = PointCloudVisualizer(
-        point_cloud=filtered_point_cloud,
-        coordinate_systems=coord_systems,
-        remove_ground=False  # Already removed
-    )
+    print(f"Projected {len(result_all_pixels['projected_points'])} points")    
     
     # Visualize image with marked pixels
     print("Visualizing image with projected pixels...")
-    visualizer.visualize_image_with_pixels(
+    visualize_image_with_pixels(
         image=data['image_path'],
         pixel_coords=pixels,
         save_path="image_with_pixels.png",
         show=False
     )
     
-    # Optional: Perform DBSCAN clustering
-    print("Performing DBSCAN clustering...")
-    clusters = visualizer.cluster_with_dbscan(eps=1.0, min_samples=10)
+    
     
     # Visualize with projected points, coordinate systems, and clusters
-    visualizer.visualize_with_projected_points(
-        result['projected_points'],
-        rays=result['rays'],
-        clusters=clusters,
-        title="nuScenes: 2D to 3D Projection with Coordinate Systems",
-        draw_coordinate_systems=True,
-        axis_length=3.0
+    visualizer_without_ground.visualize_point_cloud(
+        result_all_pixels['projected_points'],
+        rays=result_all_pixels['rays'],
+        clusters=None,
+        title="nuScenes: 2D to 3D Projection with Coordinate Systems"
     )
-    
+    for idx in range(len(bbox_extractor.boxes)):
+        box = bbox_extractor.get_box_from_idx(sample_token, idx)
+        print(f"Box {idx}:")
+        pixels = box.get_corners()
+        result = projector.project_pixels_to_3d(pixels, max_distance=100.0, distance_threshold=1.0)
+        visualize_image_with_pixels(
+            image=data['image_path'],
+            pixel_coords=pixels,
+            save_path=f"image_with_pixels_idx_{idx}.png",
+            show=True
+        )
+        visualizer_without_ground.visualize_point_cloud(
+            result['projected_points'],
+            rays=result['rays'],
+            clusters=None,
+            title="nuScenes: 2D to 3D Projection with Coordinate Systems"
+        )
+
+    visualizer_without_ground.visualize_point_cloud(
+        rays=rays,
+        title="nuScenes: 2D to 3D Projection with Coordinate Systems"
+    )
+    pointcloud.add_projected_points(result_all_pixels['projected_points'])
+    pointcloud.cluster_with_dbscan(eps=1.0, min_samples=10)
     # Visualize with clusters only (using the same function)
-    visualizer.visualize_with_projected_points(
-        projected_points=None,  # No projected points, just clusters
+    visualizer_without_ground = PointCloudVisualizer(point_cloud=pointcloud)
+    visualizer_without_ground.visualize_point_cloud(
+        points=None,  # No projected points, just clusters
         rays=None,
-        clusters=clusters,
-        title="nuScenes: Point Cloud Clusters",
-        draw_coordinate_systems=True,
-        axis_length=3.0
+        clusters=pointcloud.clusters,
+        title="nuScenes: Point Cloud Clusters"
     )
     
     print("Done!")

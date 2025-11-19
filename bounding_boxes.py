@@ -51,25 +51,11 @@ class BoundingBoxes:
         """
         self.data_format = data_format.lower()
         self.nusc = nusc
-        
-        if self.data_format == "nuscenes" and nusc is None:
-            raise ValueError("NuScenes object is required for 'nuscenes' data format")
     
     def get_boxes_for_sample(self, sample_token: str, camera_channel: str = "CAM_FRONT",
                             max_boxes: Optional[int] = None) -> List[BoundingBox]:
-        """
-        Get bounding boxes for a specific sample.
-        
-        Args:
-            sample_token: Token of the sample
-            camera_channel: Camera channel name (e.g., 'CAM_FRONT')
-            max_boxes: Maximum number of bounding boxes to return (None for all)
-            
-        Returns:
-            List of BoundingBox objects
-        """
         if self.data_format == "nuscenes":
-            return self._get_boxes_from_nuscenes(sample_token, camera_channel, max_boxes)
+            self.boxes = self._get_boxes_from_nuscenes(sample_token, camera_channel, max_boxes)
         else:
             raise NotImplementedError(f"Data format '{self.data_format}' is not yet implemented")
     
@@ -153,6 +139,14 @@ class BoundingBoxes:
                     bounding_boxes.append(bounding_box)
         
         return bounding_boxes
+
+    def get_box_from_idx(self, sample_token: str,
+                         idx: int) -> BoundingBox:
+        """
+        Get bounding box from index. Can only be called after get_boxes_for_sample has been called.
+        """
+        bounding_boxes = self.boxes
+        return bounding_boxes[idx]
     
     def get_all_bb_pixels(self, sample_token: str, camera_channel: str = "CAM_FRONT",
                              max_boxes: Optional[int] = None, sample_ratio: float = 0.1) -> np.ndarray:
@@ -168,7 +162,7 @@ class BoundingBoxes:
         Returns:
             Nx2 array of pixel coordinates (sampled pixels from all boxes)
         """
-        bounding_boxes = self.get_boxes_for_sample(sample_token, camera_channel, max_boxes)
+        bounding_boxes = self.boxes
         
         if len(bounding_boxes) == 0:
             return np.array([])
@@ -197,4 +191,3 @@ class BoundingBoxes:
             all_pixels.extend(sampled_pixels)
         
         return np.array(all_pixels)
-        

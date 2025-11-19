@@ -131,29 +131,27 @@ class NuScenesDatasetLoader:
         
         cs_record = self.nusc.get('calibrated_sensor', sample_data['calibrated_sensor_token'])
         
-        
         # Camera extrinsic: ego to camera
         cam_rotation_quat = Quaternion(cs_record['rotation'])
-        T_ego_to_cam = np.eye(4)
-        T_ego_to_cam[:3, :3] = cam_rotation_quat.rotation_matrix
-        T_ego_to_cam[:3, 3] = np.array(cs_record['translation'])
+        T_cam_to_ego = np.eye(4)
+        T_cam_to_ego[:3, :3] = cam_rotation_quat.rotation_matrix
+        T_cam_to_ego[:3, 3] = np.array(cs_record['translation'])
         
         # Ego to lidar
         lidar_cs = self.nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
         lidar_rotation_quat = Quaternion(lidar_cs['rotation'])
-        T_ego_to_lidar = np.eye(4)
-        T_ego_to_lidar[:3, :3] = lidar_rotation_quat.rotation_matrix
-        T_ego_to_lidar[:3, 3] = np.array(lidar_cs['translation'])
+        T_lidar_to_ego = np.eye(4)
+        T_lidar_to_ego[:3, :3] = lidar_rotation_quat.rotation_matrix
+        T_lidar_to_ego[:3, 3] = np.array(lidar_cs['translation'])
         
-        # Camera to lidar
-        T_cam_to_lidar = T_ego_to_lidar @ np.linalg.inv(T_ego_to_cam)
+        T_cam_to_lidar =  np.linalg.inv(T_lidar_to_ego) @ T_cam_to_ego
         
         return {
                 "sample_token": sample_token,
                 "image_path": os.path.join(self.nusc.dataroot, sample_data['filename']),
                 "point_cloud": point_cloud,                 # Nx3 numpy array
                 "camera_intrinsic": K,                      # 3x3
-                "camera_extrinsic": T_ego_to_cam,           # 4x4
+                "camera_extrinsic": T_cam_to_ego,           # 4x4
                 "camera_to_lidar_transform": T_cam_to_lidar,              # 4x4
                 "nusc": self.nusc
             }
