@@ -1,0 +1,42 @@
+api:
+  dashboard: true
+  insecure: true
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+
+entryPoints:
+  web:
+    address: ":80"
+
+  cvat:
+    address: ":8080"
+
+  ui:
+    address: ":3000"
+
+http:
+  routers:
+    cvat-api:
+      entryPoints:
+        - cvat
+      service: cvat_server
+      rule: "PathPrefix(`/api/v1/`)"
+
+    cvat-ui:
+      entryPoints:
+        - ui
+      service: cvat_ui
+      rule: "PathPrefix(`/`)"
+
+  services:
+    cvat_server:
+      loadBalancer:
+        servers:
+          - url: "http://cvat_server:8080"
+
+    cvat_ui:
+      loadBalancer:
+        servers:
+          - url: "http://cvat_ui:80"
