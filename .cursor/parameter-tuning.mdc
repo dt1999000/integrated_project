@@ -1,0 +1,66 @@
+---
+alwaysApply: false
+description: Key parameters and tuning guidelines
+---
+
+# Parameter Tuning Guidelines
+
+## RANSAC Ground Removal
+
+Location: [pointcloud_projection.py:209](mdc:pointcloud_projection.py#L209)
+
+Key parameters:
+- `distance_threshold`: 0.3m (typical for flat ground)
+  - Increase for uneven terrain
+  - Decrease for more precise ground plane detection
+- `num_iterations`: 1000
+  - Increase for noisy data
+  - Decrease for faster processing
+
+## DBSCAN Clustering
+
+Location: [pointcloud_projection.py:261](mdc:pointcloud_projection.py#L261)
+
+Key parameters:
+- `eps`: Neighborhood radius (1.0m default)
+  - Reduce for dense scenes (0.5-0.8m)
+  - Increase for sparse scenes (1.2-1.5m)
+- `min_samples`: Minimum points per cluster (10 default)
+  - Increase for larger objects (15-20)
+  - Decrease for smaller objects (5-8)
+
+Note: Consider using `cluster_with_dbscan_adaptive()` for automatic tuning
+
+## Projection Parameters
+
+Location: [pointcloud_projection.py:106](mdc:pointcloud_projection.py#L106)
+
+Key parameters:
+- `max_distance`: 100m (match to LiDAR range)
+  - Adjust based on LiDAR sensor specifications
+- `distance_threshold`: 0.5m (perpendicular distance to ray)
+  - Tighter threshold (0.3m) = stricter ray-point matching
+  - Looser threshold (0.7m) = more permissive matching
+
+## Bounding Box Sampling
+
+Location: [bounding_boxes.py:152](mdc:bounding_boxes.py#L152)
+
+Key parameters:
+- `sample_ratio`: 0.1 (10% of pixels per box)
+  - Increase for denser sampling (0.2-0.3)
+  - Decrease for faster processing (0.05)
+
+## Tuning Workflow
+
+1. Start with default parameters
+2. Run on a diverse set of samples
+3. Analyze visualization outputs:
+   - Check if ground plane is correctly removed
+   - Verify if objects are properly clustered
+   - Ensure 2D-3D projections are accurate
+4. Adjust parameters based on specific issues:
+   - Too many ground points in clusters → Decrease RANSAC distance_threshold
+   - Too few clusters → Decrease DBSCAN eps or min_samples
+   - Inaccurate projections → Decrease projection distance_threshold
+5. Document parameter changes and their effects

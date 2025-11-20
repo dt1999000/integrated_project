@@ -1,0 +1,66 @@
+---
+globs: *.py
+description: Coordinate system handling and transformations
+---
+
+# Coordinate System Handling
+
+## Multiple Coordinate Frames
+
+The project manages multiple coordinate frames:
+- **LiDAR coordinates**: Origin at LiDAR sensor (typically vehicle center)
+- **Camera coordinates**: X-right, Y-down, Z-forward (standard camera convention)
+- **Ego vehicle coordinates**: Vehicle body frame
+
+## Transformation Chain
+
+The standard transformation chain is:
+`Pixel → Camera → Ego Vehicle → LiDAR`
+
+## Key Transformation Matrices
+
+- `camera_intrinsic`: 3x3 camera intrinsic matrix (K)
+- `camera_extrinsic`: 4x4 camera extrinsic matrix (world to camera)
+- `camera_to_lidar_transform`: 4x4 transformation matrix from camera to lidar coordinates
+- `lidar_to_camera_transform`: Inverse of camera_to_lidar_transform
+- `camera_to_world_transform`: Inverse of camera_extrinsic
+
+## Implementation Guidelines
+
+1. Always use consistent floating-point precision (np.float32) for transformation matrices
+2. Compute inverse transformations during initialization to avoid repeated computation
+3. Use homogeneous coordinates (4x4 matrices) for 3D transformations
+4. When converting between coordinate systems, always document the source and target frames
+
+## Common Operations
+
+### Back-projecting 2D pixels to 3D rays
+```python
+# Convert pixel coordinates to homogeneous coordinates
+pixel_homogeneous = np.hstack([pixels, np.ones((pixels.shape[0], 1))])
+
+# Apply inverse camera intrinsics to get rays in camera coordinates
+ray_camera = np.linalg.inv(camera_intrinsic) @ pixel_homogeneous.T
+
+# Normalize rays
+ray_camera = ray_camera / np.linalg.norm(ray_camera, axis=0)
+```
+
+### Transforming points between coordinate systems
+```python
+# Convert to homogeneous coordinates
+points_homogeneous = np.hstack([points, np.ones((points.shape[0], 1))])
+
+# Apply transformation
+transformed_points = (transform_matrix @ points_homogeneous.T).T
+
+# Extract 3D coordinates
+transformed_points_3d = transformed_points[:, :3]
+```
+
+## Visualization
+
+When visualizing coordinate systems:
+- Use different colors for each axis (e.g., red for X, green for Y, blue for Z)
+- Label coordinate system origins clearly
+- Show transformation relationships between frames

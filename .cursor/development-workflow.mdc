@@ -1,0 +1,70 @@
+---
+alwaysApply: true
+description: Development workflow and best practices
+---
+
+# Development Workflow
+
+## Environment Setup
+
+The project uses a virtual environment (`.venv`) with key dependencies:
+- `nuscenes-devkit`: nuScenes dataset API
+- `open3d`: 3D visualization and RANSAC
+- `scikit-learn`: DBSCAN clustering
+- `ultralytics`: YOLO models
+- `opencv-python`, `matplotlib`: Image processing and visualization
+- `pyquaternion`: Rotation handling
+
+Activate environment before development:
+```bash
+# Windows
+.venv\Scripts\activate
+
+# Linux/Mac
+source .venv/bin/activate
+```
+
+## Running the Pipeline
+
+Execute the full pipeline with the example script:
+```bash
+python example_projection_usage.py
+```
+
+## Testing and Validation
+
+- The repository has no automated test suite
+- Manual validation is required by inspecting visualizations
+- Check generated images in `detection_results/` and `detection_comparisons/` directories
+- Verify point cloud projections and clustering results visually
+
+## Code Modification Guidelines
+
+1. When modifying projection parameters:
+   - Test with multiple samples to ensure robustness
+   - Check visualization outputs for correctness
+   - Document parameter changes in CLAUDE.md
+
+2. When modifying clustering algorithms:
+   - Compare results between standard and adaptive DBSCAN
+   - Adjust parameters based on point cloud density
+   - Validate cluster quality visually
+
+3. When adding new functionality:
+   - Follow the existing class structure and naming conventions
+   - Add appropriate type hints and docstrings
+   - Update example_projection_usage.py to demonstrate new features
+
+## Known Issues and Limitations
+
+1. **Clustering Performance**: Current DBSCAN parameters may produce too few clusters
+2. **Single Sample Focus**: `example_projection_usage.py` processes only the first sample
+3. **Ground Plane Assumption**: RANSAC assumes a single dominant ground plane
+4. **No Tests**: Manual validation required by inspecting visualizations
+
+## File Organization
+
+- All main functionality is in 4 Python files at the root level
+- No modular package structure (no `src/` or module directories)
+- Example usage is the primary entry point for understanding the pipeline
+- Heavy use of numpy arrays with shape conventions: Nx2 for pixels, Nx3 for 3D points, 4x4 for transforms

@@ -1,0 +1,49 @@
+---
+alwaysApply: true
+description: Project structure and main components
+---
+
+# Project Structure Guide
+
+This is a 3D object detection and point cloud processing pipeline for autonomous driving datasets, specifically designed for the nuScenes dataset.
+
+## Core Components
+
+1. **Data Loading** ([nuscenes_dataset_loader.py](mdc:nuscenes_dataset_loader.py))
+   - `NuScenesDatasetLoader`: Loads nuScenes dataset and extracts camera/LiDAR data
+   - Computes transformation matrices: camera intrinsic (K), camera extrinsic (T_cam_to_ego), camera-to-LiDAR transform (T_cam_to_lidar)
+
+2. **Bounding Box Extraction** ([bounding_boxes.py](mdc:bounding_boxes.py))
+   - `BoundingBoxes`: Extracts 2D bounding boxes from nuScenes annotations
+   - `BoundingBox`: Represents individual boxes with 2D/3D coordinates and metadata
+
+3. **2D-to-3D Projection** ([pointcloud_projection.py](mdc:pointcloud_projection.py))
+   - `Projection2DTo3D`: Core projection class that transforms 2D pixels to 3D rays in LiDAR coordinate space
+   - `PointCloud`: Manages point cloud data and operations
+   - `PointCloudVisualizer`: Open3D-based 3D visualization
+
+4. **Example Usage** ([example_projection_usage.py](mdc:example_projection_usage.py))
+   - Main entry point demonstrating the full pipeline
+
+## Pipeline Flow
+
+**2D Image → Bounding Boxes → Pixel Extraction → Ray Projection → 3D Point Cloud → Ground Removal → Clustering**
+
+## Dataset Structure
+
+The project expects nuScenes dataset in this structure:
+```
+v1.0-mini/
+  v1.0-mini/
+    *.json (metadata files)
+  samples/
+    CAM_FRONT/, CAM_BACK/, etc. (camera images)
+    LIDAR_TOP/ (point cloud data)
+```
+
+## Key Parameters
+
+- RANSAC Ground Removal: `distance_threshold`: 0.3m, `num_iterations`: 1000
+- DBSCAN Clustering: `eps`: 1.0m, `min_samples`: 10
+- Projection: `max_distance`: 100m, `distance_threshold`: 0.5m
+- Bounding Box Sampling: `sample_ratio`: 0.1 (10% of pixels per box)

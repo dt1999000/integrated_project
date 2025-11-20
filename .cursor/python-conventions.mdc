@@ -1,0 +1,51 @@
+---
+globs: *.py
+description: Python coding conventions for this project
+---
+
+# Python Coding Conventions
+
+## Code Style
+
+- Follow PEP 8 style guidelines
+- Use 4 spaces for indentation (no tabs)
+- Maximum line length: 100 characters
+- Use docstrings for all classes and public methods
+
+## Type Hints
+
+- Use type hints for all function parameters and return values
+- Import typing constructs from the `typing` module
+- Use `Optional[T]` for nullable types
+
+## NumPy Conventions
+
+- Use `np.ndarray` for array type hints
+- Specify array shapes in docstrings when relevant (e.g., "Nx3 array of 3D points")
+- Use `astype(np.float32)` for consistent floating-point precision
+- Use `[:, :3]` slicing to extract x,y,z coordinates from point clouds with intensity
+
+## Coordinate System Conventions
+
+- LiDAR coordinates: Origin at LiDAR sensor (typically vehicle center)
+- Camera coordinates: X-right, Y-down, Z-forward (standard camera convention)
+- Ego vehicle coordinates: Vehicle body frame
+- Transformation chain: `Pixel → Camera → Ego Vehicle → LiDAR`
+
+## Error Handling
+
+- Avoid try-catch blocks unless explicitly mentioned in the task
+- Use descriptive error messages with context
+- Raise appropriate exception types (ValueError, FileNotFoundError, etc.)
+
+## Import Organization
+
+1. Standard library imports
+2. Third-party imports (numpy, cv2, etc.)
+3. Local application imports
+
+## Class and Function Naming
+
+- Use PascalCase for class names (e.g., `Projection2DTo3D`)
+- Use snake_case for function and variable names (e.g., `pixel_to_ray`)
+- Use descriptive names that indicate purpose (e.g., `camera_to_lidar_transform`)

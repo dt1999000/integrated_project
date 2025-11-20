@@ -96,7 +96,8 @@ def main():
     pixels = get_bounding_box_pixels(
         bbox_extractor=bbox_extractor,
         sample_token=sample_token,
-        camera_channel="CAM_FRONT"
+        camera_channel="CAM_FRONT",
+        max_boxes=2
     )
     
     print(f"Found {len(pixels)} pixels from bounding boxes")
@@ -116,7 +117,7 @@ def main():
         show=False
     )
     
-    
+    bbox_extractor.get_boxes_for_sample(sample_token, camera_channel="CAM_FRONT")
     
     # Visualize with projected points, coordinate systems, and clusters
     visualizer_without_ground.visualize_point_cloud(
@@ -125,15 +126,20 @@ def main():
         clusters=None,
         title="nuScenes: 2D to 3D Projection with Coordinate Systems"
     )
-    for idx in range(len(bbox_extractor.boxes)):
-        box = bbox_extractor.get_box_from_idx(sample_token, idx)
-        print(f"Box {idx}:")
-        pixels = box.get_corners()
-        result = projector.project_pixels_to_3d(pixels, max_distance=100.0, distance_threshold=1.0)
+    # Run visualizations for every 5th box instead of every box
+    print(f"Found {len(bbox_extractor.boxes)} total boxes. Running visualizations for every 5th box...")
+
+    for idx in range(37, len(bbox_extractor.boxes), 5):  # Increment by 5
+        pixels = np.array([]).reshape(0, 2)
+        for i in range(5):
+            box = bbox_extractor.get_box_from_idx(sample_token, idx + i)
+            print(f"Box {idx + i}:")
+            pixels = np.concatenate([pixels, box.get_corners()])
+            result = projector.project_pixels_to_3d(pixels, max_distance=100.0, distance_threshold=1.0)
         visualize_image_with_pixels(
             image=data['image_path'],
             pixel_coords=pixels,
-            save_path=f"image_with_pixels_idx_{idx}.png",
+            save_path=f"image_with_pixels_idx_{idx + i}.png",
             show=True
         )
         visualizer_without_ground.visualize_point_cloud(
@@ -158,6 +164,64 @@ def main():
         title="nuScenes: Point Cloud Clusters"
     )
     
+  
+    # ================================================================================
+    # NEW: Demonstrate Multiple Clustering Algorithms Comparison
+    # ================================================================================
+
+    print("\n" + "="*70)
+    print("DEMONSTRATING MULTIPLE CLUSTERING ALGORITHMS")
+    print("="*70)
+
+    # Reset clustering and run multiple algorithms comparison
+    pointcloud.clusters = []  # Clear previous clustering results
+
+    print("Running multiple clustering algorithms with automatic parameter optimization...")
+    print("This will test different algorithms and select the best one based on multiple metrics.")
+
+    # Run clustering comparison (testing fewer algorithms for faster demo)
+    clustering_results = pointcloud.cluster_with_multiple_algorithms(
+        algorithms=['dbscan', 'optics', 'birch'],
+        max_combinations_per_algorithm=15  # Reduced for faster execution
+    )
+
+    # Print summary of results
+    if hasattr(pointcloud, 'best_algorithm_name'):
+        print(f"\n🏆 Best algorithm: {pointcloud.best_algorithm_name}")
+        print(f"   Composite score: {pointcloud.best_algorithm_result['best_evaluation']['composite_score']:.4f}")
+        print(f"   Number of clusters: {pointcloud.best_algorithm_result['best_evaluation']['num_clusters']}")
+        print(f"   Noise ratio: {pointcloud.best_algorithm_result['best_evaluation']['noise_ratio']:.3f}")
+        print(f"   Computation time: {pointcloud.best_algorithm_result['computation_time']:.2f}s")
+
+        # Visualize best clustering result
+        print("\nVisualizing best clustering result...")
+        visualizer_best = PointCloudVisualizer(point_cloud=pointcloud)
+        visualizer_best.visualize_point_cloud(
+            points=result_all_pixels['projected_points'],
+            rays=result_all_pixels['rays'],
+            clusters=pointcloud.best_clusters,
+            title=f"Best Clustering: {pointcloud.best_algorithm_name} (Score: {pointcloud.best_algorithm_result['best_evaluation']['composite_score']:.4f})"
+        )
+
+        # Get clustering summary
+        summary = pointcloud.get_clustering_summary()
+        print(f"\n📊 Algorithms tested: {summary['total_algorithms_tested']}")
+        print("Algorithm ranking:")
+
+        for algo_name, result in summary['algorithm_results'].items():
+            if result['status'] == 'success':
+                print(f"   • {algo_name:15s}: Score={result['composite_score']:.4f}, "
+                      f"Clusters={result['num_clusters']}, Time={result['computation_time']:.2f}s")
+
+    print("\n" + "="*70)
+    print("NEW FEATURES SUMMARY:")
+    print("✓ Multiple clustering algorithms automatically compared")
+    print("✓ Parameter optimization via grid search")
+    print("✓ Comprehensive evaluation metrics")
+    print("✓ Automatic best algorithm selection")
+    print("✓ Performance ranking and comparison")
+    print("="*70)
+
     print("Done!")
 
 

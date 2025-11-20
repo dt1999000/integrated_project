@@ -1,0 +1,67 @@
+version: '3.3'
+
+services:
+  cvat_server:
+    image: cvat/server:latest
+    environment:
+      - "DJANGO_MODWSGI_APPS_GROUP=cvat"
+      - "ALLOWED_HOSTS=*"
+      - "CVAT_REDIS_HOST=redis"
+    volumes:
+      - cvat_data:/data
+      - ./cvat_exports:/data/exports:ro  # Mount our export files
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - postgres
+
+  cvat_worker:
+    image: cvat/server:latest
+    environment:
+      - "DJANGO_MODWSGI_APPS_GROUP=cvat"
+      - "ALLOWED_HOSTS=*"
+      - "CVAT_REDIS_HOST=redis"
+    volumes:
+      - cvat_data:/data
+      - ./cvat_exports:/data/exports:ro  # Mount our export files
+    depends_on:
+      - redis
+      - postgres
+
+  cvat_ui:
+    image: cvat/ui:latest
+    environment:
+      - "CVAT_SERVER_HOST=cvat_server"
+    ports:
+      - "3000:80"
+    depends_on:
+      - cvat_server
+
+  traefik:
+    image: traefik:v2.10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+    ports:
+      - "80:80"
+      - "8080:8080"  # CVAT API
+      - "3000:3000"   # CVAT UI
+    depends_on:
+      - cvat_server
+
+  redis:
+    image: redis:6.2-alpine
+
+  postgres:
+    image: postgres:13-alpine
+    environment:
+      - "POSTGRES_USER=cvat"
+      - "POSTGRES_DB=cvat"
+      - "POSTGRES_PASSWORD=cvat"
+    volumes:
+      - cvat_db:/var/lib/postgresql/data
+
+volumes:
+  cvat_data:
+  cvat_db:
