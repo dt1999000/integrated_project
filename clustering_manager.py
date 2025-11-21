@@ -1,15 +1,3 @@
-"""
-ClusteringManager - Comprehensive clustering system for 3D point clouds with multiple algorithms
-and evaluation metrics.
-
-This module provides:
-- Multiple clustering algorithms (DBSCAN, HDBSCAN, OPTICS, BIRCH, Agglomerative)
-- Parameter grid search and automatic tuning
-- Comprehensive evaluation metrics (standard and 3D-specific)
-- Algorithm comparison and ranking
-- 3D point cloud specialized metrics
-"""
-
 import numpy as np
 import warnings
 from typing import Dict, List, Tuple, Any, Optional
@@ -437,17 +425,14 @@ class ClusteringManager:
         if algorithms is None:
             algorithms = list(self.algorithms.keys())
 
-        print(f"\n{'='*60}")
         print("CLUSTERING ALGORITHM COMPARISON")
-        print(f"{'='*60}")
         print(f"Point cloud: {self.point_cloud.shape[0]} points")
         print(f"Algorithms to test: {algorithms}")
-        print(f"{'='*60}\n")
 
         comparison_results = {}
 
         for algo_name in algorithms:
-            print(f"\n{'='*20} {algo_name.upper()} {'='*20}")
+            print(f"\n {algo_name.upper()} ")
 
             try:
                 start_time = time.time()
@@ -481,11 +466,8 @@ class ClusteringManager:
         if valid_results:
             sorted_results = dict(sorted(valid_results.items(),
                                        key=lambda x: x[1]['best_evaluation']['composite_score'],
-                                       reverse=True))
-
-            print(f"\n{'='*60}")
+                                       reverse=True)) 
             print("ALGORITHM RANKING (by composite score)")
-            print(f"{'='*60}")
 
             for i, (algo_name, result) in enumerate(sorted_results.items(), 1):
                 eval_metrics = result['best_evaluation']
