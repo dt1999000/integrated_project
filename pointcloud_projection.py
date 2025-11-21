@@ -497,6 +497,78 @@ class PointCloud:
 
         return summary
 
+    def cluster_with_segmentation_masks(self, mask_points: Dict[int, np.ndarray],
+                                       min_points_per_cluster: int = 10) -> List[np.ndarray]:
+        """
+        Create clusters based on segmentation mask projections.
+        
+        Args:
+            mask_points: Dictionary mapping mask_id to Nx3 array of projected 3D points
+            min_points_per_cluster: Minimum number of points required for a valid cluster
+            
+        Returns:
+            List of numpy arrays, where each array contains the indices of points
+            belonging to that cluster in the ground-removed point cloud.
+        """
+        if not self.ground_removed:
+            raise ValueError("Ground plane removal required before clustering. Call remove_ground_plane_ransac() first.")
+        
+        clusters = []
+        
+        # For each mask projection, find corresponding points in the ground-removed point cloud
+        for mask_id, points in mask_points.items():
+            if len(points) < min_points_per_cluster:
+                print(f"Skipping mask {mask_id}: only {len(points)} points (minimum: {min_points_per_cluster})")
+                continue
+            
+            # Find points in the ground-removed point cloud that are close to the projected points
+            # This is a simplified approach - you might want to use a more sophisticated method
+            cluster_indices = []
+            
+            # For each projected point, find the closest point in the ground-removed point cloud
+            for point in points:
+                # Calculate distances to all points in the ground-removed point cloud
+                distances = np.linalg.norm(self.point_cloud_plane_removed - point, axis=1)
+                
+                # Find the closest point
+                closest_idx = np.argmin(distances)
+                
+                # If the closest point is within a reasonable distance, add it to the cluster
+                if distances[closest_idx] < 0.5:  # 0.5m threshold
+                    cluster_indices.append(closest_idx)
+            
+            # Remove duplicates
+            cluster_indices = list(set(cluster_indices))
+            
+            if len(cluster_indices) >= min_points_per_cluster:
+                clusters.append(np.array(cluster_indices))
+                print(f"Created cluster for mask {mask_id}: {len(cluster_indices)} points")
+            else:
+                print(f"Skipping mask {mask_id}: only {len(cluster_indices)} unique points found (minimum: {min_points_per_cluster})")
+        
+        print(f"Created {len(clusters)} clusters from {len(mask_points)} segmentation masks")
+        self.clusters = clusters
+        return clusters
+    
+    def add_segmentation_projected_points(self, mask_points: Dict[int, np.ndarray]):
+        """
+        Add projected points from segmentation masks to the point cloud.
+        
+        Args:
+            mask_points: Dictionary mapping mask_id to Nx3 array of projected 3D points
+        """
+        all_points = []
+        for mask_id, points in mask_points.items():
+            if len(points) > 0:
+                all_points.append(points)
+        
+        if all_points:
+            all_points = np.vstack(all_points)
+            self.add_projected_points(all_points)
+            print(f"Added {len(all_points)} points from {len(mask_points)} segmentation masks")
+        else:
+            print("No points to add from segmentation masks")
+
 class PointCloudVisualizer:
     """
     Class for visualizing point clouds, clusters, and rays.

@@ -154,7 +154,7 @@ def main():
         title="nuScenes: 2D to 3D Projection with Coordinate Systems"
     )
     pointcloud.add_projected_points(result_all_pixels['projected_points'])
-    pointcloud.cluster_with_dbscan(eps=0.50, min_samples=5)
+    pointcloud.cluster_with_dbscan(eps=1, min_samples=5)
     # Visualize with clusters only (using the same function)
     visualizer_without_ground = PointCloudVisualizer(point_cloud=pointcloud)
     visualizer_without_ground.visualize_point_cloud(
