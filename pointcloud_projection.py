@@ -267,7 +267,10 @@ class PointCloud:
         """
         Add projected points to the point cloud.
         """
+        print(f"Num pts before: {len(self.point_cloud_plane_removed)} point cloud")
         self.point_cloud_plane_removed = np.concatenate((self.point_cloud_plane_removed, projected_points), axis=0)
+        print(f"Added {len(projected_points)} projected points to the point cloud")
+        print(f"Total points: {len(self.point_cloud_plane_removed)}")
         
     def cluster_with_dbscan(self, eps: float = 0.5, min_samples: int = 10,
                            metric: str = 'euclidean', algorithm: str = 'auto',
@@ -383,13 +386,10 @@ class PointCloud:
         if not self.ground_removed:
             raise ValueError("Ground plane removal required before clustering. Call remove_ground_plane_ransac() first.")
 
-        print(f"\n{'='*70}")
         print("MULTIPLE ALGORITHM CLUSTERING ANALYSIS")
-        print(f"{'='*70}")
         print(f"Point cloud size: {len(self.point_cloud_plane_removed)} points")
         print(f"Testing algorithms: {algorithms if algorithms else 'All available'}")
         print(f"Max parameter combinations per algorithm: {max_combinations_per_algorithm}")
-        print(f"{'='*70}")
 
         # Initialize clustering manager with the ground-removed point cloud
         clustering_manager = ClusteringManager(self.point_cloud_plane_removed)
@@ -420,9 +420,7 @@ class PointCloud:
             # Store best clusters as the main clustering result
             self.clusters = self.best_clusters
 
-            print(f"\n{'='*70}")
             print("BEST ALGORITHM SELECTION")
-            print(f"{'='*70}")
             print(f"Best algorithm: {self.best_algorithm_name}")
             print(f"Best parameters: {self.best_algorithm_result['best_params']}")
             print(f"Best composite score: {self.best_algorithm_result['best_evaluation']['composite_score']:.4f}")
@@ -432,9 +430,7 @@ class PointCloud:
             print(f"Computation time: {self.best_algorithm_result['computation_time']:.2f}s")
 
             # Show algorithm ranking
-            print(f"\n{'='*70}")
             print("ALGORITHM RANKING")
-            print(f"{'='*70}")
             sorted_results = dict(sorted(valid_results.items(),
                                        key=lambda x: x[1]['best_evaluation']['composite_score'],
                                        reverse=True))
@@ -447,7 +443,7 @@ class PointCloud:
                       f"Time: {result['computation_time']:.2f}s")
 
         else:
-            print("\n⚠️ No valid clustering results found!")
+            print("\n No valid clustering results found!")
             self.best_algorithm_name = None
             self.best_algorithm_result = None
             self.best_clusters = []
@@ -545,7 +541,10 @@ class PointCloudVisualizer:
         
         # Add clusters if provided
         if clusters is not None:
-            cluster_colors = plt.cm.tab20(np.linspace(0, 1, len(clusters)))[:, :3]
+            cluster_colors = np.zeros((len(clusters), 3))
+            cluster_colors[:, 0] = 0.9  # High red channel for all clusters
+            cluster_colors[:, 1] = np.linspace(0, 0.3, len(clusters))  # Vary green from 0 to 0.3
+            cluster_colors[:, 2] = np.linspace(0, 0.2, len(clusters))  # Vary blue from 0 to 0.2
             print("Cluster colors:")
             print(cluster_colors)
             for i, cluster_indices in enumerate(clusters):
