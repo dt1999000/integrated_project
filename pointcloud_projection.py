@@ -358,144 +358,7 @@ class PointCloud:
         # Perform DBSCAN with adaptive eps
         self.cluster_with_dbscan(eps=eps, min_samples=min_samples)
 
-    def cluster_with_multiple_algorithms(self, algorithms: Optional[List[str]] = None,
-                                       max_combinations_per_algorithm: int = 30) -> Dict[str, Dict[str, Any]]:
-        """
-        Cluster point cloud using multiple algorithms and compare results.
-        Uses ground-removed point cloud if available.
 
-        Args:
-            algorithms: List of algorithm names to test. If None, tests all available algorithms.
-                       Options: 'dbscan', 'optics', 'birch', 'agglomerative', 'hdbscan' (if available)
-            max_combinations_per_algorithm: Maximum number of parameter combinations to test per algorithm
-
-        Returns:
-            Dictionary containing comprehensive comparison results for each algorithm:
-            {
-                'algorithm_name': {
-                    'best_params': {...},
-                    'best_labels': array,
-                    'best_evaluation': {...},
-                    'computation_time': float,
-                    'num_combinations_tested': int
-                },
-                ...
-            }
-        """
-
-        if not self.ground_removed:
-            raise ValueError("Ground plane removal required before clustering. Call remove_ground_plane_ransac() first.")
-
-        print("MULTIPLE ALGORITHM CLUSTERING ANALYSIS")
-        print(f"Point cloud size: {len(self.point_cloud_plane_removed)} points")
-        print(f"Testing algorithms: {algorithms if algorithms else 'All available'}")
-        print(f"Max parameter combinations per algorithm: {max_combinations_per_algorithm}")
-
-        # Initialize clustering manager with the ground-removed point cloud
-        clustering_manager = ClusteringManager(self.point_cloud_plane_removed)
-
-        # Run clustering comparison
-        comparison_results = clustering_manager.run_clustering_comparison(
-            algorithms=algorithms,
-            max_combinations_per_algorithm=max_combinations_per_algorithm
-        )
-
-        # Store results and set best algorithm
-        self.clustering_results = comparison_results
-
-        # Find the best algorithm (highest composite score)
-        valid_results = {k: v for k, v in comparison_results.items()
-                        if 'error' not in v and 'composite_score' in v.get('best_evaluation', {})}
-
-        if valid_results:
-            self.best_algorithm_name = max(valid_results.keys(),
-                                         key=lambda k: valid_results[k]['best_evaluation']['composite_score'])
-            self.best_algorithm_result = valid_results[self.best_algorithm_name]
-
-            # Convert best labels to cluster format (list of index arrays)
-            self.best_clusters = clustering_manager.convert_labels_to_clusters(
-                self.best_algorithm_result['best_labels']
-            )
-
-            # Store best clusters as the main clustering result
-            self.clusters = self.best_clusters
-
-            print("BEST ALGORITHM SELECTION")
-            print(f"Best algorithm: {self.best_algorithm_name}")
-            print(f"Best parameters: {self.best_algorithm_result['best_params']}")
-            print(f"Best composite score: {self.best_algorithm_result['best_evaluation']['composite_score']:.4f}")
-            print(f"Number of clusters: {self.best_algorithm_result['best_evaluation']['num_clusters']}")
-            print(f"Noise ratio: {self.best_algorithm_result['best_evaluation']['noise_ratio']:.3f}")
-            print(f"Silhouette score: {self.best_algorithm_result['best_evaluation']['silhouette_score']:.4f}")
-            print(f"Computation time: {self.best_algorithm_result['computation_time']:.2f}s")
-
-            # Show algorithm ranking
-            print("ALGORITHM RANKING")
-            sorted_results = dict(sorted(valid_results.items(),
-                                       key=lambda x: x[1]['best_evaluation']['composite_score'],
-                                       reverse=True))
-
-            for i, (algo_name, result) in enumerate(sorted_results.items(), 1):
-                eval_metrics = result['best_evaluation']
-                print(f"{i:2d}. {algo_name:15s} | Score: {eval_metrics['composite_score']:.4f} | "
-                      f"Clusters: {eval_metrics['num_clusters']:2d} | "
-                      f"Noise: {eval_metrics['noise_ratio']:.3f} | "
-                      f"Time: {result['computation_time']:.2f}s")
-
-        else:
-            print("\n No valid clustering results found!")
-            self.best_algorithm_name = None
-            self.best_algorithm_result = None
-            self.best_clusters = []
-            self.clusters = []
-
-        return comparison_results
-
-    def get_clustering_summary(self) -> Dict[str, Any]:
-        """
-        Get a summary of clustering results.
-
-        Returns:
-            Dictionary containing clustering summary information
-        """
-        if not hasattr(self, 'clustering_results') or not self.clustering_results:
-            return {"status": "No clustering results available"}
-
-        summary = {
-            "status": "clustering_completed",
-            "total_algorithms_tested": len(self.clustering_results),
-            "point_cloud_size": len(self.point_cloud_plane_removed) if self.ground_removed else 0,
-            "best_algorithm": getattr(self, 'best_algorithm_name', None),
-            "algorithm_results": {}
-        }
-
-        for algo_name, result in self.clustering_results.items():
-            if 'error' in result:
-                summary["algorithm_results"][algo_name] = {
-                    "status": "failed",
-                    "error": result['error']
-                }
-            else:
-                eval_metrics = result['best_evaluation']
-                summary["algorithm_results"][algo_name] = {
-                    "status": "success",
-                    "composite_score": eval_metrics.get('composite_score', 0.0),
-                    "num_clusters": eval_metrics.get('num_clusters', 0),
-                    "noise_ratio": eval_metrics.get('noise_ratio', 1.0),
-                    "silhouette_score": eval_metrics.get('silhouette_score', 0.0),
-                    "calinski_harabasz_score": eval_metrics.get('calinski_harabasz_score', 0.0),
-                    "davies_bouldin_score": eval_metrics.get('davies_bouldin_score', float('inf')),
-                    "computation_time": result.get('computation_time', 0.0),
-                    "best_parameters": result.get('best_params', {})
-                }
-
-                # Add 3D-specific metrics if available
-                if 'avg_density' in eval_metrics:
-                    summary["algorithm_results"][algo_name]["avg_density"] = eval_metrics['avg_density']
-                if 'overall_density' in eval_metrics:
-                    summary["algorithm_results"][algo_name]["overall_density"] = eval_metrics['overall_density']
-
-        return summary
 
     def cluster_with_segmentation_masks(self, mask_points: Dict[int, np.ndarray],
                                        min_points_per_cluster: int = 10) -> List[np.ndarray]:
@@ -568,6 +431,78 @@ class PointCloud:
             print(f"Added {len(all_points)} points from {len(mask_points)} segmentation masks")
         else:
             print("No points to add from segmentation masks")
+
+    def cluster_with_sam_masks(self, sam_manager, image: np.ndarray,
+                             bboxes: Optional[List[List[float]]] = None,
+                             min_points_per_cluster: int = 10) -> List[np.ndarray]:
+        """
+        Create clusters based on SAM segmentation masks.
+        
+        Args:
+            sam_manager: SAMModelManager instance
+            image: Input image as numpy array (H, W, 3)
+            bboxes: Optional list of bounding boxes [x1, y1, x2, y2]
+            min_points_per_cluster: Minimum number of points required for a valid cluster
+            
+        Returns:
+            List of numpy arrays, where each array contains the indices of points
+            belonging to that cluster in the ground-removed point cloud.
+        """
+        if not self.ground_removed:
+            raise ValueError("Ground plane removal required before clustering. Call remove_ground_plane_ransac() first.")
+        
+        # Get segmentation mask from SAM
+        if bboxes is not None:
+            # Use bounding boxes as prompts
+            bbox_to_sam = BoundingBoxToSAM(sam_manager)
+            mask = bbox_to_sam.segment_from_bboxes(image, bboxes)
+        else:
+            # Use SAM without prompts
+            results = sam_manager.predict(image)
+            mask = sam_manager.get_segmentation_masks(results)
+        
+        print(f"SAM segmentation mask shape: {mask.shape}")
+        print(f"Unique mask values: {np.unique(mask)}")
+        
+        # Project mask to 3D
+        seg_to_3d = SegmentationToPointCloud(self)
+        mask_points = seg_to_3d.project_all_masks(mask)
+        print(f"Projected {len(mask_points)} masks to 3D")
+        
+        for mask_id, points in mask_points.items():
+            print(f"  Mask {mask_id}: {len(points)} points")
+        
+        # Add projected points to point cloud
+        self.add_segmentation_projected_points(mask_points)
+        
+        # Create clusters based on mask projections
+        clusters = []
+        for mask_id, points in mask_points.items():
+            if len(points) >= min_points_per_cluster:
+                # Find points in the ground-removed point cloud that are close to the projected points
+                cluster_indices = []
+                
+                # For each projected point, find the closest point in the ground-removed point cloud
+                for point in points:
+                    distances = np.linalg.norm(self.point_cloud_plane_removed - point, axis=1)
+                    closest_idx = np.argmin(distances)
+                    
+                    # If the closest point is within a reasonable distance, add it to the cluster
+                    if distances[closest_idx] < 0.5:  # 0.5m threshold
+                        cluster_indices.append(closest_idx)
+                
+                # Remove duplicates
+                cluster_indices = list(set(cluster_indices))
+                
+                if len(cluster_indices) >= min_points_per_cluster:
+                    clusters.append(np.array(cluster_indices))
+                    print(f"Created cluster for mask {mask_id}: {len(cluster_indices)} points")
+                else:
+                    print(f"Skipping mask {mask_id}: only {len(cluster_indices)} unique points found (minimum: {min_points_per_cluster})")
+        
+        print(f"Created {len(clusters)} clusters from {len(mask_points)} SAM masks")
+        self.clusters = clusters
+        return clusters
 
 class PointCloudVisualizer:
     """
