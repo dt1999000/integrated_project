@@ -18,9 +18,7 @@ from nuscenes_annotation_loader import NuScenesAnnotationLoader, AnnotationVisua
 def main():
     """Main function demonstrating segmentation-based object detection."""
     
-    print("="*70)
     print("SEGMENTATION-BASED OBJECT DETECTION WITH 3D POINT CLOUD PROJECTION")
-    print("="*70)
     
     # Initialize dataset loader
     print("\n1. Loading nuScenes dataset...")

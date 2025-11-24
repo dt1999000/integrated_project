@@ -213,3 +213,46 @@ class ClusteringManager:
         
         return self.labels
     
+    def generate_cuboids_from_clusters(self, labels: np.ndarray, 
+                                     cuboid_size: float = 1.0) -> Dict[str, Dict]:
+        """
+        Generate cuboids from cluster labels for interactive visualization.
+        
+        Args:
+            labels: Cluster labels for each point
+            cuboid_size: Size of each cuboid in meters
+            
+        Returns:
+            Dictionary mapping cluster_id to cuboid data
+        """
+        unique_labels = np.unique(labels)
+        cuboids = []
+        
+        for cluster_id in unique_labels:
+            if cluster_id == -1:  # Skip noise points
+                continue
+            
+            # Get points in this cluster
+            cluster_points = self.points[labels == cluster_id]
+            if len(cluster_points) < 4:  # Need at least 4 points for a cuboid
+                continue
+            
+            # Calculate bounding box
+            min_x = np.min(cluster_points[:,0])
+            max_x = np.max(cluster_points[:,0])
+            min_y = np.min(cluster_points[:,1])
+            max_y = np.max(cluster_points[:,1])
+            min_z = np.min(cluster_points[:,2])
+            max_z = np.max(cluster_points[:,2])
+            
+            cuboids.append({
+                'min_x': min_x,
+                'min_y': min_y,
+                'min_z': min_z,
+                'max_x': max_x,
+                'max_y': max_y,
+                'max_z': max_z
+            })
+        return cuboids
+
+    

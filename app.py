@@ -3,6 +3,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+from element import cuboid_from_minmax
 import time
 import sys
 import os
@@ -73,7 +74,7 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, 
         
         if sample_data is None:
             st.error(f"Failed to load sample {sample_index}")
-            return None, None, None
+            return None, None
 
         # Load point cloud
         point_cloud = PointCloud(sample_data['point_cloud'])
@@ -127,6 +128,10 @@ def create_3d_scatter_plot(points: np.ndarray, labels: Optional[np.ndarray] = No
                     marker=dict(size=2, color=colors[i % len(colors)]),
                     name=f'Cluster {label}'
                 ))
+    
+    if st.session_state.cuboids is not None:
+        for cuboid in st.session_state.cuboids:
+            fig.add_trace(cuboid_from_minmax(cuboid['min_x'], cuboid['min_y'], cuboid['min_z'], cuboid['max_x'], cuboid['max_y'], cuboid['max_z']))
 
     fig.update_layout(
         title=title,
@@ -188,6 +193,11 @@ def dbscan_page(point_cloud):
                 },
                 'runtime': time.time() - start_time
             }
+            
+            # Generate and store cuboids
+            clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
+            cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
+            st.session_state.cuboids = cuboids
             
             st.success(f"DBSCAN completed in {time.time() - start_time:.2f} seconds")
 
@@ -277,6 +287,10 @@ def optics_page(point_cloud):
                 'runtime': time.time() - start_time
             }
             
+            # Generate and store cuboids
+            clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
+            cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
+            st.session_state.cuboids = cuboids
             st.success(f"OPTICS completed in {time.time() - start_time:.2f} seconds")
 
     # Display results if available
@@ -300,6 +314,10 @@ def optics_page(point_cloud):
         # 3D Visualization
         st.subheader("3D Visualization")
         fig = create_3d_scatter_plot(point_cloud.point_cloud_plane_removed, labels, "OPTICS Clustering Results")
+        for cuboid in st.session_state.cuboids:
+            print(cuboid)
+            fig.add_trace(cuboid_from_minmax(cuboid['min_x'], cuboid['min_y'], cuboid['min_z'], cuboid['max_x'], cuboid['max_y'], cuboid['max_z']))
+        fig.update_layout(scene=dict(aspectmode='data'))
         st.plotly_chart(fig, use_container_width=True)
 
         # Parameter summary
@@ -337,14 +355,19 @@ def birch_page(point_cloud):
             
             # Store results
             st.session_state.clustering_results['birch'] = {
-                    'labels': labels,
-                    'params': {
-                        'threshold': threshold,
-                        'branching_factor': branching_factor,
-                        'n_clusters': n_clusters
+                'labels': labels,
+                'params': {
+                    'threshold': threshold,
+                    'branching_factor': branching_factor,
+                    'n_clusters': n_clusters
                 },
                 'runtime': time.time() - start_time
             }
+            
+            # Generate and store cuboids
+            clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
+            cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
+            st.session_state.cuboids = cuboids
             
             st.success(f"BIRCH completed in {time.time() - start_time:.2f} seconds")
 
@@ -405,14 +428,19 @@ def agglomerative_page(point_cloud):
             
             # Store results
             st.session_state.clustering_results['agglomerative'] = {
-                    'labels': labels,
-                    'params': {
-                        'n_clusters': n_clusters,
-                        'linkage': linkage,
-                        'affinity': affinity
+                'labels': labels,
+                'params': {
+                    'n_clusters': n_clusters,
+                    'linkage': linkage,
+                    'affinity': affinity
                 },
                 'runtime': time.time() - start_time
             }
+            
+            # Generate and store cuboids
+            clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
+            cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
+            st.session_state.cuboids = cuboids
             
             st.success(f"Agglomerative completed in {time.time() - start_time:.2f} seconds")
 
@@ -504,8 +532,13 @@ def comparison_page(point_cloud):
                     'runtime': time.time() - start_time
                 }
             
-            # Store results
-            st.session_state.clustering_results['comparison'] = comparison_results
+            # Store results for each algorithm
+            for algo_name, result in comparison_results.items():
+                st.session_state.clustering_results[algo_name] = result
+                    
+                # Generate and store cuboids
+                clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
+            
             st.success(f"Comparison completed in {time.time() - start_time:.2f} seconds")
 
     # Display comparison results if available
@@ -633,10 +666,10 @@ def main():
     ])
 
     with tab1:
-        dbscan_page(point_cloud)
-
+        #project_segmask_on_pointcloud_page(segmentation_mask, point_cloud)
+        pass
     with tab2:
-        optics_page(point_cloud)
+        dbscan_page(point_cloud)
 
     with tab3:
         birch_page(point_cloud)
@@ -645,7 +678,8 @@ def main():
         agglomerative_page(point_cloud)
 
     with tab5:
-        comparison_page(point_cloud)
+        optics_page(point_cloud)
+        
 
 if __name__ == "__main__":
     main()
