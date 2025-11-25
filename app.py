@@ -64,8 +64,19 @@ if 'point_cloud' not in st.session_state:
 if 'clustering_results' not in st.session_state:
     st.session_state.clustering_results = {}
 
-def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, ransac_n: int = 3, num_iterations: int = 1000):
-    """Load a sample from the nuScenes dataset"""
+def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, ransac_n: int = 3, 
+                     num_iterations: int = 1000, filter_rear: bool = True, front_angle_degrees: float = 180):
+    """
+    Load a sample from the nuScenes dataset
+    
+    Args:
+        sample_index: Index of the sample to load
+        distance_threshold: Maximum distance from plane to be considered inlier for ground removal
+        ransac_n: Number of points to sample for plane fitting
+        num_iterations: Number of RANSAC iterations
+        filter_rear: Whether to filter out rear points
+        front_angle_degrees: Angle in degrees to consider as "front" when filtering rear points
+    """
     try:
         # Initialize dataset loader
         dataset_loader = NuScenesDatasetLoader(dataroot='v1.0-mini')
@@ -84,8 +95,15 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, 
         # Load point cloud
         point_cloud = PointCloud(sample_data['point_cloud'])
         
-        point_cloud.remove_ground_plane_ransac(distance_threshold=distance_threshold, ransac_n=ransac_n, num_iterations=num_iterations)
-        #segmentation_detector = SegmentationDetector()
+        # Filter rear points and remove ground plane
+        point_cloud.remove_ground_plane_ransac(
+            distance_threshold=distance_threshold, 
+            ransac_n=ransac_n, 
+            num_iterations=num_iterations,
+            filter_rear=filter_rear,
+            front_angle_degrees=front_angle_degrees
+        )
+        
         return sample_data, point_cloud
 
     except Exception as e:
@@ -727,14 +745,32 @@ def main():
     
     # Sample selection
     sample_index = st.sidebar.slider("Sample Index", min_value=0, max_value=403, value=0, step=1, key="sample_index")
-    #add some slider to change the parameters of ransac interactively before loading the data
-    distance_threshold = st.sidebar.slider("Distance Threshold", min_value=0.1, max_value=1.0, value=0.3, step=0.01, key="distance_threshold")
+    
+    # Point cloud preprocessing parameters
+    st.sidebar.subheader("Point Cloud Preprocessing")
+    
+    # Rear filtering parameters
+    filter_rear = st.sidebar.checkbox("Filter Rear Points", value=True, help="Filter out points behind the LiDAR sensor")
+    front_angle_degrees = st.sidebar.slider("Front Angle (degrees)", min_value=90, max_value=270, value=180, step=10, 
+                                         help="Angle in degrees to consider as 'front'", key="front_angle_degrees",
+                                         disabled=not filter_rear)
+    
+    # Ground plane removal parameters
+    distance_threshold = st.sidebar.slider("Ground Distance Threshold", min_value=0.1, max_value=1.0, value=0.3, step=0.01, key="distance_threshold")
     ransac_n = st.sidebar.slider("RANSAC N", min_value=3, max_value=10, value=3, step=1, key="ransac_n")
     num_iterations = st.sidebar.slider("Number of Iterations", min_value=100, max_value=1000, value=1000, step=100, key="num_iterations")
+    
     # Load data button
     if st.sidebar.button("🔄 Load Sample", key="load_sample"):
         with st.spinner("Loading dataset sample..."):
-            sample_data, point_cloud = load_dataset_sample(sample_index, distance_threshold, ransac_n, num_iterations)
+            sample_data, point_cloud = load_dataset_sample(
+                sample_index, 
+                distance_threshold, 
+                ransac_n, 
+                num_iterations,
+                filter_rear=filter_rear,
+                front_angle_degrees=front_angle_degrees
+            )
             
             if sample_data is not None:
                 st.session_state.data_loaded = True

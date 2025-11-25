@@ -208,9 +208,51 @@ class PointCloud:
         self.original_point_cloud = point_cloud[:, :3] if point_cloud.shape[1] > 3 else point_cloud
         self.coordinate_systems = coordinate_systems
         self.ground_removed = False
+        self.rear_filtered = False
+        
+    def filter_rear_points(self, front_angle_degrees: float = 180) -> np.ndarray:
+        """
+        Filter out points that are behind the LiDAR sensor (negative x-axis) or outside the specified front angle.
+        
+        Args:
+            front_angle_degrees: Angle in degrees to consider as "front" (180 = half circle in front)
+            
+        Returns:
+            Filtered point cloud with rear points removed
+        """
+        # Calculate angle for each point in the horizontal plane (x-y plane)
+        # arctan2(y, x) gives angle in radians from -pi to pi
+        # Convert to degrees for easier interpretation
+        angles = np.arctan2(self.original_point_cloud[:, 1], self.original_point_cloud[:, 0]) * 180 / np.pi
+        
+        # Define front region based on angle
+        # For 180 degrees, this keeps points with angles between -90 and 90 degrees
+        half_angle = front_angle_degrees / 2
+        front_mask = (angles >= -half_angle) & (angles <= half_angle)
+        
+        # Filter points
+        filtered_points = self.original_point_cloud[front_mask]
+        
+        # Store filtered points
+        self.front_point_cloud = filtered_points
+        self.rear_filtered = True
+        
+        n_total_points = len(self.original_point_cloud)
+        n_front_points = len(filtered_points)
+        n_removed_points = n_total_points - n_front_points
+        
+        print(f"Rear point filtering:")
+        print(f"  Front angle: {front_angle_degrees} degrees")
+        print(f"  Points removed: {n_removed_points}")
+        print(f"  Remaining points: {n_front_points}")
+        print(f"  Removal ratio: {n_removed_points / n_total_points * 100:.2f}%")
+        
+        return filtered_points
 
     def remove_ground_plane_ransac(self, distance_threshold: float = 0.3,
-                                   ransac_n: int = 3, num_iterations: int = 1000, remove_ego_car: bool = True) -> np.ndarray:
+                                   ransac_n: int = 3, num_iterations: int = 1000, 
+                                   remove_ego_car: bool = True, filter_rear: bool = True,
+                                   front_angle_degrees: float = 180) -> np.ndarray:
         """
         Remove ground plane from point cloud using RANSAC.
         
@@ -218,14 +260,23 @@ class PointCloud:
             distance_threshold: Maximum distance from plane to be considered inlier
             ransac_n: Number of points to sample for plane fitting
             num_iterations: Number of RANSAC iterations
+            remove_ego_car: Whether to remove points close to the ego vehicle
+            filter_rear: Whether to filter out rear points before ground plane removal
+            front_angle_degrees: Angle in degrees to consider as "front" when filtering rear points
             
         Returns:
             Filtered point cloud with ground plane removed
         """
+        # First filter out rear points if requested
+        input_points = self.original_point_cloud
+        if filter_rear and not self.rear_filtered:
+            input_points = self.filter_rear_points(front_angle_degrees)
+        elif self.rear_filtered:
+            input_points = self.front_point_cloud
         
         # Create Open3D point cloud
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(self.original_point_cloud)
+        pcd.points = o3d.utility.Vector3dVector(input_points)
         
         # Segment plane using RANSAC
         plane_model, inliers = pcd.segment_plane(
@@ -514,15 +565,53 @@ class PointCloudVisualizer:
         Initialize the point cloud visualizer.
         
         Args:
-            point_cloud: Nx3 array of point cloud points (x, y, z)
-            coordinate_systems: Optional coordinate system information
-            remove_ground: Whether to automatically remove ground plane using RANSAC
+            point_cloud: PointCloud object to visualize
         """
+        # Store the full point cloud object for access to all data
+        self.point_cloud_obj = point_cloud
         
+        # Default to using the processed point cloud if available
         if point_cloud.ground_removed:
             self.original_point_cloud = point_cloud.point_cloud_plane_removed
+        elif point_cloud.rear_filtered:
+            self.original_point_cloud = point_cloud.front_point_cloud
         else:
             self.original_point_cloud = point_cloud.original_point_cloud
+    
+    def visualize_filtering(self, show_original: bool = True, show_filtered: bool = True):
+        """
+        Visualize the effect of rear point filtering.
+        
+        Args:
+            show_original: Whether to show the original point cloud
+            show_filtered: Whether to show the filtered point cloud
+        """
+        if not self.point_cloud_obj.rear_filtered:
+            print("Point cloud has not been filtered. Run filter_rear_points() first.")
+            return
+        
+        geometries = []
+        
+        if show_original:
+            # Original point cloud in gray
+            original_pcd = o3d.geometry.PointCloud()
+            original_pcd.points = o3d.utility.Vector3dVector(self.point_cloud_obj.original_point_cloud)
+            original_pcd.paint_uniform_color([0.7, 0.7, 0.7])  # Gray
+            geometries.append(original_pcd)
+        
+        if show_filtered:
+            # Filtered point cloud in blue
+            filtered_pcd = o3d.geometry.PointCloud()
+            filtered_pcd.points = o3d.utility.Vector3dVector(self.point_cloud_obj.front_point_cloud)
+            filtered_pcd.paint_uniform_color([0, 0, 1])  # Blue
+            geometries.append(filtered_pcd)
+        
+        # Add coordinate system at origin
+        coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
+        geometries.append(coordinate_frame)
+        
+        # Visualize
+        o3d.visualization.draw_geometries(geometries, window_name="Point Cloud Filtering Visualization")
     
     def visualize_point_cloud(self, points: Optional[np.ndarray] = None,
                                        rays: Optional[Dict[str, np.ndarray]] = None,
