@@ -184,9 +184,15 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
                 st.session_state.projection_runtime = runtime
                 
                 # Save the projected points to the point cloud for further use
-                projected_point_cloud = point_cloud.copy()
-                projected_point_cloud.add_segmentation_projected_points(mask_points)
-                st.session_state.projected_point_cloud = projected_point_cloud
+                if hasattr(point_cloud, 'copy') and hasattr(point_cloud, 'add_segmentation_projected_points'):
+                    # It's a PointCloud object
+                    projected_point_cloud = point_cloud.copy()
+                    projected_point_cloud.add_segmentation_projected_points(mask_points)
+                    st.session_state.projected_point_cloud = projected_point_cloud
+                else:
+                    # It's a numpy array
+                    st.session_state.projected_point_cloud = point_cloud
+                    st.session_state.all_mask_points = mask_points  # Just store the mask points separately
                 
                 st.success(f"Projection completed in {runtime:.2f} seconds")
         
