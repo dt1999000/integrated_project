@@ -40,7 +40,6 @@ class BoundingBox:
 
 
 class BoundingBoxes:
-    
     def __init__(self, nusc: Optional[NuScenes] = None, data_format: str = "nuscenes"):
         """
         Initialize BoundingBoxes extractor.
@@ -56,6 +55,8 @@ class BoundingBoxes:
                             max_boxes: Optional[int] = None) -> List[BoundingBox]:
         if self.data_format == "nuscenes":
             self.boxes = self._get_boxes_from_nuscenes(sample_token, camera_channel, max_boxes)
+            self.boxes_2d = [bbox.bbox_2d for bbox in self.boxes]
+            self.obj_ids = [bbox.token for bbox in self.boxes]
         else:
             raise NotImplementedError(f"Data format '{self.data_format}' is not yet implemented")
     

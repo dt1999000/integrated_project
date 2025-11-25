@@ -9,7 +9,12 @@ import sys
 import os
 from typing import Dict, List, Tuple, Optional, Any
 import pandas as pd
-
+import cv2
+from segmentation_detection import SegmentationDetector
+from bounding_boxes import BoundingBoxes
+from segmentation_detection import SegmentationToPointCloud
+from pointcloud_projection import Projection2DTo3D
+import matplotlib.pyplot as plt
 # Add the current directory to the path to import our modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -87,7 +92,75 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, 
         st.error(f"Error loading dataset: {str(e)}")
         return None, None
 
+def get_segmentation_mask(sample_data):
+    image = cv2.imread(sample_data['image_path'])
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    nusc = sample_data['nusc']
+    bounding_boxes = BoundingBoxes(nusc=nusc, data_format="nuscenes")
+    bounding_boxes.get_boxes_for_sample(sample_data['sample_token'], "CAM_FRONT")
+    segmentation_detector = SegmentationDetector()
+    segmentation_mask = segmentation_detector.get_segmentation_mask(image, bounding_boxes)
+    return segmentation_mask
+
+def project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, point_cloud):
+    projection = Projection2DTo3D(
+        camera_intrinsic=sample_data['camera_intrinsic'],
+        camera_extrinsic=sample_data['camera_extrinsic'],
+        camera_to_lidar_transform=sample_data['camera_to_lidar_transform'],
+        point_cloud=point_cloud,
+        image=sample_data['image_path']
+    )
+    segmentation_projection = SegmentationToPointCloud(projection)
+    results = segmentation_projection.project_all_masks(segmentation_mask)
+    rays = {}
+    mask_points = {}
+    for mask_id, result in results.items():
+        rays[mask_id] = result['rays']
+        print(f"rays: {rays}")
+        print(f"mask_points: {mask_points}")
+        mask_points[mask_id] = result['projected_points']
+        print(f"mask_points: {mask_points}")
+    return rays, mask_points
+
+def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
+    st.header("🎯 Project Segmentation Mask on Point Cloud")
+    st.subheader("Segmentation Mask")
+    st.subheader("Point Cloud")
+
+    
+
+    #run projection button
+    if st.sidebar.button("🚀 Run Segmentation and Projection", key="run_segmentation_and_projection"):
+        with st.spinner("Running segmentation..."):
+            segmentation_mask = get_segmentation_mask(sample_data)
+            rays, mask_points = project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, point_cloud)
+            # show segmentation mask on image 
+            fig, ax = plt.subplots(1, 2, figsize=(15, 6))
+            ax[0].imshow(cv2.imread(sample_data['image_path']))
+            ax[0].imshow(segmentation_mask, cmap='jet')
+            ax[0].set_title("Segmentation Mask")
+            ax[0].axis('off')
+            ax[1].imshow(cv2.imread(sample_data['image_path']))
+            ax[1].set_title("Point Cloud")
+            ax[1].axis('off')
+            st.pyplot(fig)
+        with st.spinner("Running projection..."):
+            start_time = time.time()
+            rays, mask_points = project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, point_cloud)
+            runtime = time.time() - start_time
+            st.session_state.projection_results = {
+                'rays': rays, 
+                'mask_points': mask_points,
+                'runtime': runtime
+            }
+
+        fig = create_3d_scatter_plot(point_cloud, None, mask_points, None, rays, "Projected Segmentation Mask on Point Cloud")
+        st.plotly_chart(fig, use_container_width=True)
+
 def create_3d_scatter_plot(points: np.ndarray, labels: Optional[np.ndarray] = None,
+                            mask_points: Optional[Dict[int, np.ndarray]] = None,
+                            cuboids: Optional[List[Dict]] = None,
+                            rays: Optional[Dict[int, np.ndarray]] = None,
                           title: str = "3D Point Cloud") -> go.Figure:
     """Create a 3D scatter plot using Plotly for web compatibility"""
     fig = go.Figure()
@@ -129,9 +202,45 @@ def create_3d_scatter_plot(points: np.ndarray, labels: Optional[np.ndarray] = No
                     name=f'Cluster {label}'
                 ))
     
-    if st.session_state.cuboids is not None:
+    if cuboids is not None:
         for cuboid in st.session_state.cuboids:
             fig.add_trace(cuboid_from_minmax(cuboid['min_x'], cuboid['min_y'], cuboid['min_z'], cuboid['max_x'], cuboid['max_y'], cuboid['max_z']))
+
+    if mask_points is not None:
+        for mask_id, mask_point in mask_points.items():
+            fig.add_trace(go.Scatter3d(
+                x=mask_point[:, 0],
+                y=mask_point[:, 1],
+                z=mask_point[:, 2],
+                mode='markers',
+                marker=dict(size=2, color='red'),
+                name='Mask Points'
+            ))
+
+        if rays is not None:
+            # Handle nested dictionary structure where rays is {mask_id: {'origins': array, 'directions': array}}
+            for mask_id, ray_data in rays.items():
+                if 'origins' in ray_data and 'directions' in ray_data:
+                    origin = ray_data['origins'][0]  # All origins are the same for a mask
+                    directions = ray_data['directions']
+                    
+                    # Get the corresponding mask points if available
+                    mask_points_for_id = mask_points.get(mask_id, []) if mask_points is not None else []
+                    
+                    for i in range(len(directions)):
+                        direction = directions[i]
+                        if len(mask_points_for_id) > i:
+                            projected = mask_points_for_id[i]
+                        else:
+                            projected = origin + direction * 20.0
+                        fig.add_trace(go.Scatter3d(
+                            x=[origin[0], projected[0]],
+                            y=[origin[1], projected[1]],
+                            z=[origin[2], projected[2]],
+                            mode='lines',
+                            line=dict(color='blue'),
+                            name=f'Ray {mask_id}'
+                        ))
 
     fig.update_layout(
         title=title,
@@ -221,7 +330,7 @@ def dbscan_page(point_cloud):
         
         # 3D Visualization
         st.subheader("3D Visualization")
-        fig = create_3d_scatter_plot(point_cloud.point_cloud_plane_removed, labels, "DBSCAN Clustering Results")
+        fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "DBSCAN Clustering Results")
         st.plotly_chart(fig, use_container_width=True)
 
         # Parameter summary
@@ -313,11 +422,7 @@ def optics_page(point_cloud):
         
         # 3D Visualization
         st.subheader("3D Visualization")
-        fig = create_3d_scatter_plot(point_cloud.point_cloud_plane_removed, labels, "OPTICS Clustering Results")
-        for cuboid in st.session_state.cuboids:
-            print(cuboid)
-            fig.add_trace(cuboid_from_minmax(cuboid['min_x'], cuboid['min_y'], cuboid['min_z'], cuboid['max_x'], cuboid['max_y'], cuboid['max_z']))
-        fig.update_layout(scene=dict(aspectmode='data'))
+        fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "OPTICS Clustering Results")
         st.plotly_chart(fig, use_container_width=True)
 
         # Parameter summary
@@ -390,7 +495,7 @@ def birch_page(point_cloud):
         
         # 3D Visualization
         st.subheader("3D Visualization")
-        fig = create_3d_scatter_plot(point_cloud.point_cloud_plane_removed, labels, "BIRCH Clustering Results")
+        fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "BIRCH Clustering Results")
         st.plotly_chart(fig, use_container_width=True)
 
         # Parameter summary
@@ -463,7 +568,7 @@ def agglomerative_page(point_cloud):
         
         # 3D Visualization
         st.subheader("3D Visualization")
-        fig = create_3d_scatter_plot(point_cloud.point_cloud_plane_removed, labels, "Agglomerative Clustering Results")
+        fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "Agglomerative Clustering Results")
         st.plotly_chart(fig, use_container_width=True)
 
         # Parameter summary
@@ -621,7 +726,7 @@ def main():
     st.sidebar.header("📂 Data Controls")
     
     # Sample selection
-    sample_index = st.sidebar.slider("Sample Index", min_value=0, max_value=10, value=0, step=1, key="sample_index")
+    sample_index = st.sidebar.slider("Sample Index", min_value=0, max_value=403, value=0, step=1, key="sample_index")
     #add some slider to change the parameters of ransac interactively before loading the data
     distance_threshold = st.sidebar.slider("Distance Threshold", min_value=0.1, max_value=1.0, value=0.3, step=0.01, key="distance_threshold")
     ransac_n = st.sidebar.slider("RANSAC N", min_value=3, max_value=10, value=3, step=1, key="ransac_n")
@@ -635,6 +740,7 @@ def main():
                 st.session_state.data_loaded = True
                 st.session_state.point_cloud = point_cloud
                 st.session_state.clustering_results = {}
+                st.session_state.sample_data = sample_data
                 st.success(f"Sample {sample_index} loaded successfully!")
                 st.rerun()
 
@@ -662,12 +768,12 @@ def main():
 
     # Main navigation
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🎯 DBSCAN", "🔭 OPTICS", "🌳 BIRCH", "🔗 Agglomerative", "⚖️ Comparison"
+        "SEGMENTATION AND PROJECTION ", "DBSCAN", " BIRCH", " Agglomerative", " Comparison"
     ])
 
     with tab1:
         #project_segmask_on_pointcloud_page(segmentation_mask, point_cloud)
-        pass
+        project_segmentation_mask_on_pointcloud_page(st.session_state.sample_data, points)
     with tab2:
         dbscan_page(point_cloud)
 

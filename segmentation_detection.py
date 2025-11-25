@@ -10,24 +10,8 @@ import torch
 from typing import List, Dict, Tuple, Optional, Union
 import matplotlib.pyplot as plt
 from pathlib import Path
-
-try:
-    # Try to import SAM2
-    from sam2.build_sam import build_sam2
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
-    SAM2_AVAILABLE = True
-except ImportError:
-    print("SAM2 not available. Install with: pip install git+https://github.com/facebookresearch/segment-anything-2.git")
-    SAM2_AVAILABLE = False
-
-try:
-    # Try to import DeepLabv3
-    from torchvision import models
-    from torchvision.transforms import functional as F
-    DEEPLABV3_AVAILABLE = True
-except ImportError:
-    print("DeepLabv3 not available. Install with: pip install torchvision")
-    DEEPLABV3_AVAILABLE = False
+from ultralytics.models.sam import SAM2DynamicInteractivePredictor
+from bounding_boxes import BoundingBoxes
 
 
 class SegmentationDetector:
@@ -42,100 +26,73 @@ class SegmentationDetector:
         Args:
             model_type: Type of model to use ("sam2" or "deeplabv3")
         """
-        self.model_type = model_type
-        self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        if model_type == "sam2" and SAM2_AVAILABLE:
-            self._init_sam2()
-        elif model_type == "deeplabv3" and DEEPLABV3_AVAILABLE:
-            self._init_deeplabv3()
-        else:
-            raise ValueError(f"Model type {model_type} not available or not installed")
+        overrides=dict(conf=0.01, task="segment", mode="predict", imgsz=1024, model="sam2_t.pt", save=False)
+        self.predictor = SAM2DynamicInteractivePredictor(overrides = overrides, max_obj_num=10)
     
-    def _init_sam2(self):
-        """Initialize SAM2 model."""
-        # Using the default SAM2 model configuration
-        sam2_cfg = "sam2_hiera_l.yaml"
-        sam2_checkpoint = "sam2_hiera_large.pt"  # You need to download this
-        
-        try:
-            self.model = build_sam2(sam2_cfg, sam2_checkpoint, device=self.device)
-            self.predictor = SAM2ImagePredictor(self.model)
-            print("SAM2 model initialized successfully")
-        except Exception as e:
-            print(f"Failed to initialize SAM2: {e}")
-            raise
-    
-    def _init_deeplabv3(self):
-        """Initialize DeepLabv3 model."""
-        try:
-            # Load pre-trained DeepLabv3 with ResNet-101 backbone
-            self.model = models.segmentation.deeplabv3_resnet101(
-                pretrained=True, progress=True
-            ).to(self.device)
-            self.model.eval()
-            print("DeepLabv3 model initialized successfully")
-        except Exception as e:
-            print(f"Failed to initialize DeepLabv3: {e}")
-            raise
-    
-    def get_segmentation_mask(self, image: np.ndarray, 
-                             prompts: Optional[Dict] = None) -> np.ndarray:
-        """
-        Get segmentation mask for the given image.
-        
-        Args:
-            image: Input image as numpy array (H, W, 3)
-            prompts: Optional prompts for SAM2 (points, boxes, etc.)
-            
-        Returns:
-            Segmentation mask as numpy array (H, W) with integer labels
-        """
-        if self.model_type == "sam2":
-            return self._get_sam2_mask(image, prompts)
-        elif self.model_type == "deeplabv3":
-            return self._get_deeplabv3_mask(image)
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
-    
-    def _get_sam2_mask(self, image: np.ndarray, 
-                      prompts: Optional[Dict] = None) -> np.ndarray:
+    def get_segmentation_mask(self, image: np.ndarray, bboxes: BoundingBoxes) -> np.ndarray:
         """Get segmentation mask using SAM2."""
-        if prompts is None:
-            # If no prompts provided, use automatic mask generation
-            # This is a simplified version - you might want to implement
-            # more sophisticated automatic mask generation
-            raise NotImplementedError("Automatic mask generation for SAM2 not implemented")
         
-        # Set image for SAM2
-        self.predictor.set_image(image)
+        # Get max_obj_num from predictor to limit boxes
+        max_obj_num = self.predictor._max_obj_num
         
-        # Get masks from prompts
-        masks, scores, logits = self.predictor.predict(
-            point_coords=prompts.get("points", None),
-            point_labels=prompts.get("point_labels", None),
-            box=prompts.get("box", None),
-            multimask_output=True
+        # Limit boxes to max_obj_num and create sequential integer obj_ids
+        boxes_2d = bboxes.boxes_2d[:max_obj_num] if len(bboxes.boxes_2d) > max_obj_num else bboxes.boxes_2d
+        obj_ids = list(range(len(boxes_2d)))  # Sequential integers: 0, 1, 2, ...
+        
+        if len(boxes_2d) == 0:
+            return np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+        
+        results = self.predictor(
+            source=image,
+            bboxes=boxes_2d,
+            obj_ids=obj_ids,
+            update_memory=True
         )
         
-        # Return the mask with highest score
-        best_mask_idx = np.argmax(scores)
-        return masks[best_mask_idx].astype(np.uint8)
-    
-    def _get_deeplabv3_mask(self, image: np.ndarray) -> np.ndarray:
-        """Get segmentation mask using DeepLabv3."""
-        # Preprocess image
-        input_tensor = F.to_tensor(image).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            output = self.model(input_tensor)["out"]
-        
-        # Get the most likely class for each pixel
-        masks = output.argmax(1).squeeze().cpu().numpy()
-        
-        return masks.astype(np.uint8)
-    
+        # Extract masks from results and combine into single mask array
+        if results and len(results) > 0:
+            # Create empty mask with same dimensions as image
+            mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+            
+            # Process each result
+            for i, result in enumerate(results):
+                if result.masks is not None and len(result.masks) > 0:
+                    # Get the first mask from the result
+                    # result.masks[0] is a Masks object, need to access .data attribute
+                    mask_obj = result.masks[0]
+                    
+                    # Get the actual mask data (tensor/array) from the Masks object
+                    seg_mask = mask_obj.data
+                    
+                    # Convert to numpy if it's a tensor
+                    if torch.is_tensor(seg_mask):
+                        seg_mask = seg_mask.cpu().numpy()
+                    
+                    # Reshape if needed (masks might be 2D or need reshaping)
+                    # Masks are typically stored as (1, H, W) or (H, W)
+                    if seg_mask.ndim > 2:
+                        seg_mask = seg_mask.squeeze()
+                    
+                    # Debug: print mask info
+                    print(f"Mask {i}: shape={seg_mask.shape}, dtype={seg_mask.dtype}, min={seg_mask.min()}, max={seg_mask.max()}")
+                    
+                    # Ensure mask matches image dimensions
+                    if seg_mask.shape != mask.shape:
+                        seg_mask = cv2.resize(seg_mask.astype(np.float32), 
+                                             (mask.shape[1], mask.shape[0]), 
+                                             interpolation=cv2.INTER_NEAREST).astype(np.float32)
+                    
+                    # Add to mask with unique label (i+1 to avoid 0 which is background)
+                    # Threshold the mask (masks are typically 0-1 range)
+                    mask[seg_mask > 0.5] = i + 1
+            
+            return mask
+        else:
+            # Return empty mask if no results
+            print("segmentation returns empty mask")
+            return np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+ 
     def get_mask_pixels(self, mask: np.ndarray, 
                        target_classes: Optional[List[int]] = None,
                        min_area: int = 100) -> np.ndarray:
@@ -222,7 +179,7 @@ class SegmentationToPointCloud:
             rays, max_distance=max_distance, distance_threshold=distance_threshold
         )
         
-        return projected_points
+        return rays, projected_points
     
     def project_all_masks(self, mask: np.ndarray,
                          max_distance: float = 100.0,
@@ -244,11 +201,14 @@ class SegmentationToPointCloud:
         
         results = {}
         for mask_id in mask_ids:
-            projected_points = self.project_mask_to_pointcloud(
+            rays, projected_points = self.project_mask_to_pointcloud(
                 mask, mask_id, max_distance, distance_threshold
             )
             if len(projected_points) > 0:
-                results[mask_id] = projected_points
+                results[mask_id] = {
+                    'rays': rays,
+                    'projected_points': projected_points
+                }
         
         return results
 
