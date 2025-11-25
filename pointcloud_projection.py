@@ -186,6 +186,102 @@ class Projection2DTo3D:
             'projected_points': projected_points
         }
     
+    def project_3d_points_to_pixels(self, points_3d: np.ndarray) -> np.ndarray:
+        """
+        Project 3D points in lidar coordinate system to 2D pixel coordinates.
+        
+        Args:
+            points_3d: Nx3 array of 3D points in lidar coordinate system
+            
+        Returns:
+            Nx2 array of pixel coordinates (u, v), or None for points outside the image
+        """
+        if points_3d.ndim == 1:
+            points_3d = points_3d.reshape(1, -1)
+            
+        num_points = points_3d.shape[0]
+        pixel_coords = np.full((num_points, 2), np.nan)  # Initialize with NaN for points outside image
+        
+        # Transform points from lidar to camera coordinate system
+        points_3d_homogeneous = np.hstack([points_3d, np.ones((num_points, 1))])
+        points_cam = (self.lidar_to_camera_transform @ points_3d_homogeneous.T).T
+        
+        # Filter points in front of the camera (z > 0 in camera coordinate system)
+        in_front_mask = points_cam[:, 2] > 0
+        
+        if not np.any(in_front_mask):
+            return pixel_coords  # All points are behind the camera
+        
+        # Project points to image plane
+        points_cam_in_front = points_cam[in_front_mask]
+        
+        # Normalize by z to get points on the image plane
+        points_cam_normalized = points_cam_in_front[:, :3] / points_cam_in_front[:, 2:3]
+        
+        # Apply camera intrinsic matrix to get pixel coordinates
+        pixels_homogeneous = (self.camera_intrinsic @ points_cam_normalized[:, :3].T).T
+        pixels = pixels_homogeneous[:, :2]
+        
+        # Check if pixels are within image bounds
+        if self.image is not None:
+            if isinstance(self.image, str):
+                # Load image to get dimensions
+                image = cv2.imread(self.image)
+                height, width = image.shape[:2]
+            else:
+                height, width = self.image.shape[:2]
+        else:
+            # Default image size if not provided
+            height, width = 900, 1600  # Common size for nuScenes dataset
+        
+        in_image_mask = (
+            (pixels[:, 0] >= 0) & (pixels[:, 0] < width) &
+            (pixels[:, 1] >= 0) & (pixels[:, 1] < height)
+        )
+        
+        # Assign valid pixel coordinates
+        valid_indices = np.where(in_front_mask)[0][in_image_mask]
+        pixel_coords[valid_indices] = pixels[in_image_mask]
+        
+        return pixel_coords
+        
+    def project_cluster_to_pixels(self, cluster_points: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Project a 3D point cloud cluster to 2D pixel coordinates.
+        
+        Args:
+            cluster_points: Nx3 array of 3D points in the cluster
+            
+        Returns:
+            Dictionary containing:
+                - 'pixel_coords': Mx2 array of valid pixel coordinates
+                - 'valid_indices': M indices of points that projected to valid pixels
+                - 'cluster_hull': Convex hull of the projected pixels (for visualization)
+        """
+        # Project all points to pixels
+        pixel_coords = self.project_3d_points_to_pixels(cluster_points)
+        
+        # Find valid projections (not NaN)
+        valid_mask = ~np.isnan(pixel_coords[:, 0])
+        valid_pixels = pixel_coords[valid_mask]
+        valid_indices = np.where(valid_mask)[0]
+        
+        result = {
+            'pixel_coords': valid_pixels,
+            'valid_indices': valid_indices
+        }
+        
+        # Compute convex hull if there are enough points
+        if len(valid_pixels) >= 3:
+            try:
+                from scipy.spatial import ConvexHull
+                hull = ConvexHull(valid_pixels)
+                result['cluster_hull'] = valid_pixels[hull.vertices]
+            except Exception as e:
+                print(f"Could not compute convex hull: {e}")
+        
+        return result
+    
     def get_coordinate_systems(self) -> Dict[str, np.ndarray]:
         """
         Get coordinate system origins and axes for visualization.
@@ -381,6 +477,44 @@ class PointCloud:
 
 
 
+    def project_clusters_to_image(self, projection: Projection2DTo3D, 
+                                clusters: Optional[List[np.ndarray]] = None) -> List[Dict]:
+        """
+        Project point cloud clusters back to the image.
+        
+        Args:
+            projection: Projection2DTo3D object for 3D to 2D projection
+            clusters: List of point indices for each cluster. If None, uses self.clusters
+            
+        Returns:
+            List of dictionaries containing projection results for each cluster
+        """
+        if not hasattr(self, 'ground_removed'):
+            raise ValueError("Ground plane removal required before projection. Call remove_ground_plane_ransac() first.")
+        
+        if clusters is None:
+            if not hasattr(self, 'clusters'):
+                raise ValueError("No clusters available. Run a clustering algorithm first.")
+            clusters = self.clusters
+        
+        projection_results = []
+        
+        for i, cluster_indices in enumerate(clusters):
+            # Get 3D points for this cluster
+            cluster_points = self.point_cloud_plane_removed[cluster_indices]
+            
+            # Project to image
+            result = projection.project_cluster_to_pixels(cluster_points)
+            
+            # Add cluster ID
+            result['cluster_id'] = i
+            result['num_points'] = len(cluster_indices)
+            result['num_projected_points'] = len(result['valid_indices'])
+            
+            projection_results.append(result)
+        
+        return projection_results
+    
     def cluster_with_segmentation_masks(self, mask_points: Dict[int, np.ndarray],
                                        min_points_per_cluster: int = 10) -> List[np.ndarray]:
         """
