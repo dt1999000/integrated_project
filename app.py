@@ -237,7 +237,7 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
                 display_point_cloud = st.session_state.projected_point_cloud if st.session_state.projected_point_cloud is not None else point_cloud
                 fig = create_3d_scatter_plot(display_point_cloud, None, filtered_mask_points, None, filtered_rays, 
                                            "Projected Segmentation Mask on Point Cloud")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
 def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
                             mask_points: Optional[Dict[int, np.ndarray]] = None,
@@ -424,7 +424,7 @@ def dbscan_page(point_cloud):
         # 3D Visualization
         st.subheader("3D Visualization")
         fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "DBSCAN Clustering Results")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         # Parameter summary
         st.subheader("Parameters Used")
@@ -516,7 +516,7 @@ def optics_page(point_cloud):
         # 3D Visualization
         st.subheader("3D Visualization")
         fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "OPTICS Clustering Results")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         # Parameter summary
         st.subheader("Parameters Used")
@@ -589,7 +589,7 @@ def birch_page(point_cloud):
         # 3D Visualization
         st.subheader("3D Visualization")
         fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "BIRCH Clustering Results")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         # Parameter summary
         st.subheader("Parameters Used")
@@ -662,7 +662,7 @@ def agglomerative_page(point_cloud):
         # 3D Visualization
         st.subheader("3D Visualization")
         fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "Agglomerative Clustering Results")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         # Parameter summary
         st.subheader("Parameters Used")
@@ -788,7 +788,7 @@ def comparison_page(point_cloud):
             )
         
         fig.update_layout(height=600)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 def main():
     """Main application function"""
