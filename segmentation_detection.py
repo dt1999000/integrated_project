@@ -30,9 +30,100 @@ class SegmentationDetector:
         overrides=dict(conf=0.01, task="segment", mode="predict", imgsz=1024, model="sam2_t.pt", save=False)
         self.predictor = SAM2DynamicInteractivePredictor(overrides = overrides, max_obj_num=10)
     
-    def get_segmentation_mask(self, image: np.ndarray, bboxes: BoundingBoxes) -> np.ndarray:
-        """Get segmentation mask using SAM2."""
+    def downsample_segmentation_mask(self, mask: np.ndarray, scale_factor: float = 0.5) -> np.ndarray:
+        """
+        Downsample a segmentation mask for better performance.
         
+        Args:
+            mask: Input segmentation mask (H, W) with integer labels
+            scale_factor: Scale factor for downsampling (0.5 = half size)
+            
+        Returns:
+            Downsampled mask with preserved labels
+        """
+        if scale_factor >= 1.0:
+            return mask  # No downsampling needed
+            
+        # Get mask dimensions
+        h, w = mask.shape
+        new_h, new_w = int(h * scale_factor), int(w * scale_factor)
+        
+        # Create empty downsampled mask
+        downsampled_mask = np.zeros((new_h, new_w), dtype=mask.dtype)
+        
+        # Get unique labels (excluding background 0)
+        unique_labels = np.unique(mask)
+        unique_labels = unique_labels[unique_labels > 0]
+        
+        # Process each label separately to preserve them
+        for label in unique_labels:
+            # Create binary mask for this label
+            binary_mask = (mask == label).astype(np.uint8)
+            
+            # Downsample binary mask
+            downsampled_binary = cv2.resize(
+                binary_mask, 
+                (new_w, new_h), 
+                interpolation=cv2.INTER_NEAREST
+            )
+            
+            # Add to result with correct label
+            downsampled_mask[downsampled_binary > 0] = label
+            
+        return downsampled_mask
+    
+    def upsample_segmentation_mask(self, mask: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+        """
+        Upsample a segmentation mask back to original size.
+        
+        Args:
+            mask: Downsampled segmentation mask
+            target_shape: Target shape (height, width)
+            
+        Returns:
+            Upsampled mask with preserved labels
+        """
+        if mask.shape == target_shape:
+            return mask  # No upsampling needed
+            
+        h, w = target_shape
+        
+        # Create empty upsampled mask
+        upsampled_mask = np.zeros((h, w), dtype=mask.dtype)
+        
+        # Get unique labels (excluding background 0)
+        unique_labels = np.unique(mask)
+        unique_labels = unique_labels[unique_labels > 0]
+        
+        # Process each label separately to preserve them
+        for label in unique_labels:
+            # Create binary mask for this label
+            binary_mask = (mask == label).astype(np.uint8)
+            
+            # Upsample binary mask
+            upsampled_binary = cv2.resize(
+                binary_mask, 
+                (w, h), 
+                interpolation=cv2.INTER_NEAREST
+            )
+            
+            # Add to result with correct label
+            upsampled_mask[upsampled_binary > 0] = label
+            
+        return upsampled_mask
+    
+    def get_segmentation_mask(self, image: np.ndarray, bboxes: BoundingBoxes, use_downsampling: bool = True) -> np.ndarray:
+        """
+        Get segmentation mask using SAM2.
+        
+        Args:
+            image: Input RGB image
+            bboxes: Bounding boxes to use as prompts
+            use_downsampling: Whether to use downsampling for better performance
+            
+        Returns:
+            Segmentation mask with integer labels
+        """
         # Get max_obj_num from predictor to limit boxes
         max_obj_num = self.predictor._max_obj_num
         
@@ -43,17 +134,54 @@ class SegmentationDetector:
         if len(boxes_2d) == 0:
             return np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
         
-        results = self.predictor(
-            source=image,
-            bboxes=boxes_2d,
-            obj_ids=obj_ids,
-            update_memory=True
-        )
+        # Optionally downsample the image for faster processing
+        original_shape = image.shape[:2]
+        if use_downsampling:
+            # Downsample image to half size for faster processing
+            scale_factor = 0.5
+            h, w = original_shape
+            new_h, new_w = int(h * scale_factor), int(w * scale_factor)
+            
+            # Resize image
+            resized_image = cv2.resize(image, (new_w, new_h))
+            
+            # Scale bounding boxes
+            scaled_boxes = []
+            for box in boxes_2d:
+                scaled_box = [
+                    box[0] * scale_factor,
+                    box[1] * scale_factor,
+                    box[2] * scale_factor,
+                    box[3] * scale_factor
+                ]
+                scaled_boxes.append(scaled_box)
+            
+            # Run prediction on downsampled image
+            results = self.predictor(
+                source=resized_image,
+                bboxes=scaled_boxes,
+                obj_ids=obj_ids,
+                update_memory=True
+            )
+        else:
+            # Run prediction on original image
+            results = self.predictor(
+                source=image,
+                bboxes=boxes_2d,
+                obj_ids=obj_ids,
+                update_memory=True
+            )
         
         # Extract masks from results and combine into single mask array
         if results and len(results) > 0:
-            # Create empty mask with same dimensions as image
-            mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+            # Create empty mask with appropriate dimensions
+            if use_downsampling:
+                # Create mask with downsampled dimensions
+                h, w = int(original_shape[0] * 0.5), int(original_shape[1] * 0.5)
+                mask = np.zeros((h, w), dtype=np.uint8)
+            else:
+                # Create mask with original dimensions
+                mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
             
             # Process each result
             for i, result in enumerate(results):
@@ -77,7 +205,7 @@ class SegmentationDetector:
                     # Debug: print mask info
                     print(f"Mask {i}: shape={seg_mask.shape}, dtype={seg_mask.dtype}, min={seg_mask.min()}, max={seg_mask.max()}")
                     
-                    # Ensure mask matches image dimensions
+                    # Ensure mask matches current dimensions
                     if seg_mask.shape != mask.shape:
                         seg_mask = cv2.resize(seg_mask.astype(np.float32), 
                                              (mask.shape[1], mask.shape[0]), 
@@ -86,6 +214,10 @@ class SegmentationDetector:
                     # Add to mask with unique label (i+1 to avoid 0 which is background)
                     # Threshold the mask (masks are typically 0-1 range)
                     mask[seg_mask > 0.5] = i + 1
+            
+            # Upsample mask if needed
+            if use_downsampling:
+                mask = self.upsample_segmentation_mask(mask, original_shape)
             
             return mask
         else:
