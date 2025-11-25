@@ -233,20 +233,28 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
                                            "Projected Segmentation Mask on Point Cloud")
                 st.plotly_chart(fig, use_container_width=True)
 
-def create_3d_scatter_plot(points: np.ndarray, labels: Optional[np.ndarray] = None,
+def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
                             mask_points: Optional[Dict[int, np.ndarray]] = None,
                             cuboids: Optional[List[Dict]] = None,
                             rays: Optional[Dict[int, np.ndarray]] = None,
                           title: str = "3D Point Cloud") -> go.Figure:
     """Create a 3D scatter plot using Plotly for web compatibility"""
     fig = go.Figure()
+    
+    # Convert PointCloud object to numpy array if needed
+    if hasattr(points, 'point_cloud_plane_removed'):
+        # It's a PointCloud object
+        point_array = points.point_cloud_plane_removed
+    else:
+        # It's already a numpy array
+        point_array = points
 
     if labels is None:
         # Single color for all points
         fig.add_trace(go.Scatter3d(
-            x=points[:, 0],
-            y=points[:, 1],
-            z=points[:, 2],
+            x=point_array[:, 0],
+            y=point_array[:, 1],
+            z=point_array[:, 2],
             mode='markers',
             marker=dict(size=2, color='lightblue'),
             name='Points'
@@ -260,9 +268,9 @@ def create_3d_scatter_plot(points: np.ndarray, labels: Optional[np.ndarray] = No
             if label == -1:  # Noise points
                 mask = labels == label
                 fig.add_trace(go.Scatter3d(
-                    x=points[mask, 0],
-                    y=points[mask, 1],
-                    z=points[mask, 2],
+                    x=point_array[mask, 0],
+                    y=point_array[mask, 1],
+                    z=point_array[mask, 2],
                     mode='markers',
                     marker=dict(size=2, color='gray'),
                     name='Noise'
@@ -270,9 +278,9 @@ def create_3d_scatter_plot(points: np.ndarray, labels: Optional[np.ndarray] = No
             else:
                 mask = labels == label
                 fig.add_trace(go.Scatter3d(
-                    x=points[mask, 0],
-                    y=points[mask, 1],
-                    z=points[mask, 2],
+                    x=point_array[mask, 0],
+                    y=point_array[mask, 1],
+                    z=point_array[mask, 2],
                     mode='markers',
                     marker=dict(size=2, color=colors[i % len(colors)]),
                     name=f'Cluster {label}'
