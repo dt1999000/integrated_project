@@ -208,6 +208,27 @@ class PointCloud:
         self.original_point_cloud = point_cloud[:, :3] if point_cloud.shape[1] > 3 else point_cloud
         self.coordinate_systems = coordinate_systems
         self.ground_removed = False
+        
+    def copy(self):
+        """
+        Create a copy of the point cloud.
+        
+        Returns:
+            A new PointCloud instance with the same data
+        """
+        new_point_cloud = PointCloud(self.original_point_cloud.copy(), 
+                                    self.coordinate_systems.copy() if self.coordinate_systems else None)
+        
+        # Copy additional attributes if they exist
+        if self.ground_removed:
+            new_point_cloud.ground_removed = True
+            new_point_cloud.point_cloud_plane_removed = self.point_cloud_plane_removed.copy()
+            if hasattr(self, 'ground_plane_model'):
+                new_point_cloud.ground_plane_model = self.ground_plane_model.copy()
+            if hasattr(self, 'ground_inliers'):
+                new_point_cloud.ground_inliers = self.ground_inliers.copy()
+        
+        return new_point_cloud
 
     def remove_ground_plane_ransac(self, distance_threshold: float = 0.3,
                                    ransac_n: int = 3, num_iterations: int = 1000, remove_ego_car: bool = True) -> np.ndarray:
