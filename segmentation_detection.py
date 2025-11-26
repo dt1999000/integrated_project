@@ -191,7 +191,14 @@ class SegmentationDetector:
                     mask_obj = result.masks[0]
                     
                     # Get the actual mask data (tensor/array) from the Masks object
-                    seg_mask = mask_obj.data
+                    # Handle different Masks object structures
+                    if hasattr(mask_obj, 'data'):
+                        seg_mask = mask_obj.data
+                    elif hasattr(mask_obj, 'masks'):
+                        seg_mask = mask_obj.masks
+                    else:
+                        # Try to get the mask data directly
+                        seg_mask = mask_obj
                     
                     # Convert to numpy if it's a tensor
                     if torch.is_tensor(seg_mask):
