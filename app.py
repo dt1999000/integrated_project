@@ -124,10 +124,7 @@ def project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, poin
     mask_points = {}
     for mask_id, result in results.items():
         rays[mask_id] = result['rays']
-        print(f"rays: {rays}")
-        print(f"mask_points: {mask_points}")
         mask_points[mask_id] = result['projected_points']
-        print(f"mask_points: {mask_points}")
     return rays, mask_points
 
 def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
@@ -153,7 +150,7 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
             ax[0].set_title("Original Image")
             ax[0].axis('off')
             ax[1].imshow(cv2.imread(sample_data['image_path']))
-            ax[1].imshow(segmentation_mask, cmap='jet', alpha=0.7)
+            ax[1].imshow(segmentation_mask, cmap='rgb', alpha=0.7)
             ax[1].set_title("Segmentation Mask")
             ax[1].axis('off')
             st.pyplot(fig)
@@ -164,9 +161,8 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
             st.session_state.unique_mask_ids = unique_mask_ids
             st.success(f"Found {len(unique_mask_ids)} segmentation masks")
     
-    # Run projection button (only enabled if segmentation is done)
-    if st.session_state.segmentation_masks is not None:
-        if st.sidebar.button("🚀 Run Projection", key="run_projection"):
+        if st.session_state.segmentation_masks is not None:
+
             with st.spinner("Running projection..."):
                 start_time = time.time()
                 rays, mask_points = project_segmentation_mask_on_pointcloud(
@@ -195,49 +191,48 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
                     st.session_state.all_mask_points = mask_points  # Just store the mask points separately
                 
                 st.success(f"Projection completed in {runtime:.2f} seconds")
-        
-        # Display results if available
-        if 'all_mask_points' in st.session_state and st.session_state.all_mask_points:
-            # Get all available mask IDs
-            all_mask_ids = list(st.session_state.all_mask_points.keys())
             
-            # Create mask selection slider
-            st.subheader("Mask Selection")
-            
-            # Determine how many masks to show
-            num_masks = len(all_mask_ids)
-            if num_masks > 10:
-                # If more than 10 masks, create a slider to select a range
-                start_idx = st.slider("Start Mask Index", 0, max(0, num_masks - 10), 0, key="mask_start_idx")
-                end_idx = min(start_idx + 10, num_masks)
-                selected_mask_ids = all_mask_ids[start_idx:end_idx]
-                st.info(f"Showing masks {start_idx+1} to {end_idx} of {num_masks}")
-            else:
-                # If 10 or fewer, show all masks
-                selected_mask_ids = all_mask_ids
-            
-            # Create multiselect for specific masks
-            selected_masks = st.multiselect(
-                "Select Masks to Display",
-                options=selected_mask_ids,
-                default=selected_mask_ids[:min(3, len(selected_mask_ids))],
-                key="selected_masks"
-            )
-            
-            # Filter mask_points and rays based on selection
-            filtered_mask_points = {mask_id: st.session_state.all_mask_points[mask_id] 
-                                  for mask_id in selected_masks if mask_id in st.session_state.all_mask_points}
-            filtered_rays = {mask_id: st.session_state.all_rays[mask_id] 
-                           for mask_id in selected_masks if mask_id in st.session_state.all_rays}
-            
-            # Create 3D visualization
-            st.subheader("3D Visualization")
-            if point_cloud is not None:
-                # Use projected point cloud if available
-                display_point_cloud = st.session_state.projected_point_cloud if st.session_state.projected_point_cloud is not None else point_cloud
-                fig = create_3d_scatter_plot(display_point_cloud, None, filtered_mask_points, None, filtered_rays, 
-                                           "Projected Segmentation Mask on Point Cloud")
-                st.plotly_chart(fig, width='stretch')
+            # Display results if available
+            if 'all_mask_points' in st.session_state and st.session_state.all_mask_points:
+                # Get all available mask IDs
+                all_mask_ids = list(st.session_state.all_mask_points.keys())
+                
+                # Create mask selection slider
+                st.subheader("Mask Selection")
+                
+                # Determine how many masks to show
+                num_masks = len(all_mask_ids)
+                if num_masks > 10:
+                    # If more than 10 masks, create a slider to select a range
+                    start_idx = st.slider("Start Mask Index", 0, max(0, num_masks - 10), 0, key="mask_start_idx")
+                    end_idx = min(start_idx + 10, num_masks)
+                    selected_mask_ids = all_mask_ids[start_idx:end_idx]
+                    st.info(f"Showing masks {start_idx+1} to {end_idx} of {num_masks}")
+                else:
+                    # If 10 or fewer, show all masks
+                    selected_mask_ids = all_mask_ids
+                
+                # Create multiselect for specific masks
+                selected_masks = st.multiselect(
+                    "Select Masks to Display",
+                    options=selected_mask_ids,
+                    default=selected_mask_ids[:min(3, len(selected_mask_ids))],
+                    key="selected_masks"
+                )
+                
+                # Filter mask_points and rays based on selection
+                filtered_mask_points = {mask_id: st.session_state.all_mask_points[mask_id] 
+                                    for mask_id in selected_masks if mask_id in st.session_state.all_mask_points}
+                filtered_rays = {mask_id: st.session_state.all_rays[mask_id] 
+                            for mask_id in selected_masks if mask_id in st.session_state.all_rays}
+                
+                # Create 3D visualization
+                st.subheader("3D Visualization")
+                if point_cloud is not None:
+                    display_point_cloud = st.session_state.projected_point_cloud if st.session_state.projected_point_cloud is not None else point_cloud
+                    fig = create_3d_scatter_plot(display_point_cloud, None, filtered_mask_points, None, filtered_rays, 
+                                            "Projected Segmentation Mask on Point Cloud")
+                    st.plotly_chart(fig, width='stretch')
 
 def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
                             mask_points: Optional[Dict[int, np.ndarray]] = None,
@@ -372,7 +367,7 @@ def dbscan_page(point_cloud):
             start_time = time.time()
             
             # Get points
-            points = point_cloud.point_cloud_plane_removed
+            points = st.session_state.point_cloud.point_cloud_plane_removed
             
             # Initialize clustering manager
             clustering_manager = ClusteringManager(points)
