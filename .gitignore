@@ -11,3 +11,6 @@ detection_results/
 __pycache__/
 
 *.png
+
+.claude/
+.cursor/
