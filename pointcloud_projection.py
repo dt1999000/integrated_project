@@ -230,45 +230,71 @@ class PointCloud:
         
         return new_point_cloud
 
+    def filter_forward_points(self, points: np.ndarray) -> np.ndarray:
+        """
+        Filter points to only include those in front of the vehicle (positive x in LiDAR coords).
+        This is necessary because KITTI only has forward-facing cameras.
+
+        Args:
+            points: Nx3 array of points
+
+        Returns:
+            Filtered Nx3 array with only forward-facing points
+        """
+        forward_mask = points[:, 0] > 0  # Keep only positive x values
+        filtered_points = points[forward_mask]
+
+        n_removed = len(points) - len(filtered_points)
+        if n_removed > 0:
+            print(f"Forward-facing filter:")
+            print(f"  Removed {n_removed} points behind/beside vehicle (x <= 0)")
+            print(f"  Remaining forward-facing points: {len(filtered_points)}")
+
+        return filtered_points
+
     def remove_ground_plane_ransac(self, distance_threshold: float = 0.3,
-                                   ransac_n: int = 3, num_iterations: int = 1000, remove_ego_car: bool = True) -> np.ndarray:
+                                   ransac_n: int = 3, num_iterations: int = 1000,
+                                   remove_ego_car: bool = True, filter_forward_only: bool = True) -> np.ndarray:
         """
         Remove ground plane from point cloud using RANSAC.
-        
+
         Args:
             distance_threshold: Maximum distance from plane to be considered inlier
             ransac_n: Number of points to sample for plane fitting
             num_iterations: Number of RANSAC iterations
-            
+            remove_ego_car: Whether to remove points near the ego vehicle
+            filter_forward_only: Whether to keep only forward-facing points (x > 0)
+
         Returns:
             Filtered point cloud with ground plane removed
         """
-        
+
         # Create Open3D point cloud
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(self.original_point_cloud)
-        
+
         # Segment plane using RANSAC
         plane_model, inliers = pcd.segment_plane(
             distance_threshold=distance_threshold,
             ransac_n=ransac_n,
             num_iterations=num_iterations
         )
-        
+
         # Extract non-ground points (outliers)
         outlier_cloud = pcd.select_by_index(inliers, invert=True)
-        
+
         # Convert back to numpy array
         filtered_points = np.asarray(outlier_cloud.points)
-        
+
         n_ground_points = len(inliers)
         n_remaining_points = len(filtered_points)
-        
+
         print(f"RANSAC ground plane removal:")
         print(f"  Ground plane equation: {plane_model[:3]} * x + {plane_model[3]} = 0")
         print(f"  Ground points removed: {n_ground_points}")
         print(f"  Remaining points: {n_remaining_points}")
         print(f"  Removal ratio: {n_ground_points / len(self.original_point_cloud) * 100:.2f}%")
+
         if remove_ego_car:
             # Calculate distance from LiDAR origin (0, 0, 0) for each point
             distances = np.linalg.norm(filtered_points[:, :3], axis=1)
@@ -276,8 +302,13 @@ class PointCloud:
             filtered_points = filtered_points[ego_mask]
 
             print(f"Ego car removal:")
-            print(f"  Removed {np.sum(~ego_mask)} points within 1.5m of LiDAR origin")
-            print(f"  Remaining points: {len(self.original_point_cloud)}")
+            print(f"  Removed {np.sum(~ego_mask)} points within 2.5m of LiDAR origin")
+            print(f"  Remaining points: {len(filtered_points)}")
+
+        # Filter to only forward-facing points (positive x)
+        if filter_forward_only:
+            filtered_points = self.filter_forward_points(filtered_points)
+
         self.ground_removed = True
         self.point_cloud_plane_removed = filtered_points
         self.ground_plane_model = plane_model

@@ -3,7 +3,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from element import cuboid_from_minmax
+from element import cuboid_from_minmax, cuboid_from_corners
 import time
 import sys
 import os
@@ -20,6 +20,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import our pipeline components
 from nuscenes_dataset_loader import NuScenesDatasetLoader
+from kitti_dataset_loader import KITTIDatasetLoader
 from pointcloud_projection import PointCloud, Projection2DTo3D
 from clustering_manager import ClusteringManager
 from segmentation_detection import SegmentationDetector
@@ -72,35 +73,71 @@ if 'all_mask_points' not in st.session_state:
 if 'all_rays' not in st.session_state:
     st.session_state.all_rays = {}
 
-def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, ransac_n: int = 3, num_iterations: int = 1000):
-    """Load a sample from the nuScenes dataset"""
+def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, ransac_n: int = 3, num_iterations: int = 1000, dataset: str = "nuscenes", filter_forward_only: bool = True):
+    """
+    Load a sample from either NuScenes or KITTI dataset.
+
+    Args:
+        sample_index: Index of the sample to load
+        distance_threshold: RANSAC distance threshold for ground plane removal
+        ransac_n: RANSAC number of points
+        num_iterations: RANSAC number of iterations
+        dataset: 'nuscenes' or 'kitti'
+        filter_forward_only: Whether to keep only forward-facing points (x > 0)
+
+    Returns:
+        Tuple of (sample_data dict, PointCloud object with ground removed)
+    """
     try:
-        # Initialize dataset loader
-        dataset_loader = NuScenesDatasetLoader(dataroot='v1.0-mini')
-        dataset_loader.load_dataset()
-        
-        # Get sample token
-        sample_token = dataset_loader.nusc.sample[sample_index]['token']
-        
-        # Load synchronized camera and LiDAR data
-        sample_data = dataset_loader.load_nuscenes_data(sample_token)
-        
+        if dataset == "nuscenes":
+            # Load NuScenes data
+            dataset_loader = NuScenesDatasetLoader(dataroot='v1.0-mini')
+            dataset_loader.load_dataset()
+
+            # Get sample token
+            sample_token = dataset_loader.nusc.sample[sample_index]['token']
+
+            # Load synchronized camera and LiDAR data
+            sample_data = dataset_loader.load_nuscenes_data(sample_token)
+
+        elif dataset == "kitti":
+            # Load KITTI data
+            dataset_loader = KITTIDatasetLoader(dataroot='dataset/kitti', split='training')
+            dataset_loader.load_dataset()
+
+            # Load synchronized camera, LiDAR, and ground truth data
+            sample_data = dataset_loader.load_kitti_data(sample_index)
+
+        else:
+            st.error(f"Unknown dataset: {dataset}")
+            return None, None
+
         if sample_data is None:
             st.error(f"Failed to load sample {sample_index}")
             return None, None
 
-        # Load point cloud
+        # Load point cloud and remove ground plane
         point_cloud = PointCloud(sample_data['point_cloud'])
-        
-        point_cloud.remove_ground_plane_ransac(distance_threshold=distance_threshold, ransac_n=ransac_n, num_iterations=num_iterations)
-        #segmentation_detector = SegmentationDetector()
+        point_cloud.remove_ground_plane_ransac(
+            distance_threshold=distance_threshold,
+            ransac_n=ransac_n,
+            num_iterations=num_iterations,
+            filter_forward_only=filter_forward_only
+        )
+
         return sample_data, point_cloud
 
     except Exception as e:
         st.error(f"Error loading dataset: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
         return None, None
 
 def get_segmentation_mask(sample_data):
+    # Check if we have NuScenes data (segmentation only works with NuScenes)
+    if 'nusc' not in sample_data or 'sample_token' not in sample_data:
+        return None
+
     image = cv2.imread(sample_data['image_path'])
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     nusc = sample_data['nusc']
@@ -129,19 +166,29 @@ def project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, poin
 
 def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
     st.header("🎯 Project Segmentation Mask on Point Cloud")
+
+    # Check if we're using KITTI dataset (segmentation only works with NuScenes)
+    if st.session_state.get('current_dataset') == 'kitti':
+        st.warning("⚠️ Segmentation projection is only available for NuScenes dataset. Please switch to NuScenes in the sidebar to use this feature.")
+        st.info("💡 For KITTI dataset, please use the 'KITTI Ground Truth' tab to view ground truth annotations.")
+        return
+
     st.subheader("Segmentation Mask")
-    
+
     # Projection parameters in sidebar
     with st.sidebar.expander("Projection Parameters", expanded=True):
         max_distance = st.slider("Max Ray Distance", min_value=10.0, max_value=200.0, value=100.0, step=10.0,
                               help="Maximum ray extension distance for projection", key="max_distance")
         distance_threshold = st.slider("Distance Threshold", min_value=0.1, max_value=2.0, value=0.5, step=0.1,
                                     help="Maximum perpendicular distance to consider a point on the ray", key="ray_distance_threshold")
-    
+
     # Run segmentation button
     if st.sidebar.button("🚀 Run Segmentation", key="run_segmentation"):
         with st.spinner("Running segmentation..."):
             segmentation_mask = get_segmentation_mask(sample_data)
+            if segmentation_mask is None:
+                st.error("Failed to generate segmentation mask. Please ensure NuScenes data is loaded.")
+                return
             st.session_state.segmentation_masks = segmentation_mask
             
             # Show segmentation mask on image
@@ -234,6 +281,47 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
                                             "Projected Segmentation Mask on Point Cloud")
                     st.plotly_chart(fig, width='stretch')
 
+def add_cuboids_to_figure(fig: go.Figure, cuboids: List[Dict], color: str = "blue",
+                          opacity: float = 0.2, name_prefix: str = "") -> go.Figure:
+    """
+    Add cuboids to a plotly figure, supporting both corner-based and min/max formats.
+
+    Args:
+        fig: Plotly figure to add cuboids to
+        cuboids: List of cuboid dictionaries with either 'corners' or min/max keys
+        color: Default color for cuboids
+        opacity: Opacity of cuboids (0.0 to 1.0)
+        name_prefix: Prefix for cuboid names (e.g., "GT: " or "Detected: ")
+
+    Returns:
+        Modified figure with cuboids added
+    """
+    for cuboid in cuboids:
+        category = cuboid.get('category', 'Unknown')
+        cuboid_name = f"{name_prefix}{category}" if name_prefix else category
+
+        # Use corner-based visualization if corners are available (preserves rotation)
+        if 'corners' in cuboid and cuboid['corners'] is not None:
+            fig.add_trace(cuboid_from_corners(
+                cuboid['corners'],
+                color=color,
+                opacity=opacity,
+                name=cuboid_name
+            ))
+        else:
+            # Fallback to min/max format
+            mesh = cuboid_from_minmax(
+                cuboid['min_x'], cuboid['min_y'], cuboid['min_z'],
+                cuboid['max_x'], cuboid['max_y'], cuboid['max_z'],
+                color=color,
+                opacity=opacity
+            )
+            mesh.name = cuboid_name
+            fig.add_trace(mesh)
+
+    return fig
+
+
 def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
                             mask_points: Optional[Dict[int, np.ndarray]] = None,
                             cuboids: Optional[List[Dict]] = None,
@@ -288,8 +376,7 @@ def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
                 ))
     
     if cuboids is not None:
-        for cuboid in st.session_state.cuboids:
-            fig.add_trace(cuboid_from_minmax(cuboid['min_x'], cuboid['min_y'], cuboid['min_z'], cuboid['max_x'], cuboid['max_y'], cuboid['max_z']))
+        add_cuboids_to_figure(fig, cuboids, color='red', opacity=0.2, name_prefix="Cuboid: ")
 
     if mask_points is not None:
         # Use different colors for different masks
@@ -785,6 +872,170 @@ def comparison_page(point_cloud):
         fig.update_layout(height=600)
         st.plotly_chart(fig, width='stretch')
 
+def create_comparison_plot(point_cloud, ground_truth_cuboids, detected_cuboids):
+    """Create overlay plot with both GT and detected cuboids"""
+    fig = go.Figure()
+
+    # Add point cloud
+    pc_array = point_cloud.point_cloud_plane_removed
+    fig.add_trace(go.Scatter3d(
+        x=pc_array[:, 0], y=pc_array[:, 1], z=pc_array[:, 2],
+        mode='markers',
+        marker=dict(size=1, color='lightgray'),
+        name='Point Cloud'
+    ))
+
+    # Add ground truth cuboids (green) using helper function
+    add_cuboids_to_figure(fig, ground_truth_cuboids, color='green', opacity=0.3, name_prefix="GT: ")
+
+    # Add detected cuboids (red) using helper function
+    add_cuboids_to_figure(fig, detected_cuboids, color='red', opacity=0.3, name_prefix="Detected: ")
+
+    fig.update_layout(
+        title="Ground Truth (Green) vs Detected (Red)",
+        scene=dict(
+            xaxis=dict(title='X'),
+            yaxis=dict(title='Y'),
+            zaxis=dict(title='Z'),
+            aspectmode='data'
+        ),
+        height=700
+    )
+
+    return fig
+
+def kitti_groundtruth_page():
+    """KITTI Ground Truth Comparison page - Uses same pipeline as other pages"""
+    st.header("🎯 KITTI Ground Truth Comparison")
+
+    # Check if we have KITTI data loaded
+    if 'sample_data' not in st.session_state or st.session_state.get('current_dataset') != 'kitti':
+        st.info("👈 Switch to KITTI dataset in the sidebar and load a sample to compare with ground truth")
+        st.markdown("""
+        ### How to use:
+        1. In the **Data Controls** sidebar, select **Dataset: KITTI**
+        2. Choose a sample index (0-7480)
+        3. Click **Load Sample**
+        4. Run clustering on other tabs (DBSCAN, BIRCH, etc.)
+        5. Return here to see ground truth vs detected objects
+
+        The ground truth 3D cuboids from KITTI will be shown in **green**,
+        while your pipeline's detected clusters will be shown in **red**.
+        """)
+        return
+
+    sample_data = st.session_state.sample_data
+    point_cloud = st.session_state.point_cloud
+
+    # Display camera image
+    st.subheader("📷 Camera Image")
+    try:
+        img = cv2.imread(sample_data['image_path'])
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        st.image(img, caption=f"KITTI Sample {sample_data.get('sample_index', 0)}", width='stretch')
+    except Exception as e:
+        st.warning(f"Could not load image: {str(e)}")
+
+    # Display ground truth info
+    ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
+    if ground_truth_boxes:
+        st.subheader("📦 Ground Truth Objects")
+        categories = [box['category'] for box in ground_truth_boxes]
+        category_counts = pd.DataFrame({'Category': categories}).value_counts().reset_index()
+        category_counts.columns = ['Category', 'Count']
+
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.dataframe(category_counts, width='stretch')
+        with col2:
+            st.markdown(f"""
+            **Total Ground Truth Objects**: {len(ground_truth_boxes)}
+
+            These are the human-annotated 3D bounding boxes from the KITTI dataset.
+            They will be visualized in **green** in the comparison plots below.
+            """)
+
+        # Visualize ground truth alone
+        st.subheader("🟢 Ground Truth Visualization")
+        fig_gt = create_3d_scatter_plot(
+            point_cloud,
+            None,
+            None,
+            ground_truth_boxes,
+            None,
+            "KITTI Ground Truth Cuboids"
+        )
+        st.plotly_chart(fig_gt, width='stretch')
+
+    else:
+        st.warning("No ground truth boxes available for this sample")
+
+    # Check if user has run clustering
+    st.subheader("🔴 Pipeline Detection Results")
+    if 'cuboids' in st.session_state and st.session_state.cuboids:
+        detected_cuboids = st.session_state.cuboids
+
+        # Get clustering results
+        clustering_result = None
+        for algo in ['dbscan', 'optics', 'birch', 'agglomerative']:
+            if algo in st.session_state.clustering_results:
+                clustering_result = st.session_state.clustering_results[algo]
+                labels = clustering_result['labels']
+                break
+
+        if clustering_result:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Ground Truth Objects", len(ground_truth_boxes))
+            with col2:
+                st.metric("Detected Clusters", len(detected_cuboids))
+            with col3:
+                n_noise = np.sum(labels == -1) if -1 in labels else 0
+                st.metric("Noise Points", n_noise)
+
+            # Side-by-side comparison
+            st.subheader("📊 Side-by-Side Comparison")
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**🟢 Ground Truth (KITTI)**")
+                fig_gt = create_3d_scatter_plot(
+                    point_cloud,
+                    None,
+                    None,
+                    ground_truth_boxes,
+                    None,
+                    "Ground Truth"
+                )
+                st.plotly_chart(fig_gt, width='stretch')
+
+            with col2:
+                st.markdown("**🔴 Pipeline Detection**")
+                fig_det = create_3d_scatter_plot(
+                    point_cloud,
+                    labels,
+                    None,
+                    detected_cuboids,
+                    None,
+                    "Detected Objects"
+                )
+                st.plotly_chart(fig_det, width='stretch')
+
+            # Overlay view
+            st.subheader("🎨 Overlay Comparison")
+            st.markdown("**Green** = Ground Truth | **Red** = Detected")
+            fig_overlay = create_comparison_plot(
+                point_cloud,
+                ground_truth_boxes,
+                detected_cuboids
+            )
+            st.plotly_chart(fig_overlay, width='stretch')
+
+        else:
+            st.info("Run a clustering algorithm (DBSCAN, OPTICS, etc.) on other tabs to see detection comparison")
+    else:
+        st.info("Run a clustering algorithm (DBSCAN, OPTICS, etc.) on other tabs to see detection comparison")
+
 def main():
     """Main application function"""
     # Header
@@ -812,24 +1063,61 @@ def main():
     
     # Sidebar controls
     st.sidebar.header("📂 Data Controls")
-    
-    # Sample selection
-    sample_index = st.sidebar.slider("Sample Index", min_value=0, max_value=403, value=0, step=1, key="sample_index")
-    #add some slider to change the parameters of ransac interactively before loading the data
+
+    # Dataset selection
+    dataset = st.sidebar.selectbox(
+        "Dataset",
+        options=["nuscenes", "kitti"],
+        format_func=lambda x: "NuScenes" if x == "nuscenes" else "KITTI",
+        key="dataset_selector"
+    )
+
+    # Sample selection (max value depends on dataset)
+    max_sample = 403 if dataset == "nuscenes" else 7480
+    sample_index = st.sidebar.slider(
+        "Sample Index",
+        min_value=0,
+        max_value=max_sample,
+        value=0,
+        step=1,
+        key="sample_index",
+        help=f"0-{max_sample} for {dataset.upper()}"
+    )
+
+    # RANSAC parameters for ground plane removal
+    st.sidebar.markdown("### Ground Plane Removal")
     distance_threshold = st.sidebar.slider("Distance Threshold", min_value=0.1, max_value=1.0, value=0.3, step=0.01, key="distance_threshold")
     ransac_n = st.sidebar.slider("RANSAC N", min_value=3, max_value=10, value=3, step=1, key="ransac_n")
     num_iterations = st.sidebar.slider("Number of Iterations", min_value=100, max_value=1000, value=1000, step=100, key="num_iterations")
+    filter_forward_only = st.sidebar.checkbox("Forward-Facing Only", value=True, key="filter_forward_only",
+                                              help="Keep only points in front of vehicle (x > 0). Enable for forward-facing camera datasets like KITTI.")
+
     # Load data button
     if st.sidebar.button("🔄 Load Sample", key="load_sample"):
-        with st.spinner("Loading dataset sample..."):
-            sample_data, point_cloud = load_dataset_sample(sample_index, distance_threshold, ransac_n, num_iterations)
-            
+        with st.spinner(f"Loading {dataset.upper()} sample {sample_index}..."):
+            sample_data, point_cloud = load_dataset_sample(
+                sample_index,
+                distance_threshold,
+                ransac_n,
+                num_iterations,
+                dataset=dataset,
+                filter_forward_only=filter_forward_only
+            )
+
             if sample_data is not None:
                 st.session_state.data_loaded = True
                 st.session_state.point_cloud = point_cloud
                 st.session_state.clustering_results = {}
                 st.session_state.sample_data = sample_data
-                st.success(f"Sample {sample_index} loaded successfully!")
+                st.session_state.current_dataset = dataset
+                st.session_state.cuboids = []  # Clear previous cuboids
+
+                # Show ground truth info for KITTI
+                if dataset == "kitti" and 'ground_truth_boxes' in sample_data:
+                    n_gt = len(sample_data['ground_truth_boxes'])
+                    st.success(f"✅ {dataset.upper()} sample {sample_index} loaded! Ground truth: {n_gt} objects")
+                else:
+                    st.success(f"✅ {dataset.upper()} sample {sample_index} loaded!")
                 st.rerun()
 
     # Navigation tabs
@@ -855,8 +1143,8 @@ def main():
         st.rerun()
 
     # Main navigation
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "SEGMENTATION AND PROJECTION ", "DBSCAN", " BIRCH", " Agglomerative", " Comparison"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "SEGMENTATION AND PROJECTION ", "DBSCAN", " BIRCH", " Agglomerative", " Comparison", "KITTI Ground Truth"
     ])
 
     with tab1:
@@ -873,6 +1161,9 @@ def main():
 
     with tab5:
         optics_page(point_cloud)
+
+    with tab6:
+        kitti_groundtruth_page()
         
 
 if __name__ == "__main__":
