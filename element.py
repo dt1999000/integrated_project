@@ -89,3 +89,60 @@ def cuboid_from_corners(corners, color="blue", opacity=0.2, name="cuboid"):
         name=name,
     )
     return cuboid
+
+
+def frustum_from_camera_and_corners(camera_origin: np.ndarray,
+                                     base_corners: np.ndarray,
+                                     color: str = "blue",
+                                     opacity: float = 0.2,
+                                     name: str = "frustum") -> go.Mesh3d:
+    """
+    Create a frustum/pyramid mesh from camera origin (apex) to 4 base corners.
+    Used to visualize 2D bounding box projection onto 3D point cloud.
+
+    Args:
+        camera_origin: np.ndarray (3,) - Camera center in LiDAR coords (apex of pyramid)
+        base_corners: np.ndarray (4, 3) - 4 corner points in LiDAR coords (base of pyramid)
+                      Order: [top-left, top-right, bottom-right, bottom-left]
+        color: Mesh color
+        opacity: Mesh transparency (0.0 to 1.0)
+        name: Trace name for the mesh
+
+    Returns:
+        go.Mesh3d: Plotly mesh object for the frustum pyramid
+    """
+    # Validate inputs
+    camera_origin = np.asarray(camera_origin).flatten()
+    if camera_origin.shape != (3,):
+        raise ValueError(f"Expected camera_origin shape (3,), got {camera_origin.shape}")
+
+    base_corners = np.asarray(base_corners)
+    if base_corners.shape != (4, 3):
+        raise ValueError(f"Expected base_corners shape (4, 3), got {base_corners.shape}")
+
+    # 5 vertices: apex (camera) + 4 base corners
+    # Vertex 0: camera origin (apex)
+    # Vertices 1-4: base corners (TL, TR, BR, BL)
+    vertices = np.vstack([camera_origin.reshape(1, 3), base_corners])
+    x = vertices[:, 0].tolist()
+    y = vertices[:, 1].tolist()
+    z = vertices[:, 2].tolist()
+
+    # Triangle faces:
+    # 4 side triangles connecting apex to base edges
+    # 2 base triangles to close the bottom
+    # Vertex indices: 0=apex, 1=TL, 2=TR, 3=BR, 4=BL
+    i = [0, 0, 0, 0, 1, 1]  # First vertex of each triangle
+    j = [1, 2, 3, 4, 2, 3]  # Second vertex
+    k = [2, 3, 4, 1, 3, 4]  # Third vertex
+
+    frustum = go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        color=color,
+        opacity=opacity,
+        flatshading=True,
+        showscale=False,
+        name=name,
+    )
+    return frustum

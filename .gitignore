@@ -17,5 +17,6 @@ __pycache__/
 *.webp
 *.svg
 *.eps
+nul
 
 .claude

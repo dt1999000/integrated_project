@@ -185,6 +185,14 @@ class KITTIDatasetLoader:
                     continue
 
                 # Parse KITTI label: Type Truncated Occluded Alpha bbox2d(4) dim(3) loc(3) Rotation_y
+                # Extract 2D bounding box (pixel coordinates)
+                bbox_2d = {
+                    'left': float(parts[4]),
+                    'top': float(parts[5]),
+                    'right': float(parts[6]),
+                    'bottom': float(parts[7])
+                }
+
                 h, w, l = float(parts[8]), float(parts[9]), float(parts[10])  # height, width, length
                 x, y, z = float(parts[11]), float(parts[12]), float(parts[13])  # location in camera coords
                 rotation_y = float(parts[14])
@@ -219,6 +227,7 @@ class KITTIDatasetLoader:
                 cuboid = {
                     'category': obj_type,
                     'corners': corners_lidar,
+                    'bbox_2d': bbox_2d,  # 2D bounding box in pixel coordinates
                     'min_x': float(corners_lidar[:, 0].min()),
                     'max_x': float(corners_lidar[:, 0].max()),
                     'min_y': float(corners_lidar[:, 1].min()),

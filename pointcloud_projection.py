@@ -189,7 +189,7 @@ class Projection2DTo3D:
     def get_coordinate_systems(self) -> Dict[str, np.ndarray]:
         """
         Get coordinate system origins and axes for visualization.
-        
+
         Returns:
             Dictionary with 'lidar_origin', 'lidar_axes', 'camera_origin', 'camera_axes'
         """
@@ -199,6 +199,55 @@ class Projection2DTo3D:
             'camera_origin': self.camera_origin,
             'camera_axes': self.camera_axes
         }
+
+    def project_bbox_corners_to_3d(self, bbox_2d: Dict,
+                                    depth: float = 30.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Project 2D bounding box corners to 3D using ray casting.
+        Creates a frustum/pyramid by projecting the 4 corners of a 2D bbox to 3D.
+
+        Args:
+            bbox_2d: Dict with 'left', 'top', 'right', 'bottom' pixel coords
+            depth: Distance to extend rays (meters)
+
+        Returns:
+            camera_origin: np.ndarray (3,) - Camera center in LiDAR coords (apex of frustum)
+            base_corners: np.ndarray (4, 3) - Projected corner positions in LiDAR coords (base of frustum)
+        """
+        # Get camera origin in LiDAR coordinates
+        camera_center_cam = np.array([0, 0, 0, 1])
+        camera_origin = (self.camera_to_lidar_transform @ camera_center_cam)[:3]
+
+        # Extract 4 corners from 2D bbox (in pixel coordinates)
+        corners_2d = np.array([
+            [bbox_2d['left'], bbox_2d['top']],      # Top-left
+            [bbox_2d['right'], bbox_2d['top']],     # Top-right
+            [bbox_2d['right'], bbox_2d['bottom']],  # Bottom-right
+            [bbox_2d['left'], bbox_2d['bottom']]    # Bottom-left
+        ])
+
+        # Inverse camera intrinsic for back-projection
+        K_inv = np.linalg.inv(self.camera_intrinsic)
+
+        base_corners = []
+        for u, v in corners_2d:
+            # Back-project pixel to camera coordinates (normalized at z=1)
+            pixel_homogeneous = np.array([u, v, 1.0])
+            point_cam = K_inv @ pixel_homogeneous
+
+            # Normalize to get direction vector in camera coordinates
+            direction_cam = point_cam / np.linalg.norm(point_cam)
+
+            # Transform direction to LiDAR coordinates
+            direction_lidar = self.camera_to_lidar_transform[:3, :3] @ direction_cam
+            direction_lidar = direction_lidar / np.linalg.norm(direction_lidar)
+
+            # Extend ray to specified depth
+            corner_3d = camera_origin + direction_lidar * depth
+            base_corners.append(corner_3d)
+
+        return camera_origin, np.array(base_corners)
+
 
 class PointCloud:
     """

@@ -1,13 +1,18 @@
 import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-from element import cuboid_from_minmax, cuboid_from_corners
+from visualization_helper import (
+    draw_2d_boxes_on_image,
+    add_frustums_to_figure,
+    add_cuboids_to_figure,
+    create_3d_scatter_plot,
+    create_comparison_plot
+)
 import time
 import sys
 import os
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Optional
 import pandas as pd
 import cv2
 from segmentation_detection import SegmentationDetector
@@ -72,6 +77,7 @@ if 'all_mask_points' not in st.session_state:
     st.session_state.all_mask_points = {}
 if 'all_rays' not in st.session_state:
     st.session_state.all_rays = {}
+
 
 def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, ransac_n: int = 3, num_iterations: int = 1000, dataset: str = "nuscenes", filter_forward_only: bool = True):
     """
@@ -280,156 +286,6 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
                     fig = create_3d_scatter_plot(display_point_cloud, None, filtered_mask_points, None, filtered_rays, 
                                             "Projected Segmentation Mask on Point Cloud")
                     st.plotly_chart(fig, width='stretch')
-
-def add_cuboids_to_figure(fig: go.Figure, cuboids: List[Dict], color: str = "blue",
-                          opacity: float = 0.2, name_prefix: str = "") -> go.Figure:
-    """
-    Add cuboids to a plotly figure, supporting both corner-based and min/max formats.
-
-    Args:
-        fig: Plotly figure to add cuboids to
-        cuboids: List of cuboid dictionaries with either 'corners' or min/max keys
-        color: Default color for cuboids
-        opacity: Opacity of cuboids (0.0 to 1.0)
-        name_prefix: Prefix for cuboid names (e.g., "GT: " or "Detected: ")
-
-    Returns:
-        Modified figure with cuboids added
-    """
-    for cuboid in cuboids:
-        category = cuboid.get('category', 'Unknown')
-        cuboid_name = f"{name_prefix}{category}" if name_prefix else category
-
-        # Use corner-based visualization if corners are available (preserves rotation)
-        if 'corners' in cuboid and cuboid['corners'] is not None:
-            fig.add_trace(cuboid_from_corners(
-                cuboid['corners'],
-                color=color,
-                opacity=opacity,
-                name=cuboid_name
-            ))
-        else:
-            # Fallback to min/max format
-            mesh = cuboid_from_minmax(
-                cuboid['min_x'], cuboid['min_y'], cuboid['min_z'],
-                cuboid['max_x'], cuboid['max_y'], cuboid['max_z'],
-                color=color,
-                opacity=opacity
-            )
-            mesh.name = cuboid_name
-            fig.add_trace(mesh)
-
-    return fig
-
-
-def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
-                            mask_points: Optional[Dict[int, np.ndarray]] = None,
-                            cuboids: Optional[List[Dict]] = None,
-                            rays: Optional[Dict[int, np.ndarray]] = None,
-                          title: str = "3D Point Cloud") -> go.Figure:
-    """Create a 3D scatter plot using Plotly for web compatibility"""
-    fig = go.Figure()
-    
-    # Convert PointCloud object to numpy array if needed
-    if hasattr(points, 'point_cloud_plane_removed'):
-        # It's a PointCloud object
-        point_array = points.point_cloud_plane_removed
-    else:
-        # It's already a numpy array
-        point_array = points
-
-    if labels is None:
-        # Single color for all points
-        fig.add_trace(go.Scatter3d(
-            x=point_array[:, 0],
-            y=point_array[:, 1],
-            z=point_array[:, 2],
-            mode='markers',
-            marker=dict(size=2, color='lightblue'),
-            name='Points'
-        ))
-    else:
-        # Color by cluster
-        unique_labels = np.unique(labels)
-        colors = px.colors.qualitative.Plotly[:len(unique_labels)]
-
-        for i, label in enumerate(unique_labels):
-            if label == -1:  # Noise points
-                mask = labels == label
-                fig.add_trace(go.Scatter3d(
-                    x=point_array[mask, 0],
-                    y=point_array[mask, 1],
-                    z=point_array[mask, 2],
-                    mode='markers',
-                    marker=dict(size=2, color='gray'),
-                    name='Noise'
-                ))
-            else:
-                mask = labels == label
-                fig.add_trace(go.Scatter3d(
-                    x=point_array[mask, 0],
-                    y=point_array[mask, 1],
-                    z=point_array[mask, 2],
-                    mode='markers',
-                    marker=dict(size=2, color=colors[i % len(colors)]),
-                    name=f'Cluster {label}'
-                ))
-    
-    if cuboids is not None:
-        add_cuboids_to_figure(fig, cuboids, color='red', opacity=0.2, name_prefix="Cuboid: ")
-
-    if mask_points is not None:
-        # Use different colors for different masks
-        colors = px.colors.qualitative.Plotly
-        for i, (mask_id, mask_point) in enumerate(mask_points.items()):
-            color = colors[i % len(colors)]
-            fig.add_trace(go.Scatter3d(
-                x=mask_point[:, 0],
-                y=mask_point[:, 1],
-                z=mask_point[:, 2],
-                mode='markers',
-                marker=dict(size=2, color=color),
-                name=f'Mask {mask_id}'
-            ))
-
-        if rays is not None:
-            # Handle nested dictionary structure where rays is {mask_id: {'origins': array, 'directions': array}}
-            for mask_id, ray_data in rays.items():
-                if 'origins' in ray_data and 'directions' in ray_data:
-                    origin = ray_data['origins'][0]  # All origins are the same for a mask
-                    directions = ray_data['directions']
-                    
-                    # Get the corresponding mask points if available
-                    mask_points_for_id = mask_points.get(mask_id, []) if mask_points is not None else []
-                    
-                    for i in range(len(directions)):
-                        direction = directions[i]
-                        if len(mask_points_for_id) > i:
-                            projected = mask_points_for_id[i]
-                        else:
-                            projected = origin + direction * 20.0
-                        fig.add_trace(go.Scatter3d(
-                            x=[origin[0], projected[0]],
-                            y=[origin[1], projected[1]],
-                            z=[origin[2], projected[2]],
-                            mode='lines',
-                            line=dict(color='blue'),
-                            name=f'Ray {mask_id}'
-                        ))
-
-    fig.update_layout(
-        title=title,
-        scene=dict(
-            xaxis=dict(title='X'),
-            yaxis=dict(title='Y'),
-            zaxis=dict(title='Z'),
-            aspectmode='data'
-        ),
-        margin=dict(l=0, r=0, b=0, t=40),
-        height=600
-    )
-
-    return fig
 
 def dbscan_page(point_cloud):
     """DBSCAN algorithm parameter control and visualization page"""
@@ -750,160 +606,6 @@ def agglomerative_page(point_cloud):
         st.subheader("Parameters Used")
         st.json(result['params'])
 
-def comparison_page(point_cloud):
-    """Compare different clustering algorithms side by side"""
-    st.header("⚖️ Algorithm Comparison")
-
-    # Select algorithms to compare
-    with st.sidebar.expander("Comparison Settings", expanded=True):
-        algorithms = st.multiselect(
-            "Select Algorithms to Compare",
-            options=['dbscan', 'optics', 'birch', 'agglomerative'],
-            default=['dbscan', 'optics']
-        )
-        
-        run_comparison = st.button("🚀 Run Comparison", key="run_comparison")
-    
-    if run_comparison:
-        if not algorithms:
-            st.error("Please select at least one algorithm to compare")
-            return
-
-        with st.spinner("Running comparison..."):
-            start_time = time.time()
-            
-            # Get points
-            points = point_cloud.point_cloud_plane_removed
-            
-            # Initialize clustering manager
-            clustering_manager = ClusteringManager(points)
-            
-            # Run selected algorithms with default parameters
-            comparison_results = {}
-            
-            if 'dbscan' in algorithms:
-                labels = clustering_manager.run_dbscan(eps=0.5, min_samples=10)
-                comparison_results['dbscan'] = {
-                    'labels': labels,
-                    'runtime': time.time() - start_time
-                }
-                start_time = time.time()
-            
-            if 'optics' in algorithms:
-                labels = clustering_manager.run_optics(min_samples=10, max_eps=1.0)
-                comparison_results['optics'] = {
-                    'labels': labels,
-                    'runtime': time.time() - start_time
-                }
-                start_time = time.time()
-            
-            if 'birch' in algorithms:
-                labels = clustering_manager.run_birch(threshold=0.5, n_clusters=5)
-                comparison_results['birch'] = {
-                    'labels': labels,
-                    'runtime': time.time() - start_time
-                }
-                start_time = time.time()
-            
-            if 'agglomerative' in algorithms:
-                labels = clustering_manager.run_agglomerative(n_clusters=5)
-                comparison_results['agglomerative'] = {
-                    'labels': labels,
-                    'runtime': time.time() - start_time
-                }
-            
-            # Store results for each algorithm
-            for algo_name, result in comparison_results.items():
-                st.session_state.clustering_results[algo_name] = result
-                    
-                # Generate and store cuboids
-                clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
-            
-            st.success(f"Comparison completed in {time.time() - start_time:.2f} seconds")
-
-    # Display comparison results if available
-    if 'comparison' in st.session_state.clustering_results:
-        results = st.session_state.clustering_results['comparison']
-
-        # Create comparison table
-        comparison_data = []
-        for algo_name, result in results.items():
-            labels = result['labels']
-            unique_labels = np.unique(labels)
-            n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
-            n_noise = np.sum(labels == -1) if -1 in unique_labels else 0
-            
-            comparison_data.append({
-                'Algorithm': algo_name.capitalize(),
-                'Clusters': n_clusters,
-                'Noise Points': n_noise,
-                'Runtime (s)': f"{result['runtime']:.2f}"
-            })
-        
-        # Display table
-        df = pd.DataFrame(comparison_data)
-        st.table(df)
-        
-        # Visualizations
-        st.subheader("Visualizations")
-        
-        # Create subplots
-        n_algos = len(results)
-        fig = make_subplots(
-            rows=1, cols=n_algos,
-            specs=[[{'type': 'scatter3d'} for _ in range(n_algos)]],
-            subplot_titles=list(results.keys())
-        )
-        
-        # Add each algorithm's visualization
-        for i, (algo_name, result) in enumerate(results.items()):
-            fig.add_trace(
-                go.Scatter3d(
-                    x=point_cloud.point_cloud_plane_removed[:, 0],
-                    y=point_cloud.point_cloud_plane_removed[:, 1],
-                    z=point_cloud.point_cloud_plane_removed[:, 2],
-                    mode='markers',
-                    marker=dict(size=2, color=result['labels'], colorscale='Viridis'),
-                    name=algo_name
-                ),
-                row=1, col=i+1
-            )
-        
-        fig.update_layout(height=600)
-        st.plotly_chart(fig, width='stretch')
-
-def create_comparison_plot(point_cloud, ground_truth_cuboids, detected_cuboids):
-    """Create overlay plot with both GT and detected cuboids"""
-    fig = go.Figure()
-
-    # Add point cloud
-    pc_array = point_cloud.point_cloud_plane_removed
-    fig.add_trace(go.Scatter3d(
-        x=pc_array[:, 0], y=pc_array[:, 1], z=pc_array[:, 2],
-        mode='markers',
-        marker=dict(size=1, color='lightgray'),
-        name='Point Cloud'
-    ))
-
-    # Add ground truth cuboids (green) using helper function
-    add_cuboids_to_figure(fig, ground_truth_cuboids, color='green', opacity=0.3, name_prefix="GT: ")
-
-    # Add detected cuboids (red) using helper function
-    add_cuboids_to_figure(fig, detected_cuboids, color='red', opacity=0.3, name_prefix="Detected: ")
-
-    fig.update_layout(
-        title="Ground Truth (Green) vs Detected (Red)",
-        scene=dict(
-            xaxis=dict(title='X'),
-            yaxis=dict(title='Y'),
-            zaxis=dict(title='Z'),
-            aspectmode='data'
-        ),
-        height=700
-    )
-
-    return fig
-
 def kitti_groundtruth_page():
     """KITTI Ground Truth Comparison page - Uses same pipeline as other pages"""
     st.header("🎯 KITTI Ground Truth Comparison")
@@ -927,17 +629,43 @@ def kitti_groundtruth_page():
     sample_data = st.session_state.sample_data
     point_cloud = st.session_state.point_cloud
 
-    # Display camera image
+    # Get ground truth boxes for visualization
+    ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
+
+    # Sidebar controls for 2D/3D visualization
+    with st.sidebar.expander("2D/3D Projection Settings", expanded=True):
+        show_2d_boxes = st.checkbox("Show 2D Bounding Boxes", value=True, key="show_2d_boxes_kitti")
+        show_frustums = st.checkbox("Show 2D→3D Frustums", value=True, key="show_frustums_kitti")
+        frustum_depth = st.slider("Frustum Depth (m)", min_value=5, max_value=100, value=30, step=5,
+                                  key="frustum_depth_kitti",
+                                  help="How far to project the 2D bounding box frustums into 3D space")
+        frustum_opacity = st.slider("Frustum Opacity", min_value=0.05, max_value=0.5, value=0.15, step=0.05,
+                                    key="frustum_opacity_kitti")
+
+    # Display camera image with optional 2D bounding boxes
     st.subheader("📷 Camera Image")
     try:
         img = cv2.imread(sample_data['image_path'])
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        st.image(img, caption=f"KITTI Sample {sample_data.get('sample_index', 0)}", width='stretch')
+
+        # Draw 2D bounding boxes if enabled
+        if show_2d_boxes and ground_truth_boxes:
+            img = draw_2d_boxes_on_image(img, ground_truth_boxes)
+            caption = f"KITTI Sample {sample_data.get('sample_index', 0)} - With 2D Ground Truth Boxes"
+        else:
+            caption = f"KITTI Sample {sample_data.get('sample_index', 0)}"
+
+        st.image(img, caption=caption, width='stretch')
+
+        # Show 2D bbox statistics
+        if show_2d_boxes and ground_truth_boxes:
+            n_boxes_with_2d = sum(1 for box in ground_truth_boxes if box.get('bbox_2d') is not None)
+            st.caption(f"Showing {n_boxes_with_2d} 2D bounding boxes from KITTI annotations")
+
     except Exception as e:
         st.warning(f"Could not load image: {str(e)}")
 
     # Display ground truth info
-    ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
     if ground_truth_boxes:
         st.subheader("📦 Ground Truth Objects")
         categories = [box['category'] for box in ground_truth_boxes]
@@ -954,18 +682,6 @@ def kitti_groundtruth_page():
             These are the human-annotated 3D bounding boxes from the KITTI dataset.
             They will be visualized in **green** in the comparison plots below.
             """)
-
-        # Visualize ground truth alone
-        st.subheader("🟢 Ground Truth Visualization")
-        fig_gt = create_3d_scatter_plot(
-            point_cloud,
-            None,
-            None,
-            ground_truth_boxes,
-            None,
-            "KITTI Ground Truth Cuboids"
-        )
-        st.plotly_chart(fig_gt, width='stretch')
 
     else:
         st.warning("No ground truth boxes available for this sample")
@@ -1007,6 +723,18 @@ def kitti_groundtruth_page():
                     None,
                     "Ground Truth"
                 )
+
+                # Add frustums to ground truth view if enabled
+                if show_frustums and ground_truth_boxes:
+                    camera_intrinsic = sample_data.get('camera_intrinsic')
+                    camera_to_lidar = sample_data.get('camera_to_lidar_transform')
+                    if camera_intrinsic is not None and camera_to_lidar is not None:
+                        add_frustums_to_figure(
+                            fig_gt, ground_truth_boxes,
+                            camera_intrinsic, camera_to_lidar,
+                            depth=frustum_depth, opacity=frustum_opacity
+                        )
+
                 st.plotly_chart(fig_gt, width='stretch')
 
             with col2:
@@ -1023,12 +751,24 @@ def kitti_groundtruth_page():
 
             # Overlay view
             st.subheader("🎨 Overlay Comparison")
-            st.markdown("**Green** = Ground Truth | **Red** = Detected")
+            st.markdown("**Green** = Ground Truth | **Red** = Detected | **Pyramids** = 2D→3D Frustums")
             fig_overlay = create_comparison_plot(
                 point_cloud,
                 ground_truth_boxes,
                 detected_cuboids
             )
+
+            # Add frustums to overlay view if enabled
+            if show_frustums and ground_truth_boxes:
+                camera_intrinsic = sample_data.get('camera_intrinsic')
+                camera_to_lidar = sample_data.get('camera_to_lidar_transform')
+                if camera_intrinsic is not None and camera_to_lidar is not None:
+                    add_frustums_to_figure(
+                        fig_overlay, ground_truth_boxes,
+                        camera_intrinsic, camera_to_lidar,
+                        depth=frustum_depth, opacity=frustum_opacity
+                    )
+
             st.plotly_chart(fig_overlay, width='stretch')
 
         else:
