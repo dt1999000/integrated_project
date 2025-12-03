@@ -97,7 +97,7 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, 
     try:
         if dataset == "nuscenes":
             # Load NuScenes data
-            dataset_loader = NuScenesDatasetLoader(dataroot='v1.0-mini')
+            dataset_loader = NuScenesDatasetLoader(dataroot='dataset/nuscenes')
             dataset_loader.load_dataset()
 
             # Get sample token
@@ -641,6 +641,118 @@ def kitti_groundtruth_page():
                                   help="How far to project the 2D bounding box frustums into 3D space")
         frustum_opacity = st.slider("Frustum Opacity", min_value=0.05, max_value=0.5, value=0.15, step=0.05,
                                     key="frustum_opacity_kitti")
+
+    # Frustum-based clustering controls
+    with st.sidebar.expander("Frustum-Based Clustering", expanded=False):
+        use_frustum_filtering = st.checkbox(
+            "Filter Points by Frustums",
+            value=False,
+            key="use_frustum_filtering_kitti",
+            help="Only cluster points inside the 2D bbox frustum projections"
+        )
+        frustum_cluster_depth = st.slider(
+            "Filtering Depth (m)", min_value=5, max_value=100, value=30, step=5,
+            key="frustum_cluster_depth_kitti",
+            help="Depth of frustums for point filtering"
+        )
+        frustum_min_cluster_size = st.slider(
+            "Min Cluster Size", min_value=5, max_value=100, value=15, step=5,
+            key="frustum_min_cluster_size_kitti",
+            help="Minimum points for a cluster when using frustum filtering"
+        )
+        frustum_min_samples = st.slider(
+            "Min Samples", min_value=2, max_value=30, value=5, step=1,
+            key="frustum_min_samples_kitti",
+            help="Minimum samples for HDBSCAN core points"
+        )
+
+        # Run frustum-filtered clustering button
+        run_frustum_clustering = st.button(
+            "🎯 Run Frustum-Filtered Clustering",
+            key="run_frustum_clustering_kitti",
+            help="Re-run clustering only on points inside the 2D bbox frustums"
+        )
+
+    # Handle frustum-filtered clustering
+    if run_frustum_clustering:
+        if not ground_truth_boxes:
+            st.sidebar.error("No ground truth boxes available for frustum filtering")
+        else:
+            camera_intrinsic = sample_data.get('camera_intrinsic')
+            camera_to_lidar = sample_data.get('camera_to_lidar_transform')
+
+            if camera_intrinsic is None or camera_to_lidar is None:
+                st.sidebar.error("Camera calibration data not available")
+            else:
+                with st.spinner("Running frustum-filtered clustering..."):
+                    start_time = time.time()
+
+                    # Create projection instance
+                    projection = Projection2DTo3D(
+                        camera_intrinsic=camera_intrinsic,
+                        camera_extrinsic=np.eye(4),
+                        camera_to_lidar_transform=camera_to_lidar,
+                        point_cloud=point_cloud.point_cloud_plane_removed
+                    )
+
+                    # Get frustums from ground truth 2D bboxes
+                    frustums = projection.get_frustums_from_bboxes(
+                        ground_truth_boxes, depth=frustum_cluster_depth
+                    )
+
+                    # Filter points by frustums
+                    filtered_points, mask = point_cloud.filter_by_frustums(frustums)
+
+                    if len(filtered_points) < frustum_min_cluster_size:
+                        st.sidebar.warning(
+                            f"Only {len(filtered_points)} points in frustums. "
+                            f"Need at least {frustum_min_cluster_size} for clustering."
+                        )
+                    else:
+                        # Run HDBSCAN on filtered points
+                        cluster_manager = ClusteringManager(filtered_points)
+
+                        try:
+                            labels = cluster_manager.run_hdbscan(
+                                min_cluster_size=frustum_min_cluster_size,
+                                min_samples=frustum_min_samples
+                            )
+                        except Exception as e:
+                            # Fallback to DBSCAN if HDBSCAN fails
+                            st.sidebar.warning(f"HDBSCAN failed ({e}), using DBSCAN")
+                            labels = cluster_manager.run_dbscan(
+                                eps=0.5, min_samples=frustum_min_samples
+                            )
+
+                        # Generate cuboids from clusters
+                        cuboids = cluster_manager.generate_cuboids_from_clusters(labels)
+
+                        # Store results
+                        st.session_state.clustering_results['frustum_filtered'] = {
+                            'labels': labels,
+                            'filtered_points': filtered_points,
+                            'mask': mask,
+                            'params': {
+                                'depth': frustum_cluster_depth,
+                                'min_cluster_size': frustum_min_cluster_size,
+                                'min_samples': frustum_min_samples,
+                                'n_frustums': len(frustums)
+                            },
+                            'runtime': time.time() - start_time
+                        }
+                        st.session_state.cuboids = cuboids
+
+                        # Calculate stats
+                        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+                        n_noise = np.sum(labels == -1)
+
+                        st.sidebar.success(
+                            f"Frustum clustering complete!\n"
+                            f"- Points in frustums: {len(filtered_points)}\n"
+                            f"- Clusters found: {n_clusters}\n"
+                            f"- Noise points: {n_noise}\n"
+                            f"- Runtime: {time.time() - start_time:.2f}s"
+                        )
 
     # Display camera image with optional 2D bounding boxes
     st.subheader("📷 Camera Image")

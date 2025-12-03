@@ -196,9 +196,9 @@ class ClusteringManager:
             raise ImportError("HDBSCAN not available. Install with: pip install hdbscan")
         
         print(f"Running HDBSCAN with min_cluster_size={min_cluster_size}, min_samples={min_samples}")
-        hdbscan = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples,
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples,
                                     metric=metric, cluster_selection_method=cluster_selection_method)
-        self.labels = hdbscan.fit_predict(self.points)
+        self.labels = clusterer.fit_predict(self.points)
         
         # Store results
         self.results['hdbscan'] = {

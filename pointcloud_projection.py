@@ -15,6 +15,146 @@ import open3d as o3d
 from clustering_manager import ClusteringManager
 
 
+# =============================================================================
+# Frustum Filtering Utility Functions
+# =============================================================================
+
+def compute_frustum_planes(camera_origin: np.ndarray,
+                           base_corners: np.ndarray) -> List[np.ndarray]:
+    """
+    Compute the 5 plane equations for a frustum pyramid.
+
+    A frustum is bounded by 4 side planes (connecting apex to base edges)
+    and 1 base plane (the far end at specified depth).
+
+    Args:
+        camera_origin: (3,) apex of frustum (camera center in LiDAR coords)
+        base_corners: (4, 3) base corners [TL, TR, BR, BL] in LiDAR coords
+
+    Returns:
+        List of 5 plane equations as [a, b, c, d] where ax + by + cz + d = 0
+    """
+    planes = []
+
+    # 4 side planes: each from apex + 2 adjacent base corners
+    # Order: TL-TR, TR-BR, BR-BL, BL-TL
+    for i in range(4):
+        p1 = camera_origin
+        p2 = base_corners[i]
+        p3 = base_corners[(i + 1) % 4]
+
+        # Compute plane normal using cross product
+        v1 = p2 - p1
+        v2 = p3 - p1
+        normal = np.cross(v1, v2)
+        norm_length = np.linalg.norm(normal)
+        if norm_length > 1e-10:
+            normal = normal / norm_length
+        else:
+            # Degenerate case: skip this plane
+            continue
+
+        # Plane equation: normal · (point - p1) = 0
+        # ax + by + cz + d = 0 where d = -normal · p1
+        d = -np.dot(normal, p1)
+        planes.append(np.array([normal[0], normal[1], normal[2], d]))
+
+    # Base plane: defined by 3 base corners
+    v1 = base_corners[1] - base_corners[0]
+    v2 = base_corners[2] - base_corners[0]
+    normal = np.cross(v1, v2)
+    norm_length = np.linalg.norm(normal)
+    if norm_length > 1e-10:
+        normal = normal / norm_length
+
+        # Ensure normal points toward camera (so points between camera and base are inside)
+        to_camera = camera_origin - base_corners[0]
+        if np.dot(normal, to_camera) < 0:
+            normal = -normal
+
+        d = -np.dot(normal, base_corners[0])
+        planes.append(np.array([normal[0], normal[1], normal[2], d]))
+
+    return planes
+
+
+def filter_points_in_frustum(points: np.ndarray,
+                             camera_origin: np.ndarray,
+                             base_corners: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Filter points to keep only those inside a frustum pyramid.
+
+    Uses half-space method: a point is inside if it's on the correct side
+    of all 5 bounding planes.
+
+    Args:
+        points: Nx3 array of 3D points
+        camera_origin: (3,) frustum apex (camera center)
+        base_corners: (4, 3) frustum base corners [TL, TR, BR, BL]
+
+    Returns:
+        filtered_points: Mx3 array of points inside frustum
+        mask: N boolean array indicating which points are inside
+    """
+    if len(points) == 0:
+        return np.array([]).reshape(0, 3), np.array([], dtype=bool)
+
+    planes = compute_frustum_planes(camera_origin, base_corners)
+
+    if len(planes) == 0:
+        # No valid planes, return empty
+        return np.array([]).reshape(0, 3), np.zeros(len(points), dtype=bool)
+
+    # For each plane, compute signed distance
+    # Point is inside if on correct side of ALL planes
+    n_points = len(points)
+    inside = np.ones(n_points, dtype=bool)
+
+    # Determine correct sign by testing centroid of frustum
+    centroid = (camera_origin + base_corners.mean(axis=0)) / 2
+
+    for plane in planes:
+        normal = plane[:3]
+        d = plane[3]
+
+        # Signed distance: normal · point + d
+        distances = points @ normal + d
+        centroid_dist = np.dot(centroid, normal) + d
+
+        # Points should be on same side as centroid
+        if centroid_dist >= 0:
+            inside &= (distances >= 0)
+        else:
+            inside &= (distances <= 0)
+
+    return points[inside], inside
+
+
+def filter_points_in_multiple_frustums(points: np.ndarray,
+                                       frustums: List[Tuple[np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Filter points to keep those inside ANY of the provided frustums.
+
+    Args:
+        points: Nx3 array of 3D points
+        frustums: List of (camera_origin, base_corners) tuples
+
+    Returns:
+        filtered_points: Mx3 array of points inside any frustum
+        mask: N boolean array indicating which points are inside
+    """
+    if len(points) == 0 or len(frustums) == 0:
+        return np.array([]).reshape(0, 3), np.zeros(len(points), dtype=bool)
+
+    combined_mask = np.zeros(len(points), dtype=bool)
+
+    for camera_origin, base_corners in frustums:
+        _, mask = filter_points_in_frustum(points, camera_origin, base_corners)
+        combined_mask |= mask
+
+    return points[combined_mask], combined_mask
+
+
 class Projection2DTo3D:
     """
     Class for 2D to 3D projection using camera intrinsics, extrinsics, and lidar transformations.
@@ -248,6 +388,30 @@ class Projection2DTo3D:
 
         return camera_origin, np.array(base_corners)
 
+    def get_frustums_from_bboxes(self, bboxes: List[Dict],
+                                 depth: float = 30.0) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Generate frustum data for multiple 2D bounding boxes.
+
+        Args:
+            bboxes: List of bbox dicts with 'bbox_2d' key containing
+                    {'left', 'top', 'right', 'bottom'} pixel coordinates
+            depth: Frustum depth in meters
+
+        Returns:
+            List of (camera_origin, base_corners) tuples where:
+                - camera_origin: (3,) camera center in LiDAR coords
+                - base_corners: (4, 3) frustum base corners in LiDAR coords
+        """
+        frustums = []
+        for bbox in bboxes:
+            bbox_2d = bbox.get('bbox_2d')
+            if bbox_2d is None:
+                continue
+            camera_origin, base_corners = self.project_bbox_corners_to_3d(bbox_2d, depth)
+            frustums.append((camera_origin, base_corners))
+        return frustums
+
 
 class PointCloud:
     """
@@ -300,6 +464,34 @@ class PointCloud:
             print(f"  Remaining forward-facing points: {len(filtered_points)}")
 
         return filtered_points
+
+    def filter_by_frustums(self, frustums: List[Tuple[np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Filter point cloud to keep only points inside frustum regions.
+
+        Args:
+            frustums: List of (camera_origin, base_corners) tuples where:
+                - camera_origin: (3,) frustum apex
+                - base_corners: (4, 3) frustum base corners
+
+        Returns:
+            filtered_points: Mx3 array of points inside any frustum
+            mask: N boolean array indicating which points are inside
+        """
+        points = self.point_cloud_plane_removed if self.ground_removed else self.original_point_cloud
+
+        if len(frustums) == 0:
+            print("Frustum filtering: No frustums provided, returning all points")
+            return points, np.ones(len(points), dtype=bool)
+
+        filtered_points, mask = filter_points_in_multiple_frustums(points, frustums)
+
+        print(f"Frustum filtering:")
+        print(f"  Original points: {len(points)}")
+        print(f"  Points in frustums: {len(filtered_points)}")
+        print(f"  Filtered out: {len(points) - len(filtered_points)}")
+
+        return filtered_points, mask
 
     def remove_ground_plane_ransac(self, distance_threshold: float = 0.3,
                                    ransac_n: int = 3, num_iterations: int = 1000,

@@ -1,0 +1,54 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.venv
+venv
+env
+.env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Datasets (will be mounted as volumes)
+dataset/
+v1.0-mini/
+v1.0-trainval/
+*.bin
+*.pcd
+
+# Large model files
+*.pt
+*.pth
+*.onnx
+weights/
+
+# Temp files
+*.log
+*.tmp
+output/
+exports/
+cvat_exports/
+
+# Documentation
+*.md
+!README.md
+
+# Docker files for other services
+docker-compose.yml
+traefik.yml
+
+# Test files
+tests/
+*_test.py
+test_*.py

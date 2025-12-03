@@ -23,7 +23,7 @@ from nuscenes.utils.data_classes import LidarPointCloud
 class NuScenesDatasetLoader:
     """Class to load and process nuScenes dataset."""
     
-    def __init__(self, dataroot: str = "v1.0-mini", version: str = "v1.0-mini", verbose: bool = True):
+    def __init__(self, dataroot: str = "dataset/nuscenes", version: str = "v1.0-mini", verbose: bool = True):
         """
         Initialize nuScenes dataset loader.
         
