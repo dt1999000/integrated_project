@@ -1,6 +1,6 @@
 """
 Visualization helper functions for 3D point cloud and 2D image visualization.
-Extracted from app.py for better code organization.
+Contains both primitive mesh creators (cuboids, frustums) and higher-level visualization functions.
 """
 
 import numpy as np
@@ -9,12 +9,152 @@ import plotly.express as px
 import cv2
 from typing import Dict, List, Optional
 
-from element import (
-    cuboid_from_minmax,
-    cuboid_from_corners,
-    frustum_from_camera_and_corners
-)
-from pointcloud_projection import Projection2DTo3D
+from pointcloud_projection import Projection
+
+
+# =============================================================================
+# Primitive Mesh Creators (from element.py)
+# =============================================================================
+
+def cuboid_from_minmax(min_x, min_y, min_z, max_x, max_y, max_z,
+                       color="blue", opacity=0.2):
+    """
+    Create a 3D cuboid mesh from min/max bounds.
+
+    Args:
+        min_x, min_y, min_z: Minimum corner coordinates
+        max_x, max_y, max_z: Maximum corner coordinates
+        color: Color of the cuboid
+        opacity: Opacity of the cuboid (0.0 to 1.0)
+
+    Returns:
+        go.Mesh3d: Plotly Mesh3d object
+    """
+    x0, y0, z0 = min_x, min_y, min_z
+    x1, y1, z1 = max_x, max_y, max_z
+
+    vertices = [
+        [x0, y0, z0],  # 0
+        [x1, y0, z0],  # 1
+        [x1, y1, z0],  # 2
+        [x0, y1, z0],  # 3
+        [x0, y0, z1],  # 4
+        [x1, y0, z1],  # 5
+        [x1, y1, z1],  # 6
+        [x0, y1, z1],  # 7
+    ]
+
+    x, y, z = zip(*vertices)
+
+    # 12 triangles (2 per face)
+    i = [0, 0, 0, 1, 1, 2, 4, 4, 4, 5, 5, 6]
+    j = [1, 2, 4, 2, 5, 3, 5, 7, 0, 6, 1, 7]
+    k = [2, 3, 5, 3, 6, 0, 6, 4, 3, 7, 2, 4]
+
+    cuboid = go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        color=color,
+        opacity=opacity,
+        flatshading=True,
+        showscale=False,
+        name="cuboid",
+    )
+    return cuboid
+
+
+def cuboid_from_corners(corners, color="blue", opacity=0.2, name="cuboid"):
+    """
+    Create a 3D cuboid mesh from 8 corner points.
+    Preserves rotation and exact box shape from corner coordinates.
+
+    Args:
+        corners: np.ndarray of shape (8, 3) representing 8 corner positions [x, y, z]
+        color: Color of the cuboid
+        opacity: Opacity of the cuboid (0.0 to 1.0)
+        name: Name for the mesh trace
+
+    Returns:
+        go.Mesh3d: Plotly Mesh3d object representing the cuboid
+
+    Note:
+        Corner ordering is expected to match KITTI format after transformation:
+        - Corners 0-3: one face of the box
+        - Corners 4-7: opposite face of the box
+    """
+    if corners.shape != (8, 3):
+        raise ValueError(f"Expected corners shape (8, 3), got {corners.shape}")
+
+    x = corners[:, 0].tolist()
+    y = corners[:, 1].tolist()
+    z = corners[:, 2].tolist()
+
+    # Define triangles for 6 faces (2 triangles per face = 12 triangles)
+    i = [0, 0, 4, 4, 0, 0, 2, 2, 1, 1, 3, 3]
+    j = [1, 3, 5, 7, 1, 3, 3, 6, 2, 5, 7, 2]
+    k = [2, 2, 6, 6, 5, 7, 7, 7, 6, 6, 4, 0]
+
+    cuboid = go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        color=color,
+        opacity=opacity,
+        flatshading=True,
+        showscale=False,
+        name=name,
+    )
+    return cuboid
+
+
+def frustum_from_camera_and_corners(camera_origin: np.ndarray,
+                                     base_corners: np.ndarray,
+                                     color: str = "blue",
+                                     opacity: float = 0.2,
+                                     name: str = "frustum") -> go.Mesh3d:
+    """
+    Create a frustum/pyramid mesh from camera origin (apex) to 4 base corners.
+    Used to visualize 2D bounding box projection onto 3D point cloud.
+
+    Args:
+        camera_origin: np.ndarray (3,) - Camera center in LiDAR coords (apex of pyramid)
+        base_corners: np.ndarray (4, 3) - 4 corner points in LiDAR coords (base of pyramid)
+                      Order: [top-left, top-right, bottom-right, bottom-left]
+        color: Mesh color
+        opacity: Mesh transparency (0.0 to 1.0)
+        name: Trace name for the mesh
+
+    Returns:
+        go.Mesh3d: Plotly mesh object for the frustum pyramid
+    """
+    camera_origin = np.asarray(camera_origin).flatten()
+    if camera_origin.shape != (3,):
+        raise ValueError(f"Expected camera_origin shape (3,), got {camera_origin.shape}")
+
+    base_corners = np.asarray(base_corners)
+    if base_corners.shape != (4, 3):
+        raise ValueError(f"Expected base_corners shape (4, 3), got {base_corners.shape}")
+
+    # 5 vertices: apex (camera) + 4 base corners
+    vertices = np.vstack([camera_origin.reshape(1, 3), base_corners])
+    x = vertices[:, 0].tolist()
+    y = vertices[:, 1].tolist()
+    z = vertices[:, 2].tolist()
+
+    # Triangle faces: 4 side triangles + 2 base triangles
+    i = [0, 0, 0, 0, 1, 1]
+    j = [1, 2, 3, 4, 2, 3]
+    k = [2, 3, 4, 1, 3, 4]
+
+    frustum = go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        color=color,
+        opacity=opacity,
+        flatshading=True,
+        showscale=False,
+        name=name,
+    )
+    return frustum
 
 
 # =============================================================================
@@ -46,7 +186,7 @@ def draw_2d_boxes_on_image(image: np.ndarray, boxes: List[Dict]) -> np.ndarray:
         'Misc': (128, 0, 128),      # Purple
     }
 
-    for box in boxes:
+    for index, box in enumerate(boxes):
         bbox = box.get('bbox_2d')
         if bbox is None:
             continue
@@ -60,7 +200,7 @@ def draw_2d_boxes_on_image(image: np.ndarray, boxes: List[Dict]) -> np.ndarray:
         cv2.rectangle(img_with_boxes, (left, top), (right, bottom), color, 2)
 
         # Draw label
-        label = category
+        label = category + f"{index+1}"
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.5
         thickness = 1
@@ -113,10 +253,10 @@ def add_frustums_to_figure(fig: go.Figure,
         'Misc': 'purple',
     }
 
-    # Create a Projection2DTo3D instance for projection calculations
+    # Create a Projection instance for projection calculations
     # We use a dummy point cloud and extrinsic since we only need the projection method
     dummy_point_cloud = np.zeros((1, 3))
-    projection = Projection2DTo3D(
+    projection = Projection(
         camera_intrinsic=camera_intrinsic,
         camera_extrinsic=np.eye(4),
         camera_to_lidar_transform=camera_to_lidar_transform,
@@ -165,7 +305,16 @@ def add_cuboids_to_figure(fig: go.Figure, cuboids: List[Dict],
     """
     for cuboid in cuboids:
         category = cuboid.get('category', 'Unknown')
-        cuboid_name = f"{name_prefix}{category}" if name_prefix else category
+        frustum_idx = cuboid.get('source_bbox_idx')
+        iou = cuboid.get('iou')
+
+        # Build cuboid name with frustum index and IoU if available
+        if frustum_idx is not None:
+            cuboid_name = f"{name_prefix}F{frustum_idx}: {category}"
+            if iou is not None:
+                cuboid_name += f" (IoU: {iou:.2f})"
+        else:
+            cuboid_name = f"{name_prefix}{category}" if name_prefix else category
 
         # Use corner-based visualization if corners are available (preserves rotation)
         if 'corners' in cuboid and cuboid['corners'] is not None:
@@ -197,6 +346,7 @@ def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
                             mask_points: Optional[Dict[int, np.ndarray]] = None,
                             cuboids: Optional[List[Dict]] = None,
                             rays: Optional[Dict[int, np.ndarray]] = None,
+                            points_in_frustums: Optional[List[np.ndarray]] = None,
                             title: str = "3D Point Cloud") -> go.Figure:
     """Create a 3D scatter plot using Plotly for web compatibility"""
     fig = go.Figure()
@@ -245,6 +395,16 @@ def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
                     marker=dict(size=2, color=colors[i % len(colors)]),
                     name=f'Cluster {label}'
                 ))
+
+    if points_in_frustums is not None:
+        fig.add_trace(go.Scatter3d(
+            x=points_in_frustums[:, 0],
+            y=points_in_frustums[:, 1],
+            z=points_in_frustums[:, 2],
+            mode='markers',
+            marker=dict(size=2, color='red'),
+            name='Points in Frustum'
+        ))
 
     if cuboids is not None:
         add_cuboids_to_figure(fig, cuboids, color='green', opacity=0.2, name_prefix="Cuboid: ")
@@ -331,6 +491,146 @@ def create_comparison_plot(point_cloud, ground_truth_cuboids, detected_cuboids):
             aspectmode='data'
         ),
         height=700
+    )
+
+    return fig
+
+
+def create_unified_comparison_figure(
+    point_cloud,
+    gt_cuboids: List[Dict],
+    detected_cuboids: List[Dict],
+    matches: Optional[List[tuple]] = None,
+    show_match_lines: bool = True,
+    title: str = "GT vs Detected Comparison"
+) -> go.Figure:
+    """
+    Create a unified 3D figure showing GT and detected cuboids with category-based colors.
+
+    GT cuboids use lighter shades, detected cuboids use darker shades of the same
+    color based on category. Yellow lines connect matched pairs.
+
+    Args:
+        point_cloud: PointCloud object or numpy array
+        gt_cuboids: List of ground truth cuboid dicts
+        detected_cuboids: List of detected cuboid dicts
+        matches: Optional list of (gt_idx, det_idx, dist) tuples from CuboidMatcher
+        show_match_lines: Whether to draw lines connecting matched pairs
+        title: Figure title
+
+    Returns:
+        Plotly figure
+    """
+    fig = go.Figure()
+
+    # Get point cloud array
+    if hasattr(point_cloud, 'point_cloud_plane_removed'):
+        points = point_cloud.point_cloud_plane_removed
+    else:
+        points = point_cloud
+
+    # Add point cloud (light gray)
+    fig.add_trace(go.Scatter3d(
+        x=points[:, 0],
+        y=points[:, 1],
+        z=points[:, 2],
+        mode='markers',
+        marker=dict(size=1, color='lightgray', opacity=0.3),
+        name='Point Cloud',
+        showlegend=True
+    ))
+
+    # Simple color scheme: Green for GT, Red for detected
+    gt_color = 'rgba(0, 200, 0, 0.6)'    # Green for ground truth
+    det_color = 'rgba(200, 0, 0, 0.6)'   # Red for detected
+
+    # Helper to add cuboid mesh
+    def add_cuboid_mesh(cuboid, color, name):
+        if 'corners' in cuboid and cuboid['corners'] is not None:
+            corners = cuboid['corners']
+        else:
+            # Create corners from min/max
+            min_x, max_x = cuboid['min_x'], cuboid['max_x']
+            min_y, max_y = cuboid['min_y'], cuboid['max_y']
+            min_z, max_z = cuboid['min_z'], cuboid['max_z']
+            corners = np.array([
+                [min_x, min_y, min_z], [max_x, min_y, min_z],
+                [max_x, max_y, min_z], [min_x, max_y, min_z],
+                [min_x, min_y, max_z], [max_x, min_y, max_z],
+                [max_x, max_y, max_z], [min_x, max_y, max_z]
+            ])
+
+        # Create mesh using vertices and faces
+        x, y, z = corners[:, 0], corners[:, 1], corners[:, 2]
+        i = [0, 0, 0, 0, 4, 4, 0, 1, 2, 3, 0, 1]
+        j = [1, 2, 3, 4, 5, 6, 1, 5, 6, 7, 4, 2]
+        k = [2, 3, 4, 5, 6, 7, 5, 6, 7, 4, 3, 6]
+
+        fig.add_trace(go.Mesh3d(
+            x=x, y=y, z=z,
+            i=i, j=j, k=k,
+            color=color,
+            opacity=0.4,
+            flatshading=True,
+            name=name,
+            showlegend=False
+        ))
+
+    # Helper to get cuboid center
+    def get_center(cuboid):
+        if 'corners' in cuboid and cuboid['corners'] is not None:
+            return cuboid['corners'].mean(axis=0)
+        return np.array([
+            (cuboid['min_x'] + cuboid['max_x']) / 2,
+            (cuboid['min_y'] + cuboid['max_y']) / 2,
+            (cuboid['min_z'] + cuboid['max_z']) / 2
+        ])
+
+    # Add GT cuboids (green)
+    for gt in gt_cuboids:
+        category = gt.get('category', 'Unknown')
+        add_cuboid_mesh(gt, gt_color, f"GT: {category}")
+
+    # Add detected cuboids (red)
+    for det in detected_cuboids:
+        category = det.get('category', 'Unknown')
+        add_cuboid_mesh(det, det_color, f"Det: {category}")
+
+    # Add match lines if requested
+    if show_match_lines and matches:
+        for gt_idx, det_idx, dist in matches:
+            gt = gt_cuboids[gt_idx]
+            det = detected_cuboids[det_idx]
+
+            gt_center = get_center(gt)
+            det_center = get_center(det)
+
+            fig.add_trace(go.Scatter3d(
+                x=[gt_center[0], det_center[0]],
+                y=[gt_center[1], det_center[1]],
+                z=[gt_center[2], det_center[2]],
+                mode='lines',
+                line=dict(color='yellow', width=3),
+                name=f'Match ({dist:.1f}m)',
+                showlegend=False
+            ))
+
+    # Update layout
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis=dict(title='X (m)'),
+            yaxis=dict(title='Y (m)'),
+            zaxis=dict(title='Z (m)'),
+            aspectmode='data'
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        )
     )
 
     return fig

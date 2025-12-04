@@ -155,9 +155,14 @@ def filter_points_in_multiple_frustums(points: np.ndarray,
     return points[combined_mask], combined_mask
 
 
-class Projection2DTo3D:
+class Projection:
     """
-    Class for 2D to 3D projection using camera intrinsics, extrinsics, and lidar transformations.
+    Bidirectional projection class for 2D↔3D transformations using camera intrinsics,
+    extrinsics, and LiDAR transformations.
+
+    Supports:
+    - 2D to 3D: pixel_to_ray, find_closest_point_on_ray, project_pixels_to_3d
+    - 3D to 2D: point_to_pixel, cuboid_to_2d, points_to_pixels
     """
     
     def __init__(self, camera_intrinsic: np.ndarray, camera_extrinsic: np.ndarray,
@@ -341,7 +346,7 @@ class Projection2DTo3D:
         }
 
     def project_bbox_corners_to_3d(self, bbox_2d: Dict,
-                                    depth: float = 30.0) -> Tuple[np.ndarray, np.ndarray]:
+                                    depth: float = 100) -> Tuple[np.ndarray, np.ndarray]:
         """
         Project 2D bounding box corners to 3D using ray casting.
         Creates a frustum/pyramid by projecting the 4 corners of a 2D bbox to 3D.
@@ -411,6 +416,143 @@ class Projection2DTo3D:
             camera_origin, base_corners = self.project_bbox_corners_to_3d(bbox_2d, depth)
             frustums.append((camera_origin, base_corners))
         return frustums
+
+    # =========================================================================
+    # 3D to 2D Projection Methods
+    # =========================================================================
+
+    def point_to_pixel(self, points_3d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Project 3D points (in LiDAR coordinates) to 2D pixel coordinates.
+
+        Args:
+            points_3d: Nx3 array of 3D points in LiDAR coordinates
+
+        Returns:
+            pixels: Nx2 array of pixel coordinates (u, v)
+            valid_mask: N boolean array indicating which points project in front of camera
+        """
+        if points_3d.ndim == 1:
+            points_3d = points_3d.reshape(1, -1)
+
+        n_points = len(points_3d)
+
+        # Convert to homogeneous coordinates
+        points_homo = np.hstack([points_3d, np.ones((n_points, 1))])
+
+        # Transform from LiDAR to camera coordinates
+        points_cam = (self.lidar_to_camera_transform @ points_homo.T).T[:, :3]
+
+        # Filter points behind camera (z <= 0 in camera coords)
+        valid_mask = points_cam[:, 2] > 0
+
+        # Initialize output
+        pixels = np.zeros((n_points, 2))
+
+        # Project valid points to image plane: pixel = K @ [x/z, y/z, 1]
+        if np.any(valid_mask):
+            z = points_cam[valid_mask, 2:3]
+            normalized = points_cam[valid_mask, :2] / z
+            pixels_homo = np.hstack([normalized, np.ones((np.sum(valid_mask), 1))])
+            pixels[valid_mask] = (self.camera_intrinsic @ pixels_homo.T).T[:, :2]
+
+        return pixels, valid_mask
+
+    def cuboid_to_2d(self, cuboid: Dict) -> Optional[Dict]:
+        """
+        Project a 3D cuboid to 2D bounding box and projected corners.
+
+        Args:
+            cuboid: Dict with either 'corners' (8x3) or min/max bounds
+                    (min_x, max_x, min_y, max_y, min_z, max_z)
+
+        Returns:
+            Dict with:
+                - 'bbox_2d': {'left', 'top', 'right', 'bottom'} in pixels
+                - 'corners_2d': 8x2 array of projected corner pixels
+                - 'valid_mask': 8 boolean array for which corners are visible
+                - 'visible': boolean indicating if cuboid is at least partially visible
+            Returns None if cuboid is entirely behind camera
+        """
+        # Get 8 corners of cuboid
+        if 'corners' in cuboid and cuboid['corners'] is not None:
+            corners_3d = np.array(cuboid['corners'])
+        else:
+            # Build corners from min/max bounds
+            min_x, max_x = cuboid['min_x'], cuboid['max_x']
+            min_y, max_y = cuboid['min_y'], cuboid['max_y']
+            min_z, max_z = cuboid['min_z'], cuboid['max_z']
+            corners_3d = np.array([
+                [min_x, min_y, min_z], [max_x, min_y, min_z],
+                [max_x, max_y, min_z], [min_x, max_y, min_z],
+                [min_x, min_y, max_z], [max_x, min_y, max_z],
+                [max_x, max_y, max_z], [min_x, max_y, max_z]
+            ])
+
+        # Project corners to 2D
+        corners_2d, valid_mask = self.point_to_pixel(corners_3d)
+
+        # If no corners visible, return None
+        if not np.any(valid_mask):
+            return None
+
+        # Get 2D bounding box from visible corners
+        visible_corners = corners_2d[valid_mask]
+        bbox_2d = {
+            'left': float(np.min(visible_corners[:, 0])),
+            'top': float(np.min(visible_corners[:, 1])),
+            'right': float(np.max(visible_corners[:, 0])),
+            'bottom': float(np.max(visible_corners[:, 1]))
+        }
+
+        return {
+            'bbox_2d': bbox_2d,
+            'corners_2d': corners_2d,
+            'valid_mask': valid_mask,
+            'visible': True
+        }
+
+    def points_to_pixels(self, points_3d: np.ndarray,
+                         image_shape: Optional[Tuple[int, int]] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Project 3D points to 2D and optionally filter by image bounds.
+
+        Args:
+            points_3d: Nx3 array of 3D points in LiDAR coordinates
+            image_shape: Optional (height, width) to filter points outside image
+
+        Returns:
+            pixels: Mx2 array of valid pixel coordinates
+            indices: M array of indices into original points array
+        """
+        pixels, valid_mask = self.point_to_pixel(points_3d)
+
+        if image_shape is not None:
+            h, w = image_shape
+            in_bounds = (
+                (pixels[:, 0] >= 0) & (pixels[:, 0] < w) &
+                (pixels[:, 1] >= 0) & (pixels[:, 1] < h)
+            )
+            valid_mask &= in_bounds
+
+        indices = np.where(valid_mask)[0]
+        return pixels[valid_mask], indices
+
+    def project_cuboids_to_2d(self, cuboids: List[Dict]) -> List[Optional[Dict]]:
+        """
+        Project multiple 3D cuboids to 2D.
+
+        Args:
+            cuboids: List of cuboid dicts
+
+        Returns:
+            List of 2D projection results (None for cuboids behind camera)
+        """
+        return [self.cuboid_to_2d(cuboid) for cuboid in cuboids]
+
+
+# Backward compatibility alias
+Projection2DTo3D = Projection
 
 
 class PointCloud:
@@ -554,8 +696,32 @@ class PointCloud:
         self.point_cloud_plane_removed = filtered_points
         self.ground_plane_model = plane_model
         self.ground_inliers = self.original_point_cloud[inliers]
-        
-        
+
+    def get_ground_z(self, x: float = 0.0, y: float = 0.0) -> Optional[float]:
+        """
+        Compute the ground z value at a given (x, y) location using the ground plane model.
+
+        The ground plane equation is: ax + by + cz + d = 0
+        Solving for z: z = -(ax + by + d) / c
+
+        Args:
+            x: X coordinate (forward direction)
+            y: Y coordinate (lateral direction)
+
+        Returns:
+            Ground z value at (x, y), or None if ground plane not computed
+        """
+        if not self.ground_removed or self.ground_plane_model is None:
+            return None
+
+        a, b, c, d = self.ground_plane_model
+        if abs(c) < 1e-6:
+            # Plane is nearly vertical, can't solve for z
+            return None
+
+        z = -(a * x + b * y + d) / c
+        return float(z)
+
     def add_projected_points(self, projected_points: np.ndarray):
         """
         Add projected points to the point cloud.
@@ -724,78 +890,6 @@ class PointCloud:
             print(f"Added {len(all_points)} points from {len(mask_points)} segmentation masks")
         else:
             print("No points to add from segmentation masks")
-
-    def cluster_with_sam_masks(self, sam_manager, image: np.ndarray,
-                             bboxes: Optional[List[List[float]]] = None,
-                             min_points_per_cluster: int = 10) -> List[np.ndarray]:
-        """
-        Create clusters based on SAM segmentation masks.
-        
-        Args:
-            sam_manager: SAMModelManager instance
-            image: Input image as numpy array (H, W, 3)
-            bboxes: Optional list of bounding boxes [x1, y1, x2, y2]
-            min_points_per_cluster: Minimum number of points required for a valid cluster
-            
-        Returns:
-            List of numpy arrays, where each array contains the indices of points
-            belonging to that cluster in the ground-removed point cloud.
-        """
-        if not self.ground_removed:
-            raise ValueError("Ground plane removal required before clustering. Call remove_ground_plane_ransac() first.")
-        
-        # Get segmentation mask from SAM
-        if bboxes is not None:
-            # Use bounding boxes as prompts
-            bbox_to_sam = BoundingBoxToSAM(sam_manager)
-            mask = bbox_to_sam.segment_from_bboxes(image, bboxes)
-        else:
-            # Use SAM without prompts
-            results = sam_manager.predict(image)
-            mask = sam_manager.get_segmentation_masks(results)
-        
-        print(f"SAM segmentation mask shape: {mask.shape}")
-        print(f"Unique mask values: {np.unique(mask)}")
-        
-        # Project mask to 3D
-        seg_to_3d = SegmentationToPointCloud(self)
-        mask_points = seg_to_3d.project_all_masks(mask)
-        print(f"Projected {len(mask_points)} masks to 3D")
-        
-        for mask_id, points in mask_points.items():
-            print(f"  Mask {mask_id}: {len(points)} points")
-        
-        # Add projected points to point cloud
-        self.add_segmentation_projected_points(mask_points)
-        
-        # Create clusters based on mask projections
-        clusters = []
-        for mask_id, points in mask_points.items():
-            if len(points) >= min_points_per_cluster:
-                # Find points in the ground-removed point cloud that are close to the projected points
-                cluster_indices = []
-                
-                # For each projected point, find the closest point in the ground-removed point cloud
-                for point in points:
-                    distances = np.linalg.norm(self.point_cloud_plane_removed - point, axis=1)
-                    closest_idx = np.argmin(distances)
-                    
-                    # If the closest point is within a reasonable distance, add it to the cluster
-                    if distances[closest_idx] < 0.5:  # 0.5m threshold
-                        cluster_indices.append(closest_idx)
-                
-                # Remove duplicates
-                cluster_indices = list(set(cluster_indices))
-                
-                if len(cluster_indices) >= min_points_per_cluster:
-                    clusters.append(np.array(cluster_indices))
-                    print(f"Created cluster for mask {mask_id}: {len(cluster_indices)} points")
-                else:
-                    print(f"Skipping mask {mask_id}: only {len(cluster_indices)} unique points found (minimum: {min_points_per_cluster})")
-        
-        print(f"Created {len(clusters)} clusters from {len(mask_points)} SAM masks")
-        self.clusters = clusters
-        return clusters
 
 class PointCloudVisualizer:
     """

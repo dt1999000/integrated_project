@@ -15,7 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import our pipeline components
 from nuscenes_dataset_loader import NuScenesDatasetLoader
-from pointcloud_projection import PointCloud, Projection2DTo3D
+from pointcloud_projection import PointCloud, Projection
 from clustering_manager import ClusteringManager
 from sam_integration import SAMModelManager, BoundingBoxToSAM
 
@@ -91,7 +91,7 @@ def load_dataset_sample(sample_index: int = 0):
         point_cloud.remove_ego_vehicle_points()
 
         # Initialize projection
-        projection = Projection2DTo3D(
+        projection = Projection(
             camera_intrinsic=sample_data['camera_intrinsic'],
             camera_extrinsic=sample_data['camera_extrinsic'],
             camera_to_lidar_transform=sample_data['camera_to_lidar_transform'],

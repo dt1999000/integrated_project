@@ -7,8 +7,10 @@ from visualization_helper import (
     add_frustums_to_figure,
     add_cuboids_to_figure,
     create_3d_scatter_plot,
-    create_comparison_plot
+    create_comparison_plot,
 )
+from frustum_manager import FrustumManager, Frustum, FrustumClusterResult
+from evaluation import CuboidMatcher, MatchResult
 import time
 import sys
 import os
@@ -18,7 +20,7 @@ import cv2
 from segmentation_detection import SegmentationDetector
 from bounding_boxes import BoundingBoxes
 from segmentation_detection import SegmentationToPointCloud
-from pointcloud_projection import Projection2DTo3D
+from pointcloud_projection import Projection
 import matplotlib.pyplot as plt
 # Add the current directory to the path to import our modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -26,9 +28,11 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Import our pipeline components
 from nuscenes_dataset_loader import NuScenesDatasetLoader
 from kitti_dataset_loader import KITTIDatasetLoader
-from pointcloud_projection import PointCloud, Projection2DTo3D
+from pointcloud_projection import PointCloud, Projection
 from clustering_manager import ClusteringManager
 from segmentation_detection import SegmentationDetector
+
+from pointcloud_projection import filter_points_in_frustum  
 
 # Configure Streamlit page
 st.set_page_config(
@@ -77,6 +81,10 @@ if 'all_mask_points' not in st.session_state:
     st.session_state.all_mask_points = {}
 if 'all_rays' not in st.session_state:
     st.session_state.all_rays = {}
+if 'frustums' not in st.session_state:
+    st.session_state.frustums = []  # List of (camera_origin, base_corners, category, bbox_2d) tuples
+if 'per_frustum_clusters' not in st.session_state:
+    st.session_state.per_frustum_clusters = []  # List of cluster results per frustum
 
 
 def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, ransac_n: int = 3, num_iterations: int = 1000, dataset: str = "nuscenes", filter_forward_only: bool = True):
@@ -131,6 +139,13 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, 
             filter_forward_only=filter_forward_only
         )
 
+        # Store ground_z at origin in session state for template cuboids
+        ground_z = point_cloud.get_ground_z(x=0.0, y=0.0)
+        st.session_state.ground_z = ground_z
+        st.session_state.ground_plane_model = point_cloud.ground_plane_model
+        if ground_z is not None:
+            print(f"Ground plane z at origin: {ground_z:.3f}m")
+
         return sample_data, point_cloud
 
     except Exception as e:
@@ -154,7 +169,7 @@ def get_segmentation_mask(sample_data):
     return segmentation_mask
 
 def project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, point_cloud, max_distance=100.0, distance_threshold=0.5):
-    projection = Projection2DTo3D(
+    projection = Projection(
         camera_intrinsic=sample_data['camera_intrinsic'],
         camera_extrinsic=sample_data['camera_extrinsic'],
         camera_to_lidar_transform=sample_data['camera_to_lidar_transform'],
@@ -171,12 +186,100 @@ def project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, poin
     return rays, mask_points
 
 def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
-    st.header("🎯 Project Segmentation Mask on Point Cloud")
+    st.header("🎯 Projection & Frustum Visualization")
 
-    # Check if we're using KITTI dataset (segmentation only works with NuScenes)
+    # Check if we're using KITTI dataset - show frustum visualization instead of segmentation
     if st.session_state.get('current_dataset') == 'kitti':
-        st.warning("⚠️ Segmentation projection is only available for NuScenes dataset. Please switch to NuScenes in the sidebar to use this feature.")
-        st.info("💡 For KITTI dataset, please use the 'KITTI Ground Truth' tab to view ground truth annotations.")
+        st.subheader("KITTI 2D→3D Frustum Projection")
+
+        sample_data_full = st.session_state.get('sample_data', {})
+        ground_truth_boxes = sample_data_full.get('ground_truth_boxes', [])
+        has_2d_bboxes = any(box.get('bbox_2d') is not None for box in ground_truth_boxes)
+
+        if not has_2d_bboxes:
+            st.warning("No 2D bounding boxes available for this sample.")
+            return
+
+        # Frustum parameters
+        with st.sidebar.expander("Frustum Parameters", expanded=True):
+            frustum_depth = st.slider("Frustum Depth (m)", min_value=5, max_value=100, value=30, step=5,
+                                      key="frustum_depth_projection",
+                                      help="How far to project the 2D bounding boxes into 3D space")
+            frustum_opacity = st.slider("Frustum Opacity", min_value=0.05, max_value=0.5, value=0.2, step=0.05,
+                                        key="frustum_opacity_projection")
+
+        # Compute frustums using FrustumManager
+        fm = FrustumManager(
+            sample_data_full['camera_intrinsic'],
+            sample_data_full['camera_to_lidar_transform']
+        )
+        frustums = fm.create_frustums_from_bboxes(ground_truth_boxes, depth=frustum_depth)
+        st.session_state.frustums = frustums
+
+        # Show camera image with 2D bboxes
+        st.subheader("Camera Image with 2D Bounding Boxes")
+        try:
+            img = cv2.imread(sample_data_full['image_path'])
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = draw_2d_boxes_on_image(img, ground_truth_boxes)
+            st.image(img, caption=f"KITTI Sample - {len(frustums)} 2D Bounding Boxes", width="stretch")
+        except Exception as e:
+            st.warning(f"Could not load image: {str(e)}")
+
+        # Show frustum statistics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total 2D Bboxes", len([b for b in ground_truth_boxes if b.get('bbox_2d')]))
+        with col2:
+            st.metric("Frustums Generated", len(frustums))
+        with col3:
+            categories = [f.category for f in frustums]
+            unique_cats = len(set(categories))
+            st.metric("Object Categories", unique_cats)
+
+        # Show frustums in 3D
+        st.subheader("3D Point Cloud with Frustums")
+        point_cloud_obj = st.session_state.get('point_cloud')
+        points_in_frustums = np.array([]).reshape(0, 3)
+        for frustum in frustums:
+            points_in_frustum, mask = filter_points_in_frustum(point_cloud_obj.point_cloud_plane_removed, frustum.camera_origin, frustum.base_corners) 
+            points_in_frustums = np.concatenate([points_in_frustums, points_in_frustum])
+        
+        print(f'points in frustum: {points_in_frustums}')
+        if point_cloud_obj is not None:
+            fig = create_3d_scatter_plot(point_cloud_obj, None, None, None, None, points_in_frustums,
+                                         "Point Cloud with 2D→3D Frustum Projections")
+
+            # Add frustums to the figure
+            camera_intrinsic = sample_data_full.get('camera_intrinsic')
+            camera_to_lidar = sample_data_full.get('camera_to_lidar_transform')
+            if camera_intrinsic is not None and camera_to_lidar is not None:
+                add_frustums_to_figure(
+                    fig, ground_truth_boxes,
+                    camera_intrinsic, camera_to_lidar,
+                    depth=frustum_depth, opacity=frustum_opacity
+                )
+
+            st.plotly_chart(fig, width='stretch', key='frustum_projection_chart')
+
+        # Per-frustum info table
+        if frustums:
+            st.subheader("Frustum Details")
+            frustum_data = []
+            for f in frustums:
+                frustum_data.append({
+                    'Index': f.idx,
+                    'Category': f.category,
+                    'BBox Left': f.bbox_2d['left'],
+                    'BBox Top': f.bbox_2d['top'],
+                    'BBox Right': f.bbox_2d['right'],
+                    'BBox Bottom': f.bbox_2d['bottom']
+                })
+            df = pd.DataFrame(frustum_data)
+            st.dataframe(df, use_container_width=True)
+
+        st.info("Run any clustering algorithm on the other tabs to see per-frustum clustering results. "
+                "Clusters are automatically filtered by these frustums when using KITTI data.")
         return
 
     st.subheader("Segmentation Mask")
@@ -283,9 +386,9 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
                 st.subheader("3D Visualization")
                 if point_cloud is not None:
                     display_point_cloud = st.session_state.projected_point_cloud if st.session_state.projected_point_cloud is not None else point_cloud
-                    fig = create_3d_scatter_plot(display_point_cloud, None, filtered_mask_points, None, filtered_rays, 
+                    fig = create_3d_scatter_plot(display_point_cloud, None, filtered_mask_points, None, filtered_rays,
                                             "Projected Segmentation Mask on Point Cloud")
-                    st.plotly_chart(fig, width='stretch')
+                    st.plotly_chart(fig, width='stretch', key='segmentation_projection_chart')
 
 def dbscan_page(point_cloud):
     """DBSCAN algorithm parameter control and visualization page"""
@@ -306,63 +409,182 @@ def dbscan_page(point_cloud):
 
     # Run clustering button
     if st.sidebar.button("🚀 Run DBSCAN", key="run_dbscan"):
-        with st.spinner("Running DBSCAN clustering..."):
-            start_time = time.time()
-            
-            # Get points
-            points = st.session_state.point_cloud.point_cloud_plane_removed
-            
-            # Initialize clustering manager
-            clustering_manager = ClusteringManager(points)
-            
-            # Run DBSCAN
-            labels = clustering_manager.run_dbscan(
-                eps=eps, min_samples=min_samples, metric=metric,
-                algorithm=algorithm, leaf_size=leaf_size
-            )
-            
-            # Store results
-            st.session_state.clustering_results['dbscan'] = {
-                'labels': labels,
-                'params': {
-                    'eps': eps,
-                    'min_samples': min_samples,
-                    'metric': metric,
-                    'algorithm': algorithm,
-                    'leaf_size': leaf_size
-                },
-                'runtime': time.time() - start_time
-            }
-            
-            # Generate and store cuboids
-            clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
-            cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
-            st.session_state.cuboids = cuboids
-            
-            st.success(f"DBSCAN completed in {time.time() - start_time:.2f} seconds")
+        # Check if KITTI 2D bboxes are available for frustum filtering
+        sample_data = st.session_state.get('sample_data', {})
+        is_kitti = st.session_state.get('current_dataset') == 'kitti'
+        ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
+        has_2d_bboxes = any(box.get('bbox_2d') is not None for box in ground_truth_boxes)
+
+        if is_kitti and has_2d_bboxes:
+            # Use frustum-based clustering
+            with st.spinner("Running frustum-based DBSCAN clustering..."):
+                start_time = time.time()
+
+                # Create FrustumManager and compute frustums
+                fm = FrustumManager(
+                    sample_data['camera_intrinsic'],
+                    sample_data['camera_to_lidar_transform']
+                )
+                frustums = fm.create_frustums_from_bboxes(ground_truth_boxes, depth=100)
+                st.session_state.frustums = frustums
+
+                # Get points
+                points = st.session_state.point_cloud.point_cloud_plane_removed
+
+                # Build clustering params from UI sliders
+                clustering_params = {
+                    'dbscan': {
+                        'eps': eps,
+                        'min_samples': min_samples,
+                        'metric': metric,
+                        'algorithm': algorithm,
+                        'leaf_size': leaf_size
+                    }
+                }
+
+                # Run per-frustum clustering with overlap validation
+                cuboids, per_frustum_results = fm.cluster_in_frustums(
+                    points, frustums,
+                    min_cluster_size=min_samples,
+                    min_samples=min_samples,
+                    algorithm='dbscan',
+                    validate_overlap=st.session_state.validate_overlap,
+                    overlap_threshold=st.session_state.overlap_threshold,
+                    use_templates=st.session_state.use_templates,
+                    clustering_params=clustering_params,
+                    ground_plane_model=st.session_state.get('ground_plane_model')
+                )
+                bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
+
+                # Store per-frustum results
+                st.session_state.per_frustum_clusters = per_frustum_results
+                st.session_state.cuboids = cuboids
+
+                # Store results
+                st.session_state.clustering_results['dbscan'] = {
+                    'labels': None,  # No global labels for frustum-based
+                    'per_frustum_clusters': per_frustum_results,
+                    'bbox_results': bbox_results,
+                    'is_frustum_based': True,
+                    'params': {
+                        'eps': eps,
+                        'min_samples': min_samples,
+                        'metric': metric,
+                        'algorithm': algorithm,
+                        'leaf_size': leaf_size,
+                        'validate_overlap': st.session_state.validate_overlap,
+                        'overlap_threshold': st.session_state.overlap_threshold,
+                        'use_templates': st.session_state.use_templates
+                    },
+                    'runtime': time.time() - start_time
+                }
+
+                n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+                st.success(f"Frustum-based DBSCAN completed in {time.time() - start_time:.2f}s. "
+                          f"Processed {len(frustums)} frustums, {n_successful} with clusters, {len(cuboids)} cuboids found.")
+        else:
+            # Standard whole point cloud clustering
+            with st.spinner("Running DBSCAN clustering..."):
+                start_time = time.time()
+
+                # Get points
+                points = st.session_state.point_cloud.point_cloud_plane_removed
+
+                # Initialize clustering manager
+                clustering_manager = ClusteringManager(points)
+
+                # Run DBSCAN
+                labels = clustering_manager.run_dbscan(
+                    eps=eps, min_samples=min_samples, metric=metric,
+                    algorithm=algorithm, leaf_size=leaf_size
+                )
+
+                # Store results
+                st.session_state.clustering_results['dbscan'] = {
+                    'labels': labels,
+                    'is_frustum_based': False,
+                    'params': {
+                        'eps': eps,
+                        'min_samples': min_samples,
+                        'metric': metric,
+                        'algorithm': algorithm,
+                        'leaf_size': leaf_size
+                    },
+                    'runtime': time.time() - start_time
+                }
+
+                # Generate and store cuboids
+                clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
+                cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
+                st.session_state.cuboids = cuboids
+
+                st.success(f"DBSCAN completed in {time.time() - start_time:.2f} seconds")
 
     # Display results if available
     if 'dbscan' in st.session_state.clustering_results:
         result = st.session_state.clustering_results['dbscan']
+        is_frustum_based = result.get('is_frustum_based', False)
 
-        # Metrics
-        labels = result['labels']
-        unique_labels = np.unique(labels)
-        n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
-        n_noise = np.sum(labels == -1)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Clusters", n_clusters)
-        with col2:
-            st.metric("Noise Points", n_noise)
-        with col3:
-            st.metric("Runtime", f"{result['runtime']:.2f}s")
-        
-        # 3D Visualization
+        if is_frustum_based:
+            # Frustum-based metrics
+            per_frustum_clusters = result.get('per_frustum_clusters', [])
+            bbox_results = result.get('bbox_results', [])
+            n_frustums = len(per_frustum_clusters)
+            n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+            n_cuboids = len(st.session_state.get('cuboids', []))
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Frustums", n_frustums)
+            with col2:
+                st.metric("With Clusters", n_successful)
+            with col3:
+                st.metric("Total Cuboids", n_cuboids)
+            with col4:
+                st.metric("Runtime", f"{result['runtime']:.2f}s")
+
+            # Show per-frustum breakdown
+            if bbox_results:
+                st.subheader("Per-Frustum Results")
+                df = pd.DataFrame(bbox_results)
+                st.dataframe(df, use_container_width=True)
+
+            # Show IoU info if overlap validation was used
+            params = result.get('params', {})
+            if params.get('validate_overlap'):
+                st.info(f"Overlap validation enabled with IoU threshold: {params.get('overlap_threshold', 0.3):.2f}")
+        else:
+            # Standard metrics
+            labels = result['labels']
+            unique_labels = np.unique(labels)
+            n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+            n_noise = np.sum(labels == -1)
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Clusters", n_clusters)
+            with col2:
+                st.metric("Noise Points", n_noise)
+            with col3:
+                st.metric("Runtime", f"{result['runtime']:.2f}s")
+
+        # 3D Visualization (show clusters with distinct colors)
         st.subheader("3D Visualization")
-        fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "DBSCAN Clustering Results")
-        st.plotly_chart(fig, width='stretch')
+        if is_frustum_based:
+            # For frustum-based: combine all frustum clusters with distinct colors
+            per_frustum_clusters = result.get('per_frustum_clusters', [])
+            cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
+            if cluster_points is not None:
+                # Create custom figure showing only clustered points with colors
+                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
+                                             "Frustum-Based DBSCAN Results (Colored by Cluster)")
+            else:
+                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
+                                             "Frustum-Based DBSCAN Results")
+        else:
+            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
+                                         "DBSCAN Clustering Results")
+        st.plotly_chart(fig, width='stretch', key='dbscan_clustering_chart')
 
         # Parameter summary
         st.subheader("Parameters Used")
@@ -454,7 +676,7 @@ def optics_page(point_cloud):
         # 3D Visualization
         st.subheader("3D Visualization")
         fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "OPTICS Clustering Results")
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, width='stretch', key='optics_clustering_chart')
 
         # Parameter summary
         st.subheader("Parameters Used")
@@ -475,59 +697,144 @@ def birch_page(point_cloud):
 
     # Run clustering button
     if st.sidebar.button("🚀 Run BIRCH", key="run_birch"):
-        with st.spinner("Running BIRCH clustering..."):
-            start_time = time.time()
-            
-            # Get points
-            points = point_cloud.point_cloud_plane_removed
-            
-            # Initialize clustering manager
-            clustering_manager = ClusteringManager(points)
-            
-            # Run BIRCH
-            labels = clustering_manager.run_birch(
-                threshold=threshold, branching_factor=branching_factor, n_clusters=n_clusters
-            )
-            
-            # Store results
-            st.session_state.clustering_results['birch'] = {
-                'labels': labels,
-                'params': {
-                    'threshold': threshold,
-                    'branching_factor': branching_factor,
-                    'n_clusters': n_clusters
-                },
-                'runtime': time.time() - start_time
-            }
-            
-            # Generate and store cuboids
-            clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
-            cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
-            st.session_state.cuboids = cuboids
-            
-            st.success(f"BIRCH completed in {time.time() - start_time:.2f} seconds")
+        # Check if KITTI 2D bboxes are available for frustum filtering
+        sample_data = st.session_state.get('sample_data', {})
+        is_kitti = st.session_state.get('current_dataset') == 'kitti'
+        ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
+        has_2d_bboxes = any(box.get('bbox_2d') is not None for box in ground_truth_boxes)
+
+        if is_kitti and has_2d_bboxes:
+            # Use frustum-based clustering (with HDBSCAN for automatic cluster detection)
+            with st.spinner("Running frustum-based clustering..."):
+                start_time = time.time()
+
+                # Create FrustumManager and compute frustums
+                fm = FrustumManager(
+                    sample_data['camera_intrinsic'],
+                    sample_data['camera_to_lidar_transform']
+                )
+                frustums = fm.create_frustums_from_bboxes(ground_truth_boxes, depth=100)
+                st.session_state.frustums = frustums
+
+                # Get points
+                points = st.session_state.point_cloud.point_cloud_plane_removed
+
+                # Run per-frustum clustering
+                cuboids, per_frustum_results = fm.cluster_in_frustums(
+                    points, frustums, min_cluster_size=10, min_samples=5,
+                    ground_plane_model=st.session_state.get('ground_plane_model')
+                )
+                bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
+
+                # Store results
+                st.session_state.per_frustum_clusters = per_frustum_results
+                st.session_state.cuboids = cuboids
+
+                st.session_state.clustering_results['birch'] = {
+                    'labels': None,
+                    'per_frustum_clusters': per_frustum_results,
+                    'bbox_results': bbox_results,
+                    'is_frustum_based': True,
+                    'params': {
+                        'threshold': threshold,
+                        'branching_factor': branching_factor,
+                        'n_clusters': n_clusters
+                    },
+                    'runtime': time.time() - start_time
+                }
+
+                n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+                st.success(f"Frustum-based clustering completed in {time.time() - start_time:.2f}s. "
+                          f"{n_successful} frustums with clusters, {len(cuboids)} cuboids found.")
+        else:
+            with st.spinner("Running BIRCH clustering..."):
+                start_time = time.time()
+
+                # Get points
+                points = point_cloud.point_cloud_plane_removed
+
+                # Initialize clustering manager
+                clustering_manager = ClusteringManager(points)
+
+                # Run BIRCH
+                labels = clustering_manager.run_birch(
+                    threshold=threshold, branching_factor=branching_factor, n_clusters=n_clusters
+                )
+
+                # Store results
+                st.session_state.clustering_results['birch'] = {
+                    'labels': labels,
+                    'is_frustum_based': False,
+                    'params': {
+                        'threshold': threshold,
+                        'branching_factor': branching_factor,
+                        'n_clusters': n_clusters
+                    },
+                    'runtime': time.time() - start_time
+                }
+
+                # Generate and store cuboids
+                clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
+                cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
+                st.session_state.cuboids = cuboids
+
+                st.success(f"BIRCH completed in {time.time() - start_time:.2f} seconds")
 
     # Display results if available
     if 'birch' in st.session_state.clustering_results:
         result = st.session_state.clustering_results['birch']
-        
-        # Metrics
-        labels = result['labels']
-        unique_labels = np.unique(labels)
-        n_clusters = len(unique_labels)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Clusters", n_clusters)
-        with col2:
-            st.metric("Noise Points", 0)  # BIRCH doesn't have noise points
-        with col3:
-            st.metric("Runtime", f"{result['runtime']:.2f}s")
-        
-        # 3D Visualization
+        is_frustum_based = result.get('is_frustum_based', False)
+
+        if is_frustum_based:
+            # Frustum-based metrics
+            bbox_results = result.get('bbox_results', [])
+            n_frustums = len(bbox_results)
+            n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+            n_cuboids = len(st.session_state.get('cuboids', []))
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Frustums", n_frustums)
+            with col2:
+                st.metric("With Clusters", n_successful)
+            with col3:
+                st.metric("Total Cuboids", n_cuboids)
+            with col4:
+                st.metric("Runtime", f"{result['runtime']:.2f}s")
+
+            if bbox_results:
+                st.subheader("Per-Frustum Results")
+                df = pd.DataFrame(bbox_results)
+                st.dataframe(df, use_container_width=True)
+        else:
+            # Standard metrics
+            labels = result['labels']
+            unique_labels = np.unique(labels)
+            n_clusters = len(unique_labels)
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Clusters", n_clusters)
+            with col2:
+                st.metric("Noise Points", 0)
+            with col3:
+                st.metric("Runtime", f"{result['runtime']:.2f}s")
+
+        # 3D Visualization (show clusters with distinct colors)
         st.subheader("3D Visualization")
-        fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "BIRCH Clustering Results")
-        st.plotly_chart(fig, width='stretch')
+        if is_frustum_based:
+            per_frustum_clusters = result.get('per_frustum_clusters', [])
+            cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
+            if cluster_points is not None:
+                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
+                                             "Frustum-Based Clustering Results (Colored by Cluster)")
+            else:
+                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
+                                             "Frustum-Based Clustering Results")
+        else:
+            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
+                                         "BIRCH Clustering Results")
+        st.plotly_chart(fig, width='stretch', key='birch_clustering_chart')
 
         # Parameter summary
         st.subheader("Parameters Used")
@@ -548,63 +855,341 @@ def agglomerative_page(point_cloud):
 
     # Run clustering button
     if st.sidebar.button("🚀 Run Agglomerative", key="run_agglomerative"):
-        with st.spinner("Running Agglomerative clustering..."):
-            start_time = time.time()
-            
-            # Get points
-            points = point_cloud.point_cloud_plane_removed
-            
-            # Initialize clustering manager
-            clustering_manager = ClusteringManager(points)
-            
-            # Run Agglomerative
-            labels = clustering_manager.run_agglomerative(
-                n_clusters=n_clusters, linkage=linkage, affinity=affinity
-            )
-            
-            # Store results
-            st.session_state.clustering_results['agglomerative'] = {
-                'labels': labels,
-                'params': {
-                    'n_clusters': n_clusters,
-                    'linkage': linkage,
-                    'affinity': affinity
-                },
-                'runtime': time.time() - start_time
-            }
-            
-            # Generate and store cuboids
-            clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
-            cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
-            st.session_state.cuboids = cuboids
-            
-            st.success(f"Agglomerative completed in {time.time() - start_time:.2f} seconds")
+        # Check if KITTI 2D bboxes are available for frustum filtering
+        sample_data = st.session_state.get('sample_data', {})
+        is_kitti = st.session_state.get('current_dataset') == 'kitti'
+        ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
+        has_2d_bboxes = any(box.get('bbox_2d') is not None for box in ground_truth_boxes)
+
+        if is_kitti and has_2d_bboxes:
+            # Use frustum-based clustering
+            with st.spinner("Running frustum-based clustering..."):
+                start_time = time.time()
+
+                # Create FrustumManager and compute frustums
+                fm = FrustumManager(
+                    sample_data['camera_intrinsic'],
+                    sample_data['camera_to_lidar_transform']
+                )
+                frustums = fm.create_frustums_from_bboxes(ground_truth_boxes, depth=100)
+                st.session_state.frustums = frustums
+
+                # Get points
+                points = st.session_state.point_cloud.point_cloud_plane_removed
+
+                # Run per-frustum clustering
+                cuboids, per_frustum_results = fm.cluster_in_frustums(
+                    points, frustums, min_cluster_size=10, min_samples=5,
+                    ground_plane_model=st.session_state.get('ground_plane_model')
+                )
+                bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
+
+                # Store results
+                st.session_state.per_frustum_clusters = per_frustum_results
+                st.session_state.cuboids = cuboids
+
+                st.session_state.clustering_results['agglomerative'] = {
+                    'labels': None,
+                    'per_frustum_clusters': per_frustum_results,
+                    'bbox_results': bbox_results,
+                    'is_frustum_based': True,
+                    'params': {
+                        'n_clusters': n_clusters,
+                        'linkage': linkage,
+                        'affinity': affinity
+                    },
+                    'runtime': time.time() - start_time
+                }
+
+                n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+                st.success(f"Frustum-based clustering completed in {time.time() - start_time:.2f}s. "
+                          f"{n_successful} frustums with clusters, {len(cuboids)} cuboids found.")
+        else:
+            with st.spinner("Running Agglomerative clustering..."):
+                start_time = time.time()
+
+                # Get points
+                points = point_cloud.point_cloud_plane_removed
+
+                # Initialize clustering manager
+                clustering_manager = ClusteringManager(points)
+
+                # Run Agglomerative
+                labels = clustering_manager.run_agglomerative(
+                    n_clusters=n_clusters, linkage=linkage, affinity=affinity
+                )
+
+                # Store results
+                st.session_state.clustering_results['agglomerative'] = {
+                    'labels': labels,
+                    'is_frustum_based': False,
+                    'params': {
+                        'n_clusters': n_clusters,
+                        'linkage': linkage,
+                        'affinity': affinity
+                    },
+                    'runtime': time.time() - start_time
+                }
+
+                # Generate and store cuboids
+                clustering_manager = ClusteringManager(point_cloud.point_cloud_plane_removed)
+                cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
+                st.session_state.cuboids = cuboids
+
+                st.success(f"Agglomerative completed in {time.time() - start_time:.2f} seconds")
 
     # Display results if available
     if 'agglomerative' in st.session_state.clustering_results:
         result = st.session_state.clustering_results['agglomerative']
-        
-        # Metrics
-        labels = result['labels']
-        unique_labels = np.unique(labels)
-        n_clusters = len(unique_labels)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Clusters", n_clusters)
-        with col2:
-            st.metric("Noise Points", 0)  # Agglomerative doesn't have noise points
-        with col3:
-            st.metric("Runtime", f"{result['runtime']:.2f}s")
-        
-        # 3D Visualization
+        is_frustum_based = result.get('is_frustum_based', False)
+
+        if is_frustum_based:
+            # Frustum-based metrics
+            bbox_results = result.get('bbox_results', [])
+            n_frustums = len(bbox_results)
+            n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+            n_cuboids = len(st.session_state.get('cuboids', []))
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Frustums", n_frustums)
+            with col2:
+                st.metric("With Clusters", n_successful)
+            with col3:
+                st.metric("Total Cuboids", n_cuboids)
+            with col4:
+                st.metric("Runtime", f"{result['runtime']:.2f}s")
+
+            if bbox_results:
+                st.subheader("Per-Frustum Results")
+                df = pd.DataFrame(bbox_results)
+                st.dataframe(df, use_container_width=True)
+        else:
+            # Standard metrics
+            labels = result['labels']
+            unique_labels = np.unique(labels)
+            n_clusters = len(unique_labels)
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Clusters", n_clusters)
+            with col2:
+                st.metric("Noise Points", 0)
+            with col3:
+                st.metric("Runtime", f"{result['runtime']:.2f}s")
+
+        # 3D Visualization (show clusters with distinct colors)
         st.subheader("3D Visualization")
-        fig = create_3d_scatter_plot(point_cloud, labels, None, st.session_state.cuboids, "Agglomerative Clustering Results")
-        st.plotly_chart(fig, width='stretch')
+        if is_frustum_based:
+            per_frustum_clusters = result.get('per_frustum_clusters', [])
+            cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
+            if cluster_points is not None:
+                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
+                                             "Frustum-Based Clustering Results (Colored by Cluster)")
+            else:
+                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
+                                             "Frustum-Based Clustering Results")
+        else:
+            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
+                                         "Agglomerative Clustering Results")
+        st.plotly_chart(fig, width='stretch', key='agglomerative_clustering_chart')
 
         # Parameter summary
         st.subheader("Parameters Used")
         st.json(result['params'])
+
+def hdbscan_page(point_cloud):
+    """HDBSCAN algorithm parameter control and visualization page"""
+    st.header("🔬 HDBSCAN Clustering")
+
+    # Parameter controls
+    with st.sidebar.expander("HDBSCAN Parameters", expanded=True):
+        min_cluster_size = st.slider("Min Cluster Size", min_value=5, max_value=100, value=5, step=1,
+                                     help="Minimum number of points in a cluster", key="min_cluster_size_hdbscan")
+        min_samples = st.slider("Min Samples", min_value=1, max_value=50, value=5, step=1,
+                                help="Number of samples in a neighborhood for a point to be considered as a core point",
+                                key="min_samples_hdbscan")
+        cluster_selection_method = st.selectbox("Cluster Selection Method",
+                                                 options=['eom', 'leaf'],
+                                                 index=0,
+                                                 help="Method used to select clusters from the condensed tree",
+                                                 key="cluster_selection_method_hdbscan")
+
+    # Run clustering button
+    if st.sidebar.button("🚀 Run HDBSCAN", key="run_hdbscan"):
+        # Check if KITTI 2D bboxes are available for frustum filtering
+        sample_data = st.session_state.get('sample_data', {})
+        is_kitti = st.session_state.get('current_dataset') == 'kitti'
+        ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
+        has_2d_bboxes = any(box.get('bbox_2d') is not None for box in ground_truth_boxes)
+
+        if is_kitti and has_2d_bboxes:
+            # Use frustum-based clustering with HDBSCAN
+            with st.spinner("Running frustum-based HDBSCAN clustering..."):
+                start_time = time.time()
+
+                # Create FrustumManager and compute frustums
+                fm = FrustumManager(
+                    sample_data['camera_intrinsic'],
+                    sample_data['camera_to_lidar_transform']
+                )
+                frustums = fm.create_frustums_from_bboxes(ground_truth_boxes, depth=100)
+                st.session_state.frustums = frustums
+
+                # Get points
+                points = st.session_state.point_cloud.point_cloud_plane_removed
+
+                # Build clustering params from UI sliders
+                clustering_params = {
+                    'hdbscan': {
+                        'min_cluster_size': min_cluster_size,
+                        'min_samples': min_samples,
+                        'cluster_selection_method': cluster_selection_method
+                    }
+                }
+
+                # Run per-frustum clustering with HDBSCAN and overlap validation
+                cuboids, per_frustum_results = fm.cluster_in_frustums(
+                    points, frustums,
+                    min_cluster_size=min_cluster_size,
+                    min_samples=min_samples,
+                    algorithm='hdbscan',
+                    validate_overlap=st.session_state.validate_overlap,
+                    overlap_threshold=st.session_state.overlap_threshold,
+                    use_templates=st.session_state.use_templates,
+                    clustering_params=clustering_params,
+                    ground_plane_model=st.session_state.get('ground_plane_model')
+                )
+                bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
+
+                # Store per-frustum results
+                st.session_state.per_frustum_clusters = per_frustum_results
+                st.session_state.cuboids = cuboids
+
+                # Store results
+                st.session_state.clustering_results['hdbscan'] = {
+                    'labels': None,
+                    'per_frustum_clusters': per_frustum_results,
+                    'bbox_results': bbox_results,
+                    'is_frustum_based': True,
+                    'params': {
+                        'min_cluster_size': min_cluster_size,
+                        'min_samples': min_samples,
+                        'cluster_selection_method': cluster_selection_method,
+                        'validate_overlap': st.session_state.validate_overlap,
+                        'overlap_threshold': st.session_state.overlap_threshold,
+                        'use_templates': st.session_state.use_templates
+                    },
+                    'runtime': time.time() - start_time
+                }
+
+                n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+                st.success(f"Frustum-based HDBSCAN completed in {time.time() - start_time:.2f}s. "
+                          f"Processed {len(frustums)} frustums, {n_successful} with clusters, {len(cuboids)} cuboids found.")
+        else:
+            # Standard whole point cloud clustering
+            with st.spinner("Running HDBSCAN clustering..."):
+                start_time = time.time()
+
+                # Get points
+                points = st.session_state.point_cloud.point_cloud_plane_removed
+
+                # Initialize clustering manager
+                clustering_manager = ClusteringManager(points)
+
+                # Run HDBSCAN
+                labels = clustering_manager.run_hdbscan(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=min_samples,
+                    cluster_selection_method=cluster_selection_method
+                )
+
+                # Store results
+                st.session_state.clustering_results['hdbscan'] = {
+                    'labels': labels,
+                    'is_frustum_based': False,
+                    'params': {
+                        'min_cluster_size': min_cluster_size,
+                        'min_samples': min_samples,
+                        'cluster_selection_method': cluster_selection_method
+                    },
+                    'runtime': time.time() - start_time
+                }
+
+                # Generate and store cuboids
+                cuboids = clustering_manager.generate_cuboids_from_clusters(labels)
+                st.session_state.cuboids = cuboids
+
+                st.success(f"HDBSCAN completed in {time.time() - start_time:.2f} seconds")
+
+    # Display results if available
+    if 'hdbscan' in st.session_state.clustering_results:
+        result = st.session_state.clustering_results['hdbscan']
+        is_frustum_based = result.get('is_frustum_based', False)
+
+        if is_frustum_based:
+            # Frustum-based metrics
+            per_frustum_clusters = result.get('per_frustum_clusters', [])
+            bbox_results = result.get('bbox_results', [])
+            n_frustums = len(per_frustum_clusters)
+            n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+            n_cuboids = len(st.session_state.get('cuboids', []))
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Frustums", n_frustums)
+            with col2:
+                st.metric("With Clusters", n_successful)
+            with col3:
+                st.metric("Total Cuboids", n_cuboids)
+            with col4:
+                st.metric("Runtime", f"{result['runtime']:.2f}s")
+
+            # Show per-frustum breakdown
+            if bbox_results:
+                st.subheader("Per-Frustum Results")
+                df = pd.DataFrame(bbox_results)
+                st.dataframe(df, use_container_width=True)
+
+            # Show IoU info if overlap validation was used
+            params = result.get('params', {})
+            if params.get('validate_overlap'):
+                st.info(f"Overlap validation enabled with IoU threshold: {params.get('overlap_threshold', 0.3):.2f}")
+        else:
+            # Standard metrics
+            labels = result['labels']
+            unique_labels = np.unique(labels)
+            n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+            n_noise = np.sum(labels == -1)
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Clusters", n_clusters)
+            with col2:
+                st.metric("Noise Points", n_noise)
+            with col3:
+                st.metric("Runtime", f"{result['runtime']:.2f}s")
+
+        # 3D Visualization
+        st.subheader("3D Visualization")
+        if is_frustum_based:
+            per_frustum_clusters = result.get('per_frustum_clusters', [])
+            cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
+            if cluster_points is not None:
+                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
+                                             "Frustum-Based HDBSCAN Results (Colored by Cluster)")
+            else:
+                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
+                                             "Frustum-Based HDBSCAN Results")
+        else:
+            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
+                                         "HDBSCAN Clustering Results")
+        st.plotly_chart(fig, width='stretch', key='hdbscan_clustering_chart')
+
+        # Parameter summary
+        st.subheader("Parameters Used")
+        st.json(result['params'])
+
 
 def kitti_groundtruth_page():
     """KITTI Ground Truth Comparison page - Uses same pipeline as other pages"""
@@ -632,179 +1217,19 @@ def kitti_groundtruth_page():
     # Get ground truth boxes for visualization
     ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
 
-    # Sidebar controls for 2D/3D visualization
-    with st.sidebar.expander("2D/3D Projection Settings", expanded=True):
+    # Sidebar controls for 2D visualization
+    with st.sidebar.expander("Visualization Settings", expanded=True):
         show_2d_boxes = st.checkbox("Show 2D Bounding Boxes", value=True, key="show_2d_boxes_kitti")
-        show_frustums = st.checkbox("Show 2D→3D Frustums", value=True, key="show_frustums_kitti")
-        frustum_depth = st.slider("Frustum Depth (m)", min_value=5, max_value=100, value=30, step=5,
-                                  key="frustum_depth_kitti",
-                                  help="How far to project the 2D bounding box frustums into 3D space")
-        frustum_opacity = st.slider("Frustum Opacity", min_value=0.05, max_value=0.5, value=0.15, step=0.05,
-                                    key="frustum_opacity_kitti")
+        match_distance_threshold = st.slider("Match Distance Threshold (m)", min_value=1.0, max_value=10.0,
+                                             value=5.0, step=0.5, key="match_dist_kitti",
+                                             help="Maximum distance to match detected cuboid to GT")
+        show_match_lines = st.checkbox("Show Match Lines", value=True, key="show_match_lines_kitti",
+                                       help="Draw lines connecting matched GT and detected cuboids")
 
-    # Frustum-based clustering controls
-    with st.sidebar.expander("Frustum-Based Clustering", expanded=False):
-        use_frustum_filtering = st.checkbox(
-            "Filter Points by Frustums",
-            value=False,
-            key="use_frustum_filtering_kitti",
-            help="Only cluster points inside the 2D bbox frustum projections"
-        )
-        frustum_cluster_depth = st.slider(
-            "Filtering Depth (m)", min_value=5, max_value=100, value=30, step=5,
-            key="frustum_cluster_depth_kitti",
-            help="Depth of frustums for point filtering"
-        )
-        frustum_min_cluster_size = st.slider(
-            "Min Cluster Size", min_value=5, max_value=100, value=15, step=5,
-            key="frustum_min_cluster_size_kitti",
-            help="Minimum points for a cluster when using frustum filtering"
-        )
-        frustum_min_samples = st.slider(
-            "Min Samples", min_value=2, max_value=30, value=5, step=1,
-            key="frustum_min_samples_kitti",
-            help="Minimum samples for HDBSCAN core points"
-        )
+    # Note: Frustum-based clustering is now automatic
+    st.sidebar.info("Frustum filtering is automatic when running clustering on KITTI data. "
+                    "Run DBSCAN, BIRCH, or Agglomerative on the other tabs.")
 
-        # Run frustum-filtered clustering button
-        run_frustum_clustering = st.button(
-            "🎯 Run Frustum-Filtered Clustering",
-            key="run_frustum_clustering_kitti",
-            help="Re-run clustering only on points inside the 2D bbox frustums"
-        )
-
-    # Handle frustum-filtered clustering (per bounding box)
-    if run_frustum_clustering:
-        if not ground_truth_boxes:
-            st.sidebar.error("No ground truth boxes available for frustum filtering")
-        else:
-            camera_intrinsic = sample_data.get('camera_intrinsic')
-            camera_to_lidar = sample_data.get('camera_to_lidar_transform')
-
-            if camera_intrinsic is None or camera_to_lidar is None:
-                st.sidebar.error("Camera calibration data not available")
-            else:
-                with st.spinner("Running per-bbox frustum clustering..."):
-                    start_time = time.time()
-
-                    # Create projection instance
-                    projection = Projection2DTo3D(
-                        camera_intrinsic=camera_intrinsic,
-                        camera_extrinsic=np.eye(4),
-                        camera_to_lidar_transform=camera_to_lidar,
-                        point_cloud=point_cloud.point_cloud_plane_removed
-                    )
-
-                    # Import frustum filtering function
-                    from pointcloud_projection import filter_points_in_frustum
-
-                    # Store all detected cuboids from all frustums
-                    all_detected_cuboids = []
-                    total_points_in_frustums = 0
-                    total_clusters = 0
-                    bbox_results = []
-
-                    # Iterate through each bounding box
-                    for i, gt_box in enumerate(ground_truth_boxes):
-                        bbox_2d = gt_box.get('bbox_2d')
-                        if bbox_2d is None:
-                            continue
-
-                        category = gt_box.get('category', 'Unknown')
-
-                        # Project this bbox to 3D frustum
-                        camera_origin, base_corners = projection.project_bbox_corners_to_3d(
-                            bbox_2d, depth=frustum_cluster_depth
-                        )
-
-                        # Filter points inside this frustum
-                        points_in_frustum, mask = filter_points_in_frustum(
-                            point_cloud.point_cloud_plane_removed,
-                            camera_origin,
-                            base_corners
-                        )
-
-                        n_points = len(points_in_frustum)
-                        total_points_in_frustums += n_points
-
-                        if n_points < frustum_min_cluster_size:
-                            # Not enough points for clustering
-                            bbox_results.append({
-                                'bbox_idx': i,
-                                'category': category,
-                                'points': n_points,
-                                'clusters': 0,
-                                'status': 'too_few_points'
-                            })
-                            continue
-
-                        # Cluster points inside this frustum
-                        try:
-                            cluster_manager = ClusteringManager(points_in_frustum)
-                            try:
-                                labels = cluster_manager.run_hdbscan(
-                                    min_cluster_size=frustum_min_cluster_size,
-                                    min_samples=frustum_min_samples
-                                )
-                            except Exception:
-                                # Fallback to DBSCAN
-                                labels = cluster_manager.run_dbscan(
-                                    eps=0.5, min_samples=frustum_min_samples
-                                )
-
-                            # Generate cuboids from clusters in this frustum
-                            cuboids = cluster_manager.generate_cuboids_from_clusters(labels)
-
-                            # Add category info to cuboids
-                            for cuboid in cuboids:
-                                cuboid['category'] = category
-                                cuboid['source_bbox_idx'] = i
-
-                            all_detected_cuboids.extend(cuboids)
-
-                            n_clusters = len(cuboids)
-                            total_clusters += n_clusters
-
-                            bbox_results.append({
-                                'bbox_idx': i,
-                                'category': category,
-                                'points': n_points,
-                                'clusters': n_clusters,
-                                'status': 'success'
-                            })
-
-                        except Exception as e:
-                            bbox_results.append({
-                                'bbox_idx': i,
-                                'category': category,
-                                'points': n_points,
-                                'clusters': 0,
-                                'status': f'error: {str(e)}'
-                            })
-
-                    # Store results
-                    st.session_state.clustering_results['frustum_filtered'] = {
-                        'bbox_results': bbox_results,
-                        'params': {
-                            'depth': frustum_cluster_depth,
-                            'min_cluster_size': frustum_min_cluster_size,
-                            'min_samples': frustum_min_samples,
-                            'n_bboxes': len(ground_truth_boxes)
-                        },
-                        'runtime': time.time() - start_time
-                    }
-                    st.session_state.cuboids = all_detected_cuboids
-
-                    # Show summary
-                    n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
-                    st.sidebar.success(
-                        f"Per-bbox frustum clustering complete!\n"
-                        f"- Bounding boxes processed: {len(bbox_results)}\n"
-                        f"- Successful detections: {n_successful}\n"
-                        f"- Total clusters found: {total_clusters}\n"
-                        f"- Total points in frustums: {total_points_in_frustums}\n"
-                        f"- Runtime: {time.time() - start_time:.2f}s"
-                    )
 
     # Display camera image with optional 2D bounding boxes
     st.subheader("📷 Camera Image")
@@ -855,22 +1280,21 @@ def kitti_groundtruth_page():
     if 'cuboids' in st.session_state and st.session_state.cuboids:
         detected_cuboids = st.session_state.cuboids
 
-        # Get clustering results - check frustum_filtered first, then other algorithms
+        # Get clustering results - check any algorithm for is_frustum_based flag
         clustering_result = None
         labels = None
         is_frustum_filtered = False
+        algo_name = None
 
-        if 'frustum_filtered' in st.session_state.clustering_results:
-            clustering_result = st.session_state.clustering_results['frustum_filtered']
-            is_frustum_filtered = True
-            # Frustum filtered doesn't have global labels
-            labels = None
-        else:
-            for algo in ['dbscan', 'optics', 'birch', 'agglomerative']:
-                if algo in st.session_state.clustering_results:
-                    clustering_result = st.session_state.clustering_results[algo]
-                    labels = clustering_result['labels']
-                    break
+        for algo in ['dbscan', 'birch', 'agglomerative', 'optics', 'frustum_filtered']:
+            if algo in st.session_state.clustering_results:
+                clustering_result = st.session_state.clustering_results[algo]
+                if clustering_result.get('is_frustum_based', False) or algo == 'frustum_filtered':
+                    is_frustum_filtered = True
+                    labels = None
+                else:
+                    labels = clustering_result.get('labels')
+                break
 
         if clustering_result or detected_cuboids:
             col1, col2, col3 = st.columns(3)
@@ -890,79 +1314,21 @@ def kitti_groundtruth_page():
                 else:
                     st.metric("Method", "Frustum-based")
 
-            # Side-by-side comparison
-            st.subheader("📊 Side-by-Side Comparison")
-            col1, col2 = st.columns(2)
+            # Match detected cuboids to ground truth using CuboidMatcher
+            matcher = CuboidMatcher(max_distance=match_distance_threshold)
+            match_result = matcher.match(ground_truth_boxes, detected_cuboids)
+            matches = match_result.matches
 
-            with col1:
-                st.markdown("**🟢 Ground Truth (KITTI)**")
-                fig_gt = create_3d_scatter_plot(
-                    point_cloud,
-                    None,
-                    None,
-                    ground_truth_boxes,
-                    None,
-                    "Ground Truth"
-                )
 
-                # Add frustums to ground truth view if enabled
-                if show_frustums and ground_truth_boxes:
-                    camera_intrinsic = sample_data.get('camera_intrinsic')
-                    camera_to_lidar = sample_data.get('camera_to_lidar_transform')
-                    if camera_intrinsic is not None and camera_to_lidar is not None:
-                        add_frustums_to_figure(
-                            fig_gt, ground_truth_boxes,
-                            camera_intrinsic, camera_to_lidar,
-                            depth=frustum_depth, opacity=frustum_opacity
-                        )
+            # Unified comparison view
+            st.subheader("🎯 Unified Comparison View")
+            st.markdown("""
+            **Color Legend:** Ground truth cuboids use lighter shades, detected cuboids use darker shades of the same color (by category).
+            Yellow lines connect matched pairs.
+            """)
 
-                st.plotly_chart(fig_gt, width='stretch')
-
-            with col2:
-                st.markdown("**🔴 Frustum-Based Detection**" if is_frustum_filtered else "**🔴 Pipeline Detection**")
-                fig_det = create_3d_scatter_plot(
-                    point_cloud,
-                    labels,  # Will be None for frustum-filtered
-                    None,
-                    detected_cuboids,
-                    None,
-                    "Detected Objects"
-                )
-
-                # Add frustums to detected view if frustum-filtered
-                if is_frustum_filtered and show_frustums and ground_truth_boxes:
-                    camera_intrinsic = sample_data.get('camera_intrinsic')
-                    camera_to_lidar = sample_data.get('camera_to_lidar_transform')
-                    if camera_intrinsic is not None and camera_to_lidar is not None:
-                        add_frustums_to_figure(
-                            fig_det, ground_truth_boxes,
-                            camera_intrinsic, camera_to_lidar,
-                            depth=frustum_depth, opacity=frustum_opacity
-                        )
-
-                st.plotly_chart(fig_det, width='stretch')
-
-            # Overlay view
-            st.subheader("🎨 Overlay Comparison")
-            st.markdown("**Green** = Ground Truth | **Red** = Detected | **Pyramids** = 2D→3D Frustums")
-            fig_overlay = create_comparison_plot(
-                point_cloud,
-                ground_truth_boxes,
-                detected_cuboids
-            )
-
-            # Add frustums to overlay view if enabled
-            if show_frustums and ground_truth_boxes:
-                camera_intrinsic = sample_data.get('camera_intrinsic')
-                camera_to_lidar = sample_data.get('camera_to_lidar_transform')
-                if camera_intrinsic is not None and camera_to_lidar is not None:
-                    add_frustums_to_figure(
-                        fig_overlay, ground_truth_boxes,
-                        camera_intrinsic, camera_to_lidar,
-                        depth=frustum_depth, opacity=frustum_opacity
-                    )
-
-            st.plotly_chart(fig_overlay, width='stretch')
+            fig_unified = create_comparison_plot(point_cloud, ground_truth_boxes, detected_cuboids)
+            st.plotly_chart(fig_unified, width='stretch', key='kitti_comparison_chart')
 
         else:
             st.info("Run a clustering algorithm (DBSCAN, OPTICS, etc.) on other tabs to see detection comparison")
@@ -1007,15 +1373,13 @@ def main():
 
     # Sample selection (max value depends on dataset)
     max_sample = 403 if dataset == "nuscenes" else 7480
-    sample_index = st.sidebar.slider(
+    sample_index = st.sidebar.text_input(
         "Sample Index",
-        min_value=0,
-        max_value=max_sample,
         value=0,
-        step=1,
         key="sample_index",
         help=f"0-{max_sample} for {dataset.upper()}"
     )
+    sample_index = int(sample_index)
 
     # RANSAC parameters for ground plane removal
     st.sidebar.markdown("### Ground Plane Removal")
@@ -1069,33 +1433,41 @@ def main():
         st.sidebar.info(f"X Range: [{points[:, 0].min():.1f}, {points[:, 0].max():.1f}]")
         st.sidebar.info(f"Y Range: [{points[:, 1].min():.1f}, {points[:, 1].max():.1f}]")
         st.sidebar.info(f"Z Range: [{points[:, 2].min():.1f}, {points[:, 2].max():.1f}]")
+        ground_z = st.session_state.get('ground_z')
+        if ground_z is not None:
+            st.sidebar.info(f"Ground Z (at origin): {ground_z:.3f}m")
 
     # Clear results button
     if st.sidebar.button("🗑️ Clear All Results"):
         st.session_state.clustering_results = {}
         st.rerun()
-
+    
+    with st.sidebar.expander("Overlap Validation", expanded=True):
+        st.session_state.validate_overlap = st.checkbox("Validate with 2D Overlap", value=True, key="validate_overlap_hdbscan",
+                                       help="Select best cuboid by projecting back to 2D and checking IoU with original bbox")
+        st.session_state.overlap_threshold = st.slider("Min IoU Threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.05,
+                                      key="overlap_threshold_hdbscan",
+                                      help="Minimum IoU required to accept a cuboid")
+        st.session_state.use_templates = st.checkbox("Use Template Cuboids", value=True, key="use_templates_hdbscan",
+                                    help="Use class-specific cuboid templates based on KITTI statistics")
     # Main navigation
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "SEGMENTATION AND PROJECTION ", "DBSCAN", " BIRCH", " Agglomerative", " Comparison", "KITTI Ground Truth"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "SEGMENTATION AND PROJECTION", "HDBSCAN", "DBSCAN", "BIRCH", "Agglomerative", "Comparison", "KITTI Ground Truth"
     ])
 
     with tab1:
-        #project_segmask_on_pointcloud_page(segmentation_mask, point_cloud)
         project_segmentation_mask_on_pointcloud_page(st.session_state.sample_data, points)
     with tab2:
-        dbscan_page(point_cloud)
-
+        hdbscan_page(point_cloud)
     with tab3:
-        birch_page(point_cloud)
-
+        dbscan_page(point_cloud)
     with tab4:
-        agglomerative_page(point_cloud)
-
+        birch_page(point_cloud)
     with tab5:
-        optics_page(point_cloud)
-
+        agglomerative_page(point_cloud)
     with tab6:
+        optics_page(point_cloud)
+    with tab7:
         kitti_groundtruth_page()
         
 
