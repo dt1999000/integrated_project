@@ -188,23 +188,23 @@ class FrustumManager:
         """
         Find the best cuboid by projecting each to 2D and selecting the one with highest IoU.
 
-        Projects all cuboids to 2D and returns the one with highest IoU overlap
-        with the original 2D bounding box. Sets 'need_review' flag if IoU < threshold.
+        Projects all axis-aligned cuboids to 2D and returns the one with highest IoU overlap
+        with the original 2D bounding box. Note: 'need_review' is NOT set here - it should
+        be computed after template cuboid generation in cluster_in_frustums().
 
         Args:
             cuboids: List of cuboid dicts from clustering
             points: Nx3 array of points in the frustum
             labels: N array of cluster labels
             original_bbox_2d: Dict with 'left', 'top', 'right', 'bottom' (the original 2D detection)
-            overlap_threshold: IoU threshold below which 'need_review' is set True (default: 0.3)
+            overlap_threshold: IoU threshold (unused here, kept for API compatibility)
 
         Returns:
             Best cuboid dict with added 'selected_points', 'selected_labels', 'iou',
-            'projected_bbox_2d', and 'need_review' keys, or None if no valid cuboids
+            and 'projected_bbox_2d' keys, or None if no valid cuboids
         """
         if not cuboids:
             return None
-        print(f'cuboids given to find_best_cuboid: {len(cuboids)}')
 
         # Iterate from nearest to farthest
         best_cuboid = {'iou': 0}
@@ -217,6 +217,7 @@ class FrustumManager:
                 continue  # Cuboid is behind camera
 
             projected_bbox = projected['bbox_2d']
+            print(f"projected bbox: {projected_bbox}")
 
             # Compute IoU between projected bbox and original detection bbox
             iou = compute_bbox_iou(projected_bbox, original_bbox_2d)
@@ -227,11 +228,7 @@ class FrustumManager:
                 best_cuboid['selected_points'] = points[labels == best_cuboid['label']]
                 best_cuboid['selected_labels'] = labels[labels == best_cuboid['label']]
 
-        if best_cuboid['iou'] < overlap_threshold:
-            best_cuboid['need_review'] = True
-        else:
-            best_cuboid['need_review'] = False
-        print(f'best cuboid: {best_cuboid}')
+        print(f"best cuboid (axis-aligned): iou={best_cuboid['iou']}, source bbox idx: {best_cuboid['source_bbox_idx']}")
         return best_cuboid
 
     def cluster_in_frustums(
@@ -242,7 +239,7 @@ class FrustumManager:
         min_samples: int = 5,
         algorithm: str = "hdbscan",
         validate_overlap: bool = False,
-        overlap_threshold: float = 0.3,
+        overlap_threshold: float = 0.7,
         use_templates: bool = True,
         clustering_params: Optional[Dict[str, Dict]] = None,
         ground_plane_model: Optional[np.ndarray] = None
@@ -312,7 +309,6 @@ class FrustumManager:
                 }
                 labels = cluster_manager.run_clustering(algorithm, **override_params)
                 print(f"labels: {np.unique(labels)}")
-                print(f"frustum idx: {frustum.idx}")
                 n_clusters = len(np.unique(labels))
                 # First generate axis-aligned cuboids for selection/validation
                 cuboids = cluster_manager.generate_cuboids_from_clusters(labels)
@@ -321,7 +317,6 @@ class FrustumManager:
                 for cuboid in cuboids:
                     cuboid['category'] = frustum.category
                     cuboid['source_bbox_idx'] = frustum.idx
-                print(f"num cuboids: {len(cuboids)}")
                 # Find best cuboid via overlap validation, then create template cuboid
                 if validate_overlap and cuboids:
                     selected = self.find_best_cuboid(
@@ -352,20 +347,36 @@ class FrustumManager:
                             if template_cuboid:
                                 template_cuboid['category'] = frustum.category
                                 template_cuboid['source_bbox_idx'] = frustum.idx
-                                template_cuboid['iou'] = selected.get('iou')
-                                template_cuboid['need_review'] = selected.get('need_review')
                                 template_cuboid['selected_points'] = selected.get('selected_points')
                                 template_cuboid['selected_labels'] = selected.get('selected_labels')
+
+                                # Project template cuboid back to 2D and recalculate IoU
+                                template_projected = self.projection.cuboid_to_2d(template_cuboid)
+                                if template_projected is not None:
+                                    template_bbox_2d = template_projected['bbox_2d']
+                                    template_iou = compute_bbox_iou(template_bbox_2d, frustum.bbox_2d)
+                                    template_cuboid['projected_bbox_2d'] = template_bbox_2d
+                                    template_cuboid['iou'] = template_iou
+                                    template_cuboid['need_review'] = template_iou < overlap_threshold
+                                    print(f"template cuboid: iou={template_iou:.3f}, need_review={template_cuboid['need_review']}")
+                                else:
+                                    # Template cuboid is behind camera, use axis-aligned values
+                                    template_cuboid['projected_bbox_2d'] = selected.get('projected_bbox_2d')
+                                    template_cuboid['iou'] = selected.get('iou')
+                                    template_cuboid['need_review'] = True
+
                                 cuboid = template_cuboid
                             else:
                                 cuboid = selected
                         else:
                             cuboid = selected
                     elif selected:
+                        # Not using templates - set need_review based on axis-aligned IoU
+                        selected['need_review'] = selected.get('iou', 0) < overlap_threshold
                         cuboid = selected
                     else:
                         cuboid = None  # No cuboid met the overlap threshold
-                
+
                 if cuboid:
                     all_cuboids.append(cuboid)
 
@@ -376,7 +387,7 @@ class FrustumManager:
                     labels=labels,
                     n_points=n_points,
                     n_clusters=n_clusters,
-                    status=f"need_review: {selected.get('need_review')}"
+                    status=f"need_review: {cuboid.get('need_review') if cuboid else 'no_cuboid'}"
                 ))
             except Exception as e:
                 results.append(FrustumClusterResult(

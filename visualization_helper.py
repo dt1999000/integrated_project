@@ -217,6 +217,113 @@ def draw_2d_boxes_on_image(image: np.ndarray, boxes: List[Dict]) -> np.ndarray:
     return img_with_boxes
 
 
+def draw_projected_cuboid_bboxes(image: np.ndarray, cuboids: List[Dict],
+                                  original_boxes: Optional[List[Dict]] = None) -> np.ndarray:
+    """
+    Draw reprojected 2D bounding boxes from 3D cuboids on a camera image.
+
+    Shows the projected_bbox_2d from each cuboid (result of find_best_cuboid)
+    overlayed with original 2D bounding boxes for comparison.
+
+    Args:
+        image: RGB image array (H, W, 3)
+        cuboids: List of cuboid dictionaries containing 'projected_bbox_2d', 'category',
+                 'source_bbox_idx', and optionally 'iou'
+        original_boxes: Optional list of original ground truth boxes to draw first
+
+    Returns:
+        Image with reprojected bounding boxes drawn
+    """
+    img_with_boxes = image.copy()
+
+    # Color mapping for different categories (BGR format for cv2)
+    gt_colors = {
+        'Car': (0, 255, 0),        # Green
+        'Pedestrian': (255, 0, 0),  # Blue
+        'Cyclist': (0, 0, 255),     # Red
+        'Van': (255, 255, 0),       # Cyan
+        'Truck': (0, 255, 255),     # Yellow
+        'Person_sitting': (255, 0, 255),  # Magenta
+        'Tram': (128, 128, 0),      # Olive
+        'Misc': (128, 0, 128),      # Purple
+    }
+
+    # Projected bbox uses orange/red tones to distinguish from GT
+    proj_colors = {
+        'Car': (0, 165, 255),        # Orange
+        'Pedestrian': (255, 100, 100),  # Light blue
+        'Cyclist': (100, 100, 255),     # Light red
+        'Van': (255, 200, 0),       # Light cyan
+        'Truck': (0, 200, 255),     # Light yellow
+        'Person_sitting': (255, 100, 255),  # Light magenta
+        'Tram': (150, 150, 0),      # Light olive
+        'Misc': (150, 0, 150),      # Light purple
+    }
+
+    # First draw original GT boxes (solid line)
+    if original_boxes:
+        for index, box in enumerate(original_boxes):
+            bbox = box.get('bbox_2d')
+            if bbox is None:
+                continue
+
+            category = box.get('category', 'Unknown')
+            color = gt_colors.get(category, (255, 255, 0))
+
+            left, top = int(bbox['left']), int(bbox['top'])
+            right, bottom = int(bbox['right']), int(bbox['bottom'])
+            cv2.rectangle(img_with_boxes, (left, top), (right, bottom), color, 2)
+
+            # Draw label
+            label = f"GT{index}: {category}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.4
+            thickness = 1
+            (text_width, text_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
+            cv2.rectangle(img_with_boxes,
+                          (left, top - text_height - 5),
+                          (left + text_width, top),
+                          color, -1)
+            cv2.putText(img_with_boxes, label, (left, top - 5),
+                        font, font_scale, (255, 255, 255), thickness)
+
+    # Then draw projected cuboid bboxes (dashed effect using thicker line)
+    for cuboid in cuboids:
+        proj_bbox = cuboid['projected_bbox_2d']
+        print(f"proj_bbox: {proj_bbox}")
+
+        category = cuboid.get('category', 'Unknown')
+        frustum_idx = cuboid.get('source_bbox_idx', '?')
+        iou = cuboid.get('iou')
+        color = proj_colors.get(category, (0, 165, 255))  # Default: orange
+
+        left, top = int(proj_bbox['left']), int(proj_bbox['top'])
+        right, bottom = int(proj_bbox['right']), int(proj_bbox['bottom'])
+
+        # Draw with thicker line to distinguish from GT
+        cv2.rectangle(img_with_boxes, (left, top), (right, bottom), color, 3)
+
+        # Draw label with IoU if available
+        if iou is not None:
+            label = f"F{frustum_idx}: {category} IoU:{iou:.2f}"
+        else:
+            label = f"F{frustum_idx}: {category}"
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.4
+        thickness = 1
+        (text_width, text_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
+
+        # Position label at bottom of bbox to avoid overlap with GT label
+        cv2.rectangle(img_with_boxes,
+                      (left, bottom),
+                      (left + text_width, bottom + text_height + 5),
+                      color, -1)
+        cv2.putText(img_with_boxes, label, (left, bottom + text_height),
+                    font, font_scale, (0, 0, 0), thickness)
+
+    return img_with_boxes
+
 # =============================================================================
 # 3D Figure Modifier Functions
 # =============================================================================
