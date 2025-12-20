@@ -217,8 +217,7 @@ class FrustumManager:
                 continue  # Cuboid is behind camera
 
             projected_bbox = projected['bbox_2d']
-            print(f"projected bbox: {projected_bbox}")
-
+            
             # Compute IoU between projected bbox and original detection bbox
             iou = compute_bbox_iou(projected_bbox, original_bbox_2d)
             if iou > best_cuboid['iou']:

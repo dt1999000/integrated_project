@@ -628,11 +628,6 @@ class PointCloud:
 
         filtered_points, mask = filter_points_in_multiple_frustums(points, frustums)
 
-        print(f"Frustum filtering:")
-        print(f"  Original points: {len(points)}")
-        print(f"  Points in frustums: {len(filtered_points)}")
-        print(f"  Filtered out: {len(points) - len(filtered_points)}")
-
         return filtered_points, mask
 
     def remove_ground_plane_ransac(self, distance_threshold: float = 0.3,
@@ -672,21 +667,11 @@ class PointCloud:
         n_ground_points = len(inliers)
         n_remaining_points = len(filtered_points)
 
-        print(f"RANSAC ground plane removal:")
-        print(f"  Ground plane equation: {plane_model[:3]} * x + {plane_model[3]} = 0")
-        print(f"  Ground points removed: {n_ground_points}")
-        print(f"  Remaining points: {n_remaining_points}")
-        print(f"  Removal ratio: {n_ground_points / len(self.original_point_cloud) * 100:.2f}%")
-
         if remove_ego_car:
             # Calculate distance from LiDAR origin (0, 0, 0) for each point
             distances = np.linalg.norm(filtered_points[:, :3], axis=1)
             ego_mask = distances > 2.5
             filtered_points = filtered_points[ego_mask]
-
-            print(f"Ego car removal:")
-            print(f"  Removed {np.sum(~ego_mask)} points within 2.5m of LiDAR origin")
-            print(f"  Remaining points: {len(filtered_points)}")
 
         # Filter to only forward-facing points (positive x)
         if filter_forward_only:
@@ -726,10 +711,7 @@ class PointCloud:
         """
         Add projected points to the point cloud.
         """
-        print(f"Num pts before: {len(self.point_cloud_plane_removed)} point cloud")
         self.point_cloud_plane_removed = np.concatenate((self.point_cloud_plane_removed, projected_points), axis=0)
-        print(f"Added {len(projected_points)} projected points to the point cloud")
-        print(f"Total points: {len(self.point_cloud_plane_removed)}")
         
     def cluster_with_dbscan(self, eps: float = 0.5, min_samples: int = 10,
                            metric: str = 'euclidean', algorithm: str = 'auto',

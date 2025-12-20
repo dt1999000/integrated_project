@@ -9,6 +9,260 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Set
 import numpy as np
 
+from shapely.geometry import Polygon
+
+from kitti_dataset_loader import KITTIDatasetLoader
+from pointcloud_projection import PointCloud
+from frustum_manager import FrustumManager
+
+
+# =============================================================================
+# 3D IoU Calculation Functions
+# =============================================================================
+
+def compute_3d_iou_axis_aligned(box1: Dict, box2: Dict) -> float:
+    """
+    Compute 3D Intersection over Union between two axis-aligned cuboids.
+
+    Args:
+        box1: First cuboid with min_x, max_x, min_y, max_y, min_z, max_z
+        box2: Second cuboid with min_x, max_x, min_y, max_y, min_z, max_z
+
+    Returns:
+        IoU value between 0 and 1
+    """
+    # Get intersection box
+    x_min = max(box1['min_x'], box2['min_x'])
+    x_max = min(box1['max_x'], box2['max_x'])
+    y_min = max(box1['min_y'], box2['min_y'])
+    y_max = min(box1['max_y'], box2['max_y'])
+    z_min = max(box1['min_z'], box2['min_z'])
+    z_max = min(box1['max_z'], box2['max_z'])
+
+    # Check if there is an intersection
+    if x_max <= x_min or y_max <= y_min or z_max <= z_min:
+        return 0.0
+
+    # Intersection volume
+    intersection = (x_max - x_min) * (y_max - y_min) * (z_max - z_min)
+
+    # Individual volumes
+    vol1 = (box1['max_x'] - box1['min_x']) * (box1['max_y'] - box1['min_y']) * (box1['max_z'] - box1['min_z'])
+    vol2 = (box2['max_x'] - box2['min_x']) * (box2['max_y'] - box2['min_y']) * (box2['max_z'] - box2['min_z'])
+
+    # Union volume
+    union = vol1 + vol2 - intersection
+
+    if union <= 0:
+        return 0.0
+
+    return intersection / union
+
+
+def corners_to_bev_polygon(corners: np.ndarray) -> np.ndarray:
+    """
+    Extract bird's eye view (BEV) polygon from 8 corner points.
+
+    Args:
+        corners: 8x3 array of corner points
+
+    Returns:
+        4x2 array of BEV polygon vertices (x, y)
+    """
+    # Take bottom 4 corners (assuming corners 0-3 are bottom face)
+    # KITTI corner ordering: 0-3 bottom, 4-7 top
+    bev_corners = corners[:4, :2]  # x, y only
+    return bev_corners
+
+
+def compute_bev_iou_shapely(corners1: np.ndarray, corners2: np.ndarray) -> float:
+    """
+    Compute BEV IoU using shapely polygon intersection.
+
+    Args:
+        corners1: 8x3 array of first box corners
+        corners2: 8x3 array of second box corners
+
+    Returns:
+        BEV IoU value
+    """
+
+    try:
+        # Get BEV polygons
+        bev1 = corners_to_bev_polygon(corners1)
+        bev2 = corners_to_bev_polygon(corners2)
+
+        # Create shapely polygons
+        poly1 = Polygon(bev1)
+        poly2 = Polygon(bev2)
+
+        if not poly1.is_valid:
+            poly1 = poly1.buffer(0)
+        if not poly2.is_valid:
+            poly2 = poly2.buffer(0)
+
+        # Compute intersection and union
+        intersection = poly1.intersection(poly2).area
+        union = poly1.union(poly2).area
+
+        if union <= 0:
+            return 0.0
+
+        return intersection / union
+    except Exception:
+        return 0.0
+
+
+def compute_height_overlap(corners1: np.ndarray, corners2: np.ndarray) -> Tuple[float, float, float]:
+    """
+    Compute height overlap between two boxes.
+
+    Args:
+        corners1: 8x3 array of first box corners
+        corners2: 8x3 array of second box corners
+
+    Returns:
+        Tuple of (height_intersection, height1, height2)
+    """
+    # Get z ranges from corners
+    z1_min, z1_max = corners1[:, 2].min(), corners1[:, 2].max()
+    z2_min, z2_max = corners2[:, 2].min(), corners2[:, 2].max()
+
+    h1 = z1_max - z1_min
+    h2 = z2_max - z2_min
+
+    # Height intersection
+    z_overlap_min = max(z1_min, z2_min)
+    z_overlap_max = min(z1_max, z2_max)
+    height_intersection = max(0, z_overlap_max - z_overlap_min)
+
+    return height_intersection, h1, h2
+
+
+def box_to_corners(box: Dict) -> np.ndarray:
+    """
+    Convert axis-aligned box dict to 8 corner points.
+
+    Args:
+        box: Dict with min_x, max_x, min_y, max_y, min_z, max_z
+
+    Returns:
+        8x3 array of corner points
+    """
+    x0, x1 = box['min_x'], box['max_x']
+    y0, y1 = box['min_y'], box['max_y']
+    z0, z1 = box['min_z'], box['max_z']
+
+    # Corner ordering matching KITTI: bottom 4, then top 4
+    corners = np.array([
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ])
+    return corners
+
+
+def compute_3d_iou_oriented(box1: Dict, box2: Dict) -> float:
+    """
+    Compute oriented 3D IoU using BEV polygon intersection.
+
+    Works with rotated boxes using their corner points.
+    Falls back to axis-aligned IoU if shapely is not available.
+
+    Args:
+        box1: Cuboid dict with 'corners' (8x3) or min/max bounds
+        box2: Cuboid dict with 'corners' (8x3) or min/max bounds
+
+    Returns:
+        3D IoU value between 0 and 1
+    """
+    # Get corners for both boxes
+    if 'corners' in box1 and box1['corners'] is not None:
+        corners1 = np.asarray(box1['corners'])
+    else:
+        corners1 = box_to_corners(box1)
+
+    if 'corners' in box2 and box2['corners'] is not None:
+        corners2 = np.asarray(box2['corners'])
+    else:
+        corners2 = box_to_corners(box2)
+
+    # Compute BEV IoU
+    bev_iou = compute_bev_iou_shapely(corners1, corners2)
+    if bev_iou <= 0:
+        return 0.0
+
+    # Compute height overlap
+    height_inter, h1, h2 = compute_height_overlap(corners1, corners2)
+    if height_inter <= 0:
+        return 0.0
+
+    # Get BEV areas
+    bev1 = corners_to_bev_polygon(corners1)
+    bev2 = corners_to_bev_polygon(corners2)
+
+    try:
+        poly1 = Polygon(bev1)
+        poly2 = Polygon(bev2)
+
+        if not poly1.is_valid:
+            poly1 = poly1.buffer(0)
+        if not poly2.is_valid:
+            poly2 = poly2.buffer(0)
+
+        bev_inter = poly1.intersection(poly2).area
+        bev_area1 = poly1.area
+        bev_area2 = poly2.area
+    except Exception:
+        return compute_3d_iou_axis_aligned(box1, box2)
+
+    # 3D intersection volume
+    vol_inter = bev_inter * height_inter
+
+    # 3D volumes
+    vol1 = bev_area1 * h1
+    vol2 = bev_area2 * h2
+
+    # 3D union
+    vol_union = vol1 + vol2 - vol_inter
+
+    if vol_union <= 0:
+        return 0.0
+
+    return vol_inter / vol_union
+
+
+def compute_3d_iou(box1: Dict, box2: Dict, use_oriented: bool = True) -> float:
+    """
+    Compute 3D IoU between two cuboids.
+
+    Main entry point for 3D IoU calculation. Uses oriented IoU if corners
+    are available and shapely is installed, otherwise falls back to
+    axis-aligned calculation.
+
+    Args:
+        box1: First cuboid dict
+        box2: Second cuboid dict
+        use_oriented: If True, use oriented IoU when possible
+
+    Returns:
+        3D IoU value between 0 and 1
+    """
+    has_corners = (
+        ('corners' in box1 and box1['corners'] is not None) or
+        ('corners' in box2 and box2['corners'] is not None)
+    )
+
+    if use_oriented:
+        return compute_3d_iou_oriented(box1, box2)
+    else:
+        return compute_3d_iou_axis_aligned(box1, box2)
+
 
 @dataclass
 class MatchResult:
@@ -222,3 +476,94 @@ class CuboidMatcher:
             stats['Recall'] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
         return category_stats
+
+
+def run_pipeline_on_sample(
+    sample_index: int,
+    algorithm: str,
+    params_dict: Dict
+) -> Optional[Dict]:
+    """
+    Run the full detection pipeline on a single KITTI sample.
+
+    Args:
+        sample_index: Index of the sample to process
+        algorithm: Clustering algorithm to use ('hdbscan', 'dbscan', 'optics', 'birch', 'agglomerative')
+        params_dict: Parameters dict containing 'pipeline' and algorithm-specific params
+
+    Returns dict with detected cuboids, ground truth, and metrics.
+    """
+    # Extract pipeline parameters
+    pipeline_params = params_dict['pipeline']
+    clustering_params = params_dict.get(algorithm, {})
+
+    # Load KITTI sample
+    dataset_loader = KITTIDatasetLoader(dataroot='dataset/kitti', split='training')
+    dataset_loader.load_dataset()
+    sample_data = dataset_loader.load_kitti_data(sample_index)
+
+    if sample_data is None:
+        print(f"Sample {sample_index}: Failed to load sample data")
+        return None
+
+    # Process point cloud
+    point_cloud = PointCloud(sample_data['point_cloud'])
+    point_cloud.remove_ground_plane_ransac(
+        distance_threshold=pipeline_params['distance_threshold'],
+        ransac_n=pipeline_params['ransac_n'],
+        num_iterations=pipeline_params['num_iterations'],
+        filter_forward_only=pipeline_params['filter_forward_only']
+    )
+
+    ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
+    has_2d_bboxes = any(box.get('bbox_2d') is not None for box in ground_truth_boxes)
+
+    if not has_2d_bboxes:
+        print(f"Sample {sample_index}: No 2D bboxes available")
+        return None
+
+    if len(ground_truth_boxes) == 0:
+        print(f"Sample {sample_index}: No ground truth boxes")
+        return None
+
+    # Create frustum manager
+    fm = FrustumManager(
+        sample_data['camera_intrinsic'],
+        sample_data['camera_to_lidar_transform']
+    )
+    frustums = fm.create_frustums_from_bboxes(
+        ground_truth_boxes,
+        depth=pipeline_params.get('frustum_depth', 100)
+    )
+
+    if not frustums:
+        print(f"Sample {sample_index}: No frustums created from {len(ground_truth_boxes)} GT boxes")
+        return None
+
+    # Get points
+    points = point_cloud.point_cloud_plane_removed
+    if len(points) == 0:
+        print(f"Sample {sample_index}: No points after ground plane removal")
+        return None
+
+    # Run frustum-based clustering
+    cuboids, per_frustum_results = fm.cluster_in_frustums(
+        points, frustums,
+        min_cluster_size=clustering_params.get('min_cluster_size', 5),
+        min_samples=clustering_params.get('min_samples', 5),
+        algorithm=algorithm,
+        validate_overlap=pipeline_params['validate_overlap'],
+        overlap_threshold=pipeline_params['overlap_threshold'],
+        use_templates=pipeline_params['use_templates'],
+        clustering_params={algorithm: clustering_params},
+        ground_plane_model=point_cloud.ground_plane_model
+    )
+
+    print(f"Sample {sample_index}: {len(cuboids)} cuboids from {len(frustums)} frustums, {len(ground_truth_boxes)} GT")
+    return {
+        'sample_index': sample_index,
+        'detected_cuboids': cuboids,
+        'ground_truth_boxes': ground_truth_boxes,
+        'n_frustums': len(frustums),
+        'per_frustum_results': per_frustum_results
+    }
