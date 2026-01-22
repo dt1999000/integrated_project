@@ -10,8 +10,8 @@ from visualization_helper import (
     create_3d_scatter_plot,
     create_comparison_plot,
 )
-from frustum_manager import FrustumManager, Frustum, FrustumClusterResult
-from evaluation import CuboidMatcher, MatchResult, compute_3d_iou, run_pipeline_on_sample
+from frustum_manager import FrustumManager
+from evaluation import compute_3d_iou, run_pipeline_on_sample
 import time
 import sys
 import os
@@ -27,7 +27,6 @@ import matplotlib.pyplot as plt
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import our pipeline components
-from nuscenes_dataset_loader import NuScenesDatasetLoader
 from kitti_dataset_loader import KITTIDatasetLoader
 from pointcloud_projection import PointCloud, Projection
 from clustering_manager import ClusteringManager
@@ -133,40 +132,28 @@ if 'params' not in st.session_state:
         # Agglomerative parameters
         'agglomerative': {
             'n_clusters': 5,
-            'linkage': 'ward',
-            'affinity': 'euclidean'
+            'linkage': 'ward'
         }
     }
 
 
-def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, ransac_n: int = 3, num_iterations: int = 1000, dataset: str = "nuscenes", filter_forward_only: bool = True):
+def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, ransac_n: int = 3, num_iterations: int = 1000, dataset: str = "kitti", filter_forward_only: bool = True):
     """
-    Load a sample from either NuScenes or KITTI dataset.
+    Load a sample from KITTI dataset.
 
     Args:
         sample_index: Index of the sample to load
         distance_threshold: RANSAC distance threshold for ground plane removal
         ransac_n: RANSAC number of points
         num_iterations: RANSAC number of iterations
-        dataset: 'nuscenes' or 'kitti'
+        dataset: 'kitti'
         filter_forward_only: Whether to keep only forward-facing points (x > 0)
 
     Returns:
         Tuple of (sample_data dict, PointCloud object with ground removed)
     """
     try:
-        if dataset == "nuscenes":
-            # Load NuScenes data
-            dataset_loader = NuScenesDatasetLoader(dataroot='dataset/nuscenes')
-            dataset_loader.load_dataset()
-
-            # Get sample token
-            sample_token = dataset_loader.nusc.sample[sample_index]['token']
-
-            # Load synchronized camera and LiDAR data
-            sample_data = dataset_loader.load_nuscenes_data(sample_token)
-
-        elif dataset == "kitti":
+        if dataset == "kitti":
             # Load KITTI data
             dataset_loader = KITTIDatasetLoader(dataroot='dataset/kitti', split='training')
             dataset_loader.load_dataset()
@@ -207,10 +194,6 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, 
         return None, None
 
 def get_segmentation_mask(sample_data):
-    # Check if we have NuScenes data (segmentation only works with NuScenes)
-    if 'nusc' not in sample_data or 'sample_token' not in sample_data:
-        return None
-
     image = cv2.imread(sample_data['image_path'])
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     nusc = sample_data['nusc']
@@ -236,6 +219,9 @@ def project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, poin
         rays[mask_id] = result['rays']
         mask_points[mask_id] = result['projected_points']
     return rays, mask_points
+
+def depth_estimation_page(sample_data):
+    st.header("🎯 Depth Estimation")
 
 def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
     st.header("🎯 Projection & Frustum Visualization")
@@ -332,114 +318,6 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
         st.info("Run any clustering algorithm on the other tabs to see per-frustum clustering results. "
                 "Clusters are automatically filtered by these frustums when using KITTI data.")
         return
-
-    st.subheader("Segmentation Mask")
-
-    # Projection parameters in sidebar
-    with st.sidebar.expander("Projection Parameters", expanded=True):
-        max_distance = st.slider("Max Ray Distance", min_value=10.0, max_value=200.0, value=100.0, step=10.0,
-                              help="Maximum ray extension distance for projection", key="max_distance")
-        distance_threshold = st.slider("Distance Threshold", min_value=0.1, max_value=2.0, value=0.5, step=0.1,
-                                    help="Maximum perpendicular distance to consider a point on the ray", key="ray_distance_threshold")
-
-    # Run segmentation button
-    if st.sidebar.button("🚀 Run Segmentation", key="run_segmentation"):
-        with st.spinner("Running segmentation..."):
-            segmentation_mask = get_segmentation_mask(sample_data)
-            if segmentation_mask is None:
-                st.error("Failed to generate segmentation mask. Please ensure NuScenes data is loaded.")
-                return
-            st.session_state.segmentation_masks = segmentation_mask
-            
-            # Show segmentation mask on image
-            fig, ax = plt.subplots(1, 2, figsize=(15, 6))
-            ax[0].imshow(cv2.imread(sample_data['image_path']))
-            ax[0].set_title("Original Image")
-            ax[0].axis('off')
-            ax[1].imshow(cv2.imread(sample_data['image_path']))
-            ax[1].imshow(segmentation_mask, cmap='rgb', alpha=0.7)
-            ax[1].set_title("Segmentation Mask")
-            ax[1].axis('off')
-            st.pyplot(fig)
-            
-            # Get unique mask IDs
-            unique_mask_ids = np.unique(segmentation_mask)
-            unique_mask_ids = [id for id in unique_mask_ids if id != 0]  # Filter out background (0)
-            st.session_state.unique_mask_ids = unique_mask_ids
-            st.success(f"Found {len(unique_mask_ids)} segmentation masks")
-    
-        if st.session_state.segmentation_masks is not None:
-
-            with st.spinner("Running projection..."):
-                start_time = time.time()
-                rays, mask_points = project_segmentation_mask_on_pointcloud(
-                    sample_data, 
-                    st.session_state.segmentation_masks, 
-                    point_cloud,
-                    max_distance=max_distance,
-                    distance_threshold=distance_threshold
-                )
-                runtime = time.time() - start_time
-                
-                # Store results in session state
-                st.session_state.all_rays = rays
-                st.session_state.all_mask_points = mask_points
-                st.session_state.projection_runtime = runtime
-                
-                # Save the projected points to the point cloud for further use
-                if hasattr(point_cloud, 'copy') and hasattr(point_cloud, 'add_segmentation_projected_points'):
-                    # It's a PointCloud object
-                    projected_point_cloud = point_cloud.copy()
-                    projected_point_cloud.add_segmentation_projected_points(mask_points)
-                    st.session_state.projected_point_cloud = projected_point_cloud
-                else:
-                    # It's a numpy array
-                    st.session_state.projected_point_cloud = point_cloud
-                    st.session_state.all_mask_points = mask_points  # Just store the mask points separately
-                
-                st.success(f"Projection completed in {runtime:.2f} seconds")
-            
-            # Display results if available
-            if 'all_mask_points' in st.session_state and st.session_state.all_mask_points:
-                # Get all available mask IDs
-                all_mask_ids = list(st.session_state.all_mask_points.keys())
-                
-                # Create mask selection slider
-                st.subheader("Mask Selection")
-                
-                # Determine how many masks to show
-                num_masks = len(all_mask_ids)
-                if num_masks > 10:
-                    # If more than 10 masks, create a slider to select a range
-                    start_idx = st.slider("Start Mask Index", 0, max(0, num_masks - 10), 0, key="mask_start_idx")
-                    end_idx = min(start_idx + 10, num_masks)
-                    selected_mask_ids = all_mask_ids[start_idx:end_idx]
-                    st.info(f"Showing masks {start_idx+1} to {end_idx} of {num_masks}")
-                else:
-                    # If 10 or fewer, show all masks
-                    selected_mask_ids = all_mask_ids
-                
-                # Create multiselect for specific masks
-                selected_masks = st.multiselect(
-                    "Select Masks to Display",
-                    options=selected_mask_ids,
-                    default=selected_mask_ids[:min(3, len(selected_mask_ids))],
-                    key="selected_masks"
-                )
-                
-                # Filter mask_points and rays based on selection
-                filtered_mask_points = {mask_id: st.session_state.all_mask_points[mask_id] 
-                                    for mask_id in selected_masks if mask_id in st.session_state.all_mask_points}
-                filtered_rays = {mask_id: st.session_state.all_rays[mask_id] 
-                            for mask_id in selected_masks if mask_id in st.session_state.all_rays}
-                
-                # Create 3D visualization
-                st.subheader("3D Visualization")
-                if point_cloud is not None:
-                    display_point_cloud = st.session_state.projected_point_cloud if st.session_state.projected_point_cloud is not None else point_cloud
-                    fig = create_3d_scatter_plot(display_point_cloud, None, filtered_mask_points, None, filtered_rays,
-                                            "Projected Segmentation Mask on Point Cloud")
-                    st.plotly_chart(fig, width='stretch', key='segmentation_projection_chart')
 
 def dbscan_page(point_cloud):
     """DBSCAN algorithm parameter control and visualization page"""
@@ -1091,16 +969,10 @@ def agglomerative_page(point_cloud):
             "Linkage", options=linkage_options,
             index=linkage_options.index(st.session_state.params['agglomerative']['linkage']),
             help="Linkage criterion to use", key="linkage_agglomerative")
-        affinity_options = ['euclidean', 'manhattan', 'cosine', 'l1', 'l2']
-        st.session_state.params['agglomerative']['affinity'] = st.selectbox(
-            "Affinity", options=affinity_options,
-            index=affinity_options.index(st.session_state.params['agglomerative']['affinity']),
-            help="Metric used to compute the linkage", key="affinity_agglomerative")
 
         # Extract to local variables for convenience
         n_clusters = st.session_state.params['agglomerative']['n_clusters']
         linkage = st.session_state.params['agglomerative']['linkage']
-        affinity = st.session_state.params['agglomerative']['affinity']
 
     # Run clustering button
     if st.sidebar.button("🚀 Run Agglomerative", key="run_agglomerative"):
@@ -1130,8 +1002,7 @@ def agglomerative_page(point_cloud):
                 clustering_params = {
                     'agglomerative': {
                         'n_clusters': n_clusters,
-                        'linkage': linkage,
-                        'affinity': affinity
+                        'linkage': linkage
                     }
                 }
 
@@ -1161,7 +1032,6 @@ def agglomerative_page(point_cloud):
                     'params': {
                         'n_clusters': n_clusters,
                         'linkage': linkage,
-                        'affinity': affinity,
                         'validate_overlap': st.session_state.validate_overlap,
                         'overlap_threshold': st.session_state.overlap_threshold,
                         'use_templates': st.session_state.use_templates
@@ -1184,7 +1054,7 @@ def agglomerative_page(point_cloud):
 
                 # Run Agglomerative
                 labels = clustering_manager.run_agglomerative(
-                    n_clusters=n_clusters, linkage=linkage, affinity=affinity
+                    n_clusters=n_clusters, linkage=linkage
                 )
 
                 # Store results
@@ -1193,8 +1063,7 @@ def agglomerative_page(point_cloud):
                     'is_frustum_based': False,
                     'params': {
                         'n_clusters': n_clusters,
-                        'linkage': linkage,
-                        'affinity': affinity
+                        'linkage': linkage
                     },
                     'runtime': time.time() - start_time
                 }
@@ -1789,15 +1658,13 @@ def statistics_page():
                 min_cluster_size = st.number_input("Min Cluster Size", 5, 100, 5, key="stats_hdbscan_mcs")
             with c2:
                 min_samples = st.number_input("Min Samples", 1, 50, 5, key="stats_hdbscan_ms")
-            with c3:
-                cluster_selection_epsilon = st.number_input("Cluster Eps", 0.0, 1.0, 0.0, 0.05, key="stats_hdbscan_eps")
+            
             clustering_params = {
                 'min_cluster_size': min_cluster_size,
                 'min_samples': min_samples,
                 'hdbscan': {
                     'min_cluster_size': min_cluster_size,
-                    'min_samples': min_samples,
-                    'cluster_selection_epsilon': cluster_selection_epsilon
+                    'min_samples': min_samples
                 }
             }
         elif algorithm == 'dbscan':
@@ -2182,13 +2049,13 @@ def main():
     # Dataset selection
     dataset = st.sidebar.selectbox(
         "Dataset",
-        options=["nuscenes", "kitti"],
-        format_func=lambda x: "NuScenes" if x == "nuscenes" else "KITTI",
+        options=["kitti"],
+        format_func=lambda x: "KITTI" if x == "kitti" else "KITTI",
         key="dataset_selector"
     )
 
     # Sample selection (max value depends on dataset)
-    max_sample = 403 if dataset == "nuscenes" else 7480
+    max_sample = 7480
     sample_index = st.sidebar.text_input(
         "Sample Index",
         value=0,

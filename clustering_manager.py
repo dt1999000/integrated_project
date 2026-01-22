@@ -64,8 +64,7 @@ class ClusteringManager:
         },
         'agglomerative': {
             'n_clusters': 5,
-            'linkage': 'ward',
-            'affinity': 'euclidean'
+            'linkage': 'ward'
         }
     }
 
@@ -137,7 +136,7 @@ class ClusteringManager:
         'dbscan': {'eps', 'min_samples', 'metric', 'algorithm', 'leaf_size'},
         'optics': {'min_samples', 'max_eps', 'xi', 'min_cluster_size', 'metric'},
         'birch': {'threshold', 'branching_factor', 'n_clusters'},
-        'agglomerative': {'n_clusters', 'linkage', 'affinity'}
+        'agglomerative': {'n_clusters', 'linkage'}
     }
 
     def run_clustering(self, algorithm: str = 'hdbscan', **override_params) -> np.ndarray:
@@ -274,21 +273,19 @@ class ClusteringManager:
         
         return self.labels
     
-    def run_agglomerative(self, n_clusters: int = 5, linkage: str = 'ward',
-                       affinity: str = 'euclidean') -> np.ndarray:
+    def run_agglomerative(self, n_clusters: int = 5, linkage: str = 'ward') -> np.ndarray:
         """
         Run Agglomerative clustering algorithm.
         
         Args:
             n_clusters: Number of clusters to find.
             linkage: Linkage criterion to use.
-            affinity: Metric used to compute the linkage.
             
         Returns:
             Array of cluster labels for each point.
         """
-        print(f"Running Agglomerative with n_clusters={n_clusters}, linkage={linkage}, affinity={affinity}")
-        agglomerative = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage, affinity=affinity)
+        print(f"Running Agglomerative with n_clusters={n_clusters}, linkage={linkage}")
+        agglomerative = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage)
         self.labels = agglomerative.fit_predict(self.points)
         
         # Store results
@@ -296,8 +293,7 @@ class ClusteringManager:
             'labels': self.labels,
             'params': {
                 'n_clusters': n_clusters,
-                'linkage': linkage,
-                'affinity': affinity
+                'linkage': linkage
             }
         }
         
