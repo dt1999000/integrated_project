@@ -33,6 +33,7 @@ from clustering_manager import ClusteringManager
 from segmentation_detection import SegmentationDetector
 
 from pointcloud_projection import filter_points_in_frustum
+from depth_estimation import DepthEstimator
 
 
 # Configure Streamlit page
@@ -86,6 +87,10 @@ if 'frustums' not in st.session_state:
     st.session_state.frustums = []  # List of (camera_origin, base_corners, category, bbox_2d) tuples
 if 'per_frustum_clusters' not in st.session_state:
     st.session_state.per_frustum_clusters = []  # List of cluster results per frustum
+if 'depth_map' not in st.session_state:
+    st.session_state.depth_map = None
+if 'depth_image' not in st.session_state:
+    st.session_state.depth_image = None
 
 # Initialize centralized parameters dict
 if 'params' not in st.session_state:
@@ -222,6 +227,26 @@ def project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, poin
 
 def depth_estimation_page(sample_data):
     st.header("🎯 Depth Estimation")
+    depth_map = st.session_state.get("depth_map")
+    if depth_map is None:
+        st.info("Press 'Estimate Depth' in the sidebar to generate a depth map.")
+        return
+
+    if isinstance(depth_map, np.ndarray):
+        depth_array = depth_map
+    else:
+        depth_array = np.array(depth_map)
+
+    fig, ax = plt.subplots()
+    im = ax.imshow(depth_array, cmap="viridis")
+    ax.set_title("Depth Map")
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Depth (relative units)")
+    st.pyplot(fig, use_container_width=True)
+    depth_image = st.session_state.get("depth_image")
+    if depth_image is not None:
+        st.image(depth_image, caption="Image")
 
 def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
     st.header("🎯 Projection & Frustum Visualization")
@@ -1470,130 +1495,148 @@ def kitti_groundtruth_page():
 
     # Check if user has run clustering
     st.subheader("🔴 Pipeline Detection Results")
-    if 'cuboids' in st.session_state and st.session_state.cuboids:
-        detected_cuboids = st.session_state.cuboids
+    detected_cuboids = st.session_state.get('cuboids', [])
+    available_algos = [
+        algo for algo in ['hdbscan', 'dbscan', 'birch', 'agglomerative', 'optics', 'frustum_filtered']
+        if algo in st.session_state.clustering_results
+    ]
 
-        # Get clustering results - check any algorithm for is_frustum_based flag
-        clustering_result = None
-        labels = None
-        is_frustum_filtered = False
-        algo_name = None
+    if not available_algos and not detected_cuboids:
+        st.info("Run a clustering algorithm to see pipeline detection results.")
+        return
 
-        for algo in ['dbscan', 'birch', 'agglomerative', 'optics', 'frustum_filtered']:
-            if algo in st.session_state.clustering_results:
-                clustering_result = st.session_state.clustering_results[algo]
-                if clustering_result.get('is_frustum_based', False) or algo == 'frustum_filtered':
-                    is_frustum_filtered = True
-                    labels = None
-                else:
-                    labels = clustering_result.get('labels')
-                break
+    clustering_result = None
+    algo_name = None
+    if available_algos:
+        algo_labels = {
+            'hdbscan': 'HDBSCAN',
+            'dbscan': 'DBSCAN',
+            'birch': 'BIRCH',
+            'agglomerative': 'Agglomerative',
+            'optics': 'OPTICS',
+            'frustum_filtered': 'Frustum Filtered'
+        }
+        label_to_algo = {algo_labels[algo]: algo for algo in available_algos}
+        selected_label = st.selectbox("Clustering Result", list(label_to_algo.keys()))
+        algo_name = label_to_algo[selected_label]
+        clustering_result = st.session_state.clustering_results.get(algo_name)
 
-        if clustering_result or detected_cuboids:
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Ground Truth Objects", len(ground_truth_boxes))
-            with col2:
-                st.metric("Detected Clusters", len(detected_cuboids))
-            with col3:
-                if is_frustum_filtered:
-                    # For frustum-filtered, show number of successful bbox detections
-                    bbox_results = clustering_result.get('bbox_results', [])
-                    n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
-                    st.metric("BBoxes with Clusters", n_successful)
-                elif labels is not None:
-                    n_noise = np.sum(labels == -1) if -1 in labels else 0
-                    st.metric("Noise Points", n_noise)
-                else:
-                    st.metric("Method", "Frustum-based")
+    labels = clustering_result.get('labels') if clustering_result else None
+    is_frustum_filtered = False
+    if clustering_result:
+        is_frustum_filtered = clustering_result.get('is_frustum_based', False) or algo_name == 'frustum_filtered'
 
-            # 3D IoU Matching Statistics Section
-            st.subheader("📊 3D IoU Matching Statistics")
-            st.markdown("""
-            **Matching Logic:** Each detected cuboid is matched to the ground truth box using `source_bbox_idx`
-            which corresponds to the frustum index. The 3D IoU measures volumetric overlap between
-            detected and ground truth cuboids.
-            """)
-
-            # Compute 3D IoU for each matched pair
-            matching_results = []
-            for detected in detected_cuboids:
-                gt_idx = detected.get('source_bbox_idx')
-                if gt_idx is not None and gt_idx < len(ground_truth_boxes):
-                    gt_box = ground_truth_boxes[gt_idx]
-                    iou_3d = compute_3d_iou(detected, gt_box)
-                    matching_results.append({
-                        'GT Index': gt_idx,
-                        'Category': detected.get('category', 'Unknown'),
-                        'GT Category': gt_box.get('category', 'Unknown'),
-                        '3D IoU': iou_3d,
-                        '2D IoU': detected.get('iou', None),
-                        'Need Review': detected.get('need_review', False)
-                    })
-
-            if matching_results:
-                # Summary metrics
-                iou_3d_values = [r['3D IoU'] for r in matching_results]
-                iou_2d_values = [r['2D IoU'] for r in matching_results if r['2D IoU'] is not None]
-
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Matched Pairs", len(matching_results))
-                with col2:
-                    st.metric("Mean 3D IoU", f"{np.mean(iou_3d_values):.3f}")
-                with col3:
-                    st.metric("Min 3D IoU", f"{np.min(iou_3d_values):.3f}")
-                with col4:
-                    st.metric("Max 3D IoU", f"{np.max(iou_3d_values):.3f}")
-
-                # Count by IoU thresholds
-                st.markdown("**Detection Quality by 3D IoU Threshold:**")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    n_above_50 = sum(1 for iou in iou_3d_values if iou >= 0.5)
-                    st.metric("IoU ≥ 0.5", f"{n_above_50}/{len(iou_3d_values)}")
-                with col2:
-                    n_above_25 = sum(1 for iou in iou_3d_values if iou >= 0.25)
-                    st.metric("IoU ≥ 0.25", f"{n_above_25}/{len(iou_3d_values)}")
-                with col3:
-                    n_above_10 = sum(1 for iou in iou_3d_values if iou >= 0.1)
-                    st.metric("IoU ≥ 0.1", f"{n_above_10}/{len(iou_3d_values)}")
-
-                # Detailed per-object table
-                with st.expander("📋 Per-Object Matching Details", expanded=True):
-                    df_matching = pd.DataFrame(matching_results)
-                    # Format IoU columns
-                    df_matching['3D IoU'] = df_matching['3D IoU'].apply(lambda x: f"{x:.3f}")
-                    df_matching['2D IoU'] = df_matching['2D IoU'].apply(lambda x: f"{x:.3f}" if x is not None else "N/A")
-                    st.dataframe(df_matching, use_container_width=True)
-
-                # Compare 2D vs 3D IoU if both available
-                if iou_2d_values and len(iou_2d_values) == len(iou_3d_values):
-                    st.markdown("**2D vs 3D IoU Comparison:**")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Mean 2D IoU", f"{np.mean(iou_2d_values):.3f}")
-                    with col2:
-                        correlation = np.corrcoef(iou_2d_values, iou_3d_values)[0, 1]
-                        st.metric("2D-3D Correlation", f"{correlation:.3f}")
-
-            else:
-                st.info("No matched pairs found. Ensure detected cuboids have `source_bbox_idx` set.")
-
-            # Unified comparison view
-            st.subheader("🎯 Unified Comparison View")
-            st.markdown("""
-            **Color Legend:** Ground truth cuboids use lighter shades, detected cuboids use darker shades of the same color (by category).
-            Yellow lines connect matched pairs.
-            """)
-
-            fig_unified = create_comparison_plot(point_cloud, ground_truth_boxes, detected_cuboids)
-            st.plotly_chart(fig_unified, width='stretch', key='kitti_comparison_chart')
-
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Ground Truth Objects", len(ground_truth_boxes))
+    with col2:
+        if detected_cuboids:
+            detected_count = len(detected_cuboids)
+        elif labels is not None:
+            unique_labels = np.unique(labels)
+            detected_count = len(unique_labels) - (1 if -1 in unique_labels else 0)
         else:
-            st.info("Run a clustering algorithm (DBSCAN, OPTICS, etc.) on other tabs to see detection comparison")
+            detected_count = 0
+        st.metric("Detected Clusters", detected_count)
+    with col3:
+        if is_frustum_filtered and clustering_result:
+            bbox_results = clustering_result.get('bbox_results', [])
+            n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
+            st.metric("BBoxes with Clusters", n_successful)
+        elif labels is not None:
+            n_noise = np.sum(labels == -1) if -1 in labels else 0
+            st.metric("Noise Points", n_noise)
+        elif clustering_result:
+            st.metric("Method", "Frustum-based")
+        else:
+            st.metric("Method", "Cuboids only")
+
+    if not detected_cuboids:
+        st.info("No cuboids available for IoU matching yet.")
+        return
+
+    # 3D IoU Matching Statistics Section
+    st.subheader("📊 3D IoU Matching Statistics")
+    st.markdown("""
+    **Matching Logic:** Each detected cuboid is matched to the ground truth box using `source_bbox_idx`
+    which corresponds to the frustum index. The 3D IoU measures volumetric overlap between
+    detected and ground truth cuboids.
+    """)
+
+    # Compute 3D IoU for each matched pair
+    matching_results = []
+    for detected in detected_cuboids:
+        gt_idx = detected.get('source_bbox_idx')
+        if gt_idx is not None and gt_idx < len(ground_truth_boxes):
+            gt_box = ground_truth_boxes[gt_idx]
+            iou_3d = compute_3d_iou(detected, gt_box)
+            matching_results.append({
+                'GT Index': gt_idx,
+                'Category': detected.get('category', 'Unknown'),
+                'GT Category': gt_box.get('category', 'Unknown'),
+                '3D IoU': iou_3d,
+                '2D IoU': detected.get('iou', None),
+                'Need Review': detected.get('need_review', False)
+            })
+
+    if matching_results:
+        # Summary metrics
+        iou_3d_values = [r['3D IoU'] for r in matching_results]
+        iou_2d_values = [r['2D IoU'] for r in matching_results if r['2D IoU'] is not None]
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Matched Pairs", len(matching_results))
+        with col2:
+            st.metric("Mean 3D IoU", f"{np.mean(iou_3d_values):.3f}")
+        with col3:
+            st.metric("Min 3D IoU", f"{np.min(iou_3d_values):.3f}")
+        with col4:
+            st.metric("Max 3D IoU", f"{np.max(iou_3d_values):.3f}")
+
+        # Count by IoU thresholds
+        st.markdown("**Detection Quality by 3D IoU Threshold:**")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            n_above_50 = sum(1 for iou in iou_3d_values if iou >= 0.5)
+            st.metric("IoU ≥ 0.5", f"{n_above_50}/{len(iou_3d_values)}")
+        with col2:
+            n_above_25 = sum(1 for iou in iou_3d_values if iou >= 0.25)
+            st.metric("IoU ≥ 0.25", f"{n_above_25}/{len(iou_3d_values)}")
+        with col3:
+            n_above_10 = sum(1 for iou in iou_3d_values if iou >= 0.1)
+            st.metric("IoU ≥ 0.1", f"{n_above_10}/{len(iou_3d_values)}")
+
+        # Detailed per-object table
+        with st.expander("📋 Per-Object Matching Details", expanded=True):
+            df_matching = pd.DataFrame(matching_results)
+            # Format IoU columns
+            df_matching['3D IoU'] = df_matching['3D IoU'].apply(lambda x: f"{x:.3f}")
+            df_matching['2D IoU'] = df_matching['2D IoU'].apply(lambda x: f"{x:.3f}" if x is not None else "N/A")
+            st.dataframe(df_matching, use_container_width=True)
+
+        # Compare 2D vs 3D IoU if both available
+        if iou_2d_values and len(iou_2d_values) == len(iou_3d_values):
+            st.markdown("**2D vs 3D IoU Comparison:**")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Mean 2D IoU", f"{np.mean(iou_2d_values):.3f}")
+            with col2:
+                correlation = np.corrcoef(iou_2d_values, iou_3d_values)[0, 1]
+                st.metric("2D-3D Correlation", f"{correlation:.3f}")
+
     else:
-        st.info("Run a clustering algorithm (DBSCAN, OPTICS, etc.) on other tabs to see detection comparison")
+        st.info("No matched pairs found. Ensure detected cuboids have `source_bbox_idx` set.")
+
+    # Unified comparison view
+    st.subheader("🎯 Unified Comparison View")
+    st.markdown("""
+    **Color Legend:** Ground truth cuboids use lighter shades, detected cuboids use darker shades of the same color (by category).
+    Yellow lines connect matched pairs.
+    """)
+
+    fig_unified = create_comparison_plot(point_cloud, ground_truth_boxes, detected_cuboids)
+    st.plotly_chart(fig_unified, width='stretch', key='kitti_comparison_chart')
 
 def statistics_page():
     """Batch evaluation statistics page for KITTI dataset"""
@@ -2112,6 +2155,17 @@ def main():
                     st.success(f"✅ {dataset.upper()} sample {sample_index} loaded!")
                 st.rerun()
 
+    if st.sidebar.button("Estimate Depth", key="estimate_depth"):
+        sample_data = st.session_state.get("sample_data")
+        if not sample_data:
+            st.warning("Load a sample first to estimate depth.")
+        else:
+            with st.spinner("Estimating depth..."):
+                depth_estimator = DepthEstimator()
+                image = cv2.imread(sample_data['image_path'])
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                st.session_state.depth_map = depth_estimator.get_depth_map(image)
+                st.session_state.depth_image = image
     # Navigation tabs
     point_cloud = st.session_state.point_cloud
     if point_cloud is None:
@@ -2159,25 +2213,31 @@ def main():
         st.session_state.overlap_threshold = st.session_state.params['pipeline']['overlap_threshold']
         st.session_state.use_templates = st.session_state.params['pipeline']['use_templates']
     # Main navigation
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "SEGMENTATION AND PROJECTION", "HDBSCAN", "DBSCAN", "BIRCH", "Agglomerative", "OPTICS", "KITTI Ground Truth", "Statistics"
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "DEPTH ESTIMATION", "SEGMENTATION AND PROJECTION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
     ])
 
     with tab1:
-        project_segmentation_mask_on_pointcloud_page(st.session_state.sample_data, points)
+        depth_estimation_page(st.session_state.sample_data)
     with tab2:
-        hdbscan_page(point_cloud)
+        project_segmentation_mask_on_pointcloud_page(st.session_state.sample_data, points)
     with tab3:
-        dbscan_page(point_cloud)
+        cluster_tab1, cluster_tab2, cluster_tab3, cluster_tab4, cluster_tab5 = st.tabs([
+            "HDBSCAN", "DBSCAN", "BIRCH", "Agglomerative", "OPTICS"
+        ])
+        with cluster_tab1:
+            hdbscan_page(point_cloud)
+        with cluster_tab2:
+            dbscan_page(point_cloud)
+        with cluster_tab3:
+            birch_page(point_cloud)
+        with cluster_tab4:
+            agglomerative_page(point_cloud)
+        with cluster_tab5:
+            optics_page(point_cloud)
     with tab4:
-        birch_page(point_cloud)
-    with tab5:
-        agglomerative_page(point_cloud)
-    with tab6:
-        optics_page(point_cloud)
-    with tab7:
         kitti_groundtruth_page()
-    with tab8:
+    with tab5:
         statistics_page()
         
 
