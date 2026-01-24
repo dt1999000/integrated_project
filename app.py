@@ -33,7 +33,6 @@ from clustering_manager import ClusteringManager
 from segmentation_detection import SegmentationDetector
 
 from pointcloud_projection import filter_points_in_frustum
-from depth_estimation import DepthEstimator
 
 
 # Configure Streamlit page
@@ -197,56 +196,6 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, 
         import traceback
         st.error(traceback.format_exc())
         return None, None
-
-def get_segmentation_mask(sample_data):
-    image = cv2.imread(sample_data['image_path'])
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    nusc = sample_data['nusc']
-    bounding_boxes = BoundingBoxes(nusc=nusc, data_format="nuscenes")
-    bounding_boxes.get_boxes_for_sample(sample_data['sample_token'], "CAM_FRONT")
-    segmentation_detector = SegmentationDetector()
-    segmentation_mask = segmentation_detector.get_segmentation_mask(image, bounding_boxes)
-    return segmentation_mask
-
-def project_segmentation_mask_on_pointcloud(sample_data, segmentation_mask, point_cloud, max_distance=100.0, distance_threshold=0.5):
-    projection = Projection(
-        camera_intrinsic=sample_data['camera_intrinsic'],
-        camera_extrinsic=sample_data['camera_extrinsic'],
-        camera_to_lidar_transform=sample_data['camera_to_lidar_transform'],
-        point_cloud=point_cloud,
-        image=sample_data['image_path']
-    )
-    segmentation_projection = SegmentationToPointCloud(projection)
-    results = segmentation_projection.project_all_masks(segmentation_mask, max_distance=max_distance, distance_threshold=distance_threshold)
-    rays = {}
-    mask_points = {}
-    for mask_id, result in results.items():
-        rays[mask_id] = result['rays']
-        mask_points[mask_id] = result['projected_points']
-    return rays, mask_points
-
-def depth_estimation_page(sample_data):
-    st.header("🎯 Depth Estimation")
-    depth_map = st.session_state.get("depth_map")
-    if depth_map is None:
-        st.info("Press 'Estimate Depth' in the sidebar to generate a depth map.")
-        return
-
-    if isinstance(depth_map, np.ndarray):
-        depth_array = depth_map
-    else:
-        depth_array = np.array(depth_map)
-
-    fig, ax = plt.subplots()
-    im = ax.imshow(depth_array, cmap="viridis")
-    ax.set_title("Depth Map")
-    ax.axis("off")
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Depth (relative units)")
-    st.pyplot(fig, use_container_width=True)
-    depth_image = st.session_state.get("depth_image")
-    if depth_image is not None:
-        st.image(depth_image, caption="Image")
 
 def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
     st.header("🎯 Projection & Frustum Visualization")
@@ -2160,12 +2109,7 @@ def main():
         if not sample_data:
             st.warning("Load a sample first to estimate depth.")
         else:
-            with st.spinner("Estimating depth..."):
-                depth_estimator = DepthEstimator()
-                image = cv2.imread(sample_data['image_path'])
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                st.session_state.depth_map = depth_estimator.get_depth_map(image)
-                st.session_state.depth_image = image
+            pass
     # Navigation tabs
     point_cloud = st.session_state.point_cloud
     if point_cloud is None:
@@ -2213,15 +2157,13 @@ def main():
         st.session_state.overlap_threshold = st.session_state.params['pipeline']['overlap_threshold']
         st.session_state.use_templates = st.session_state.params['pipeline']['use_templates']
     # Main navigation
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "DEPTH ESTIMATION", "SEGMENTATION AND PROJECTION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "SEGMENTATION AND PROJECTION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
     ])
 
     with tab1:
-        depth_estimation_page(st.session_state.sample_data)
-    with tab2:
         project_segmentation_mask_on_pointcloud_page(st.session_state.sample_data, points)
-    with tab3:
+    with tab2:
         cluster_tab1, cluster_tab2, cluster_tab3, cluster_tab4, cluster_tab5 = st.tabs([
             "HDBSCAN", "DBSCAN", "BIRCH", "Agglomerative", "OPTICS"
         ])
@@ -2235,9 +2177,9 @@ def main():
             agglomerative_page(point_cloud)
         with cluster_tab5:
             optics_page(point_cloud)
-    with tab4:
+    with tab3:
         kitti_groundtruth_page()
-    with tab5:
+    with tab4:
         statistics_page()
         
 
