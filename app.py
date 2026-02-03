@@ -2036,7 +2036,14 @@ def depth_estimation_page():
         
         **Available Models:**
         - **Marigold**: High-quality metric depth estimation (requires GPU/CUDA for best performance)
+        - **Marigold-DC with Sparse Prior**: If LiDAR points are available, automatically uses them as sparse depth guidance for improved accuracy
         - **Depth Anything**: Fast depth estimation, works on CPU
+        
+        **Sparse Depth Prior (Automatic):**
+        - When LiDAR point cloud is loaded, the pipeline automatically creates a sparse depth map
+        - Uses Marigold-DC with sparse depth guidance instead of regular Marigold
+        - Provides better accuracy by incorporating ground truth depth measurements from LiDAR
+        - The sparse depth map is created by back-projecting 3D LiDAR points onto the 2D image
         
         The tool reconstructs a dense 3D point cloud from the depth map that can be combined with LiDAR data.
         """)
@@ -2074,6 +2081,17 @@ def depth_estimation_page():
     
     # Display statistics
     st.subheader("📊 Depth Estimation Statistics")
+    
+    # Check if sparse depth prior was used
+    used_sparse_prior = st.session_state.get('sparse_depth_map') is not None
+    sparse_info = ""
+    if used_sparse_prior:
+        sparse_depth_prior = st.session_state.sparse_depth_map
+        n_sparse = np.sum(sparse_depth_prior > 0)
+        coverage = 100 * n_sparse / (sparse_depth_prior.shape[0] * sparse_depth_prior.shape[1])
+        sparse_info = f" (with {n_sparse:,} sparse depth points, {coverage:.2f}% coverage)"
+        st.info(f"✅ Used sparse depth prior from LiDAR{sparse_info}")
+    
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Depth Map Shape", f"{depth_map.shape[0]}×{depth_map.shape[1]}")
@@ -2681,20 +2699,44 @@ def main():
                     img = cv2.imread(sample_data['image_path'])
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                     
-                    # Run depth estimation and reconstruction
+                    # Get LiDAR point cloud if available for sparse depth prior
+                    lidar_points = None
+                    if st.session_state.point_cloud is not None:
+                        lidar_points = st.session_state.point_cloud.point_cloud_plane_removed
+                        print(f"Using {len(lidar_points):,} LiDAR points as sparse depth prior")
+                    
+                    # Get DC parameters for sparse depth prior
+                    dc_params = st.session_state.params.get('marigold_dc', {})
+                    
+                    # Run depth estimation and reconstruction with optional sparse depth prior
                     result = st.session_state.depth_estimator.estimate_depth_and_reconstruct(
                         image=img_rgb,
                         use_marigold=use_marigold,
                         stride=2,  # Subsample to reduce point count
                         depth_threshold_min=0.5,
-                        depth_threshold_max=80.0
+                        depth_threshold_max=80.0,
+                        lidar_point_cloud=lidar_points,
+                        use_sparse_depth_prior=True,  # Use sparse depth prior if LiDAR available
+                        num_inference_steps=dc_params.get('num_inference_steps', 50),
+                        ensemble_size=dc_params.get('ensemble_size', 1),
+                        processing_resolution=dc_params.get('processing_resolution', 768),
+                        seed=dc_params.get('seed', 2024)
                     )
                     
                     # Store results
                     st.session_state.depth_map = result['depth_map']
                     st.session_state.reconstructed_points = result['points_lidar']
                     
-                    st.sidebar.success(f"✅ Depth estimated! Reconstructed {len(result['points_lidar']):,} points")
+                    # Store sparse depth if it was used
+                    if 'sparse_depth' in result:
+                        st.session_state.sparse_depth_map = result['sparse_depth']
+                    
+                    prior_info = ""
+                    if result.get('used_sparse_prior', False):
+                        n_sparse = np.sum(result['sparse_depth'] > 0)
+                        prior_info = f" (with {n_sparse:,} sparse depth points as prior)"
+                    
+                    st.sidebar.success(f"✅ Depth estimated{prior_info}! Reconstructed {len(result['points_lidar']):,} points")
                     st.rerun()
                 except Exception as e:
                     st.sidebar.error(f"Depth estimation failed: {str(e)}")

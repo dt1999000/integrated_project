@@ -342,6 +342,13 @@ class DepthEstimator:
         output = self.pipe(image_pil)
         depth = output.prediction
         depth_np = np.array(depth)
+        
+        # Ensure depth map is 2D (H, W)
+        if depth_np.ndim > 2:
+            depth_np = depth_np.squeeze()
+        if depth_np.ndim != 2:
+            raise ValueError(f"Expected 2D depth map from Marigold, got shape {depth_np.shape}")
+        depth_np = depth_np.reshape(depth_np.shape[1], depth_np.shape[2])
         print(f"Depth map shape: {depth_np.shape}, min: {depth_np.min():.2f}, max: {depth_np.max():.2f}")
         return depth_np
 
@@ -365,6 +372,40 @@ class DepthEstimator:
         if self.camera_intrinsic is None or self.camera_to_lidar_transform is None:
             raise ValueError("Camera parameters not set. Initialize with camera params or call set_camera_params() first.")
         
+        # Ensure depth_map is 2D (H, W)
+        depth_map = np.asarray(depth_map)
+        original_shape = depth_map.shape
+        print(f"DEBUG: reconstruct_points_from_depth received depth_map with shape: {original_shape}, ndim: {depth_map.ndim}")
+        
+        # Handle different possible shapes
+        if depth_map.ndim == 1:
+            raise ValueError(f"Depth map is 1D with shape {depth_map.shape}, expected 2D (H, W)")
+        elif depth_map.ndim == 2:
+            # Already 2D, use as is
+            pass
+        elif depth_map.ndim == 3:
+            # Could be (1, H, W), (H, W, 1), or (C, H, W)
+            if depth_map.shape[0] == 1:
+                depth_map = depth_map[0, :, :]  # (1, H, W) -> (H, W)
+            elif depth_map.shape[2] == 1:
+                depth_map = depth_map[:, :, 0]  # (H, W, 1) -> (H, W)
+            else:
+                # (C, H, W) - take first channel
+                depth_map = depth_map[0, :, :]
+        elif depth_map.ndim == 4:
+            # Could be (1, 1, H, W) or (B, C, H, W)
+            depth_map = depth_map.squeeze()
+            if depth_map.ndim != 2:
+                # If still not 2D, take first slice
+                depth_map = depth_map.reshape(-1, depth_map.shape[-1])[0].reshape(depth_map.shape[-2:])
+        else:
+            raise ValueError(f"Unexpected depth map shape: {depth_map.shape}, expected 2D (H, W)")
+        
+        # Final validation
+        if depth_map.ndim != 2:
+            raise ValueError(f"After processing, depth map still has {depth_map.ndim} dimensions with shape {depth_map.shape} (original shape: {original_shape})")
+        
+        print(f"DEBUG: After shape normalization, depth_map shape: {depth_map.shape}")
         height, width = depth_map.shape
         
         # Create pixel coordinate grid
@@ -423,9 +464,16 @@ class DepthEstimator:
                                       use_marigold: bool = None,
                                       depth_threshold_min: float = 0.1,
                                       depth_threshold_max: float = 100.0,
-                                      stride: int = 1):
+                                      stride: int = 1,
+                                      lidar_point_cloud: np.ndarray = None,
+                                      use_sparse_depth_prior: bool = True,
+                                      num_inference_steps: int = 50,
+                                      ensemble_size: int = 1,
+                                      processing_resolution: int = 768,
+                                      seed: int = 2024):
         """
         Complete pipeline: estimate depth from image and reconstruct 3D point cloud in LiDAR coordinates.
+        Optionally uses sparse depth from LiDAR as a prior for better accuracy (Marigold-DC).
         Uses camera parameters stored in the object.
         
         Args:
@@ -435,11 +483,21 @@ class DepthEstimator:
             depth_threshold_min: Minimum valid depth value (meters)
             depth_threshold_max: Maximum valid depth value (meters)
             stride: Sampling stride for point cloud (1 = all pixels, 2 = every other pixel, etc.)
+            lidar_point_cloud: Optional Nx3 array of LiDAR points to use as sparse depth prior.
+                              If provided and use_sparse_depth_prior=True, uses Marigold-DC for better accuracy.
+            use_sparse_depth_prior: If True and lidar_point_cloud is provided, uses Marigold-DC 
+                                   with sparse depth guidance instead of regular Marigold.
+            num_inference_steps: Number of denoising steps for Marigold-DC (if using sparse prior)
+            ensemble_size: Number of predictions to ensemble for Marigold-DC (if using sparse prior)
+            processing_resolution: Resolution for Marigold-DC processing (if using sparse prior)
+            seed: Random seed for Marigold-DC (if using sparse prior)
             
         Returns:
             Dictionary containing:
                 - 'depth_map': Depth map as numpy array (H, W)
                 - 'points_lidar': Nx3 array of 3D points in LiDAR coordinates
+                - 'sparse_depth': Sparse depth map if lidar_point_cloud was provided (H, W)
+                - 'used_sparse_prior': Boolean indicating if sparse depth prior was used
         """
         if self.camera_intrinsic is None or self.camera_to_lidar_transform is None:
             raise ValueError("Camera parameters not set. Initialize with camera params or call set_camera_params() first.")
@@ -451,12 +509,52 @@ class DepthEstimator:
         print("DEPTH ESTIMATION AND 3D RECONSTRUCTION PIPELINE")
         print("="*60)
         
-        # Step 1: Estimate depth
-        print("\n[Step 1/2] Estimating depth map...")
-        depth_map = self.get_depth_map_marigold(image)
+        # Determine if we should use sparse depth prior
+        use_prior = use_sparse_depth_prior and lidar_point_cloud is not None and self.dc_pipe is not None
+        
+        if use_prior:
+            print("\n[Step 1/3] Creating sparse depth map from LiDAR points...")
+            h, w = image.shape[:2]
+            sparse_depth = self.create_sparse_depth_map(
+                point_cloud=lidar_point_cloud,
+                image_shape=(h, w)
+            )
             
-        # Step 2: Reconstruct 3D points
-        print("\n[Step 2/2] Reconstructing 3D point cloud...")
+            # Check if we have enough sparse points to be useful
+            n_sparse_points = np.sum(sparse_depth > 0)
+            coverage = 100 * n_sparse_points / (h * w)
+            
+            if coverage < 0.1:  # Less than 0.1% coverage
+                print(f"Warning: Sparse depth coverage is very low ({coverage:.2f}%). Falling back to regular Marigold.")
+                use_prior = False
+            else:
+                print(f"\n[Step 2/3] Estimating depth with sparse depth prior (Marigold-DC)...")
+                print(f"  Using {n_sparse_points} sparse depth points ({coverage:.2f}% coverage) as guidance")
+                
+                # Use Marigold-DC with sparse depth as prior
+                depth_map = self.complete_depth(
+                    image=image,
+                    sparse_depth=sparse_depth,
+                    num_inference_steps=num_inference_steps,
+                    ensemble_size=ensemble_size,
+                    processing_resolution=processing_resolution,
+                    seed=seed
+                )
+        else:
+            if lidar_point_cloud is not None and not use_sparse_depth_prior:
+                print("\n[Step 1/2] Estimating depth map (without sparse depth prior)...")
+            elif lidar_point_cloud is None:
+                print("\n[Step 1/2] Estimating depth map (no LiDAR points provided)...")
+            else:
+                print("\n[Step 1/2] Estimating depth map...")
+            
+            # Use regular Marigold depth estimation
+            depth_map = self.get_depth_map_marigold(image)
+            sparse_depth = None
+            
+        # Step 2/3: Reconstruct 3D points
+        step_num = "3" if use_prior else "2"
+        print(f"\n[Step {step_num}/{step_num}] Reconstructing 3D point cloud...")
         points_lidar = self.reconstruct_points_from_depth(
             depth_map=depth_map,
             depth_threshold_min=depth_threshold_min,
@@ -466,12 +564,22 @@ class DepthEstimator:
         
         print("\n" + "="*60)
         print("PIPELINE COMPLETE")
+        if use_prior and sparse_depth is not None:
+            n_sparse_points = np.sum(sparse_depth > 0)
+            coverage = 100 * n_sparse_points / (h * w)
+            print(f"Used sparse depth prior: {n_sparse_points} LiDAR points ({coverage:.2f}% coverage)")
         print("="*60 + "\n")
         
-        return {
+        result = {
             'depth_map': depth_map,
-            'points_lidar': points_lidar
+            'points_lidar': points_lidar,
+            'used_sparse_prior': use_prior
         }
+        
+        if sparse_depth is not None:
+            result['sparse_depth'] = sparse_depth
+        
+        return result
     
     def create_sparse_depth_map(self, point_cloud: np.ndarray,
                                 image_shape: tuple) -> np.ndarray:
