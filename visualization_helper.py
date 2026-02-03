@@ -454,54 +454,109 @@ def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
                             cuboids: Optional[List[Dict]] = None,
                             rays: Optional[Dict[int, np.ndarray]] = None,
                             points_in_frustums: Optional[List[np.ndarray]] = None,
+                            reconstructed_points: Optional[np.ndarray] = None,
+                            show_lidar: bool = True,
+                            show_reconstructed: bool = True,
+                            color_by_depth: bool = False,
                             title: str = "3D Point Cloud") -> go.Figure:
-    """Create a 3D scatter plot using Plotly for web compatibility"""
+    """
+    Create a 3D scatter plot using Plotly for web compatibility.
+    
+    Args:
+        points: Point cloud data (PointCloud object or numpy array)
+        labels: Optional cluster labels for coloring points
+        mask_points: Optional dict mapping mask IDs to point arrays (legacy parameter)
+        cuboids: Optional list of cuboid dictionaries to visualize
+        rays: Optional dict mapping mask IDs to ray data (used with mask_points)
+        points_in_frustums: Optional array of points within frustums
+        reconstructed_points: Optional array of reconstructed points from depth estimation
+        show_lidar: Whether to show original LiDAR points (default: True)
+        show_reconstructed: Whether to show reconstructed points (default: True)
+        color_by_depth: Whether to color reconstructed points by depth (default: False)
+        title: Plot title
+    
+    Returns:
+        go.Figure: Plotly figure object
+    """
     fig = go.Figure()
 
     # Convert PointCloud object to numpy array if needed
-    if hasattr(points, 'point_cloud_plane_removed'):
-        # It's a PointCloud object
-        point_array = points.point_cloud_plane_removed
-    else:
-        # It's already a numpy array
-        point_array = points
+    point_array = None
+    if points is not None:
+        if hasattr(points, 'point_cloud_plane_removed'):
+            # It's a PointCloud object
+            point_array = points.point_cloud_plane_removed
+        else:
+            # It's already a numpy array
+            point_array = points
 
-    if labels is None:
-        # Single color for all points
-        fig.add_trace(go.Scatter3d(
-            x=point_array[:, 0],
-            y=point_array[:, 1],
-            z=point_array[:, 2],
-            mode='markers',
-            marker=dict(size=2, color='lightblue'),
-            name='Points'
-        ))
-    else:
-        # Color by cluster
-        unique_labels = np.unique(labels)
-        colors = px.colors.qualitative.Plotly[:len(unique_labels)]
+    # Add original LiDAR points if enabled
+    if show_lidar and point_array is not None and len(point_array) > 0:
+        if labels is None:
+            # Single color for all points
+            fig.add_trace(go.Scatter3d(
+                x=point_array[:, 0],
+                y=point_array[:, 1],
+                z=point_array[:, 2],
+                mode='markers',
+                marker=dict(size=1, color='lightblue', opacity=0.3),
+                name='LiDAR Points'
+            ))
+        else:
+            # Color by cluster
+            unique_labels = np.unique(labels)
+            colors = px.colors.qualitative.Plotly[:len(unique_labels)]
 
-        for i, label in enumerate(unique_labels):
-            if label == -1:  # Noise points
-                mask = labels == label
-                fig.add_trace(go.Scatter3d(
-                    x=point_array[mask, 0],
-                    y=point_array[mask, 1],
-                    z=point_array[mask, 2],
-                    mode='markers',
-                    marker=dict(size=2, color='gray'),
-                    name='Noise'
-                ))
-            else:
-                mask = labels == label
-                fig.add_trace(go.Scatter3d(
-                    x=point_array[mask, 0],
-                    y=point_array[mask, 1],
-                    z=point_array[mask, 2],
-                    mode='markers',
-                    marker=dict(size=2, color=colors[i % len(colors)]),
-                    name=f'Cluster {label}'
-                ))
+            for i, label in enumerate(unique_labels):
+                if label == -1:  # Noise points
+                    mask = labels == label
+                    fig.add_trace(go.Scatter3d(
+                        x=point_array[mask, 0],
+                        y=point_array[mask, 1],
+                        z=point_array[mask, 2],
+                        mode='markers',
+                        marker=dict(size=2, color='gray'),
+                        name='Noise'
+                    ))
+                else:
+                    mask = labels == label
+                    fig.add_trace(go.Scatter3d(
+                        x=point_array[mask, 0],
+                        y=point_array[mask, 1],
+                        z=point_array[mask, 2],
+                        mode='markers',
+                        marker=dict(size=2, color=colors[i % len(colors)]),
+                        name=f'Cluster {label}'
+                    ))
+
+    # Add reconstructed points from depth estimation if enabled
+    if show_reconstructed and reconstructed_points is not None and len(reconstructed_points) > 0:
+        if color_by_depth:
+            # Calculate depth from origin
+            depths = np.linalg.norm(reconstructed_points, axis=1)
+            fig.add_trace(go.Scatter3d(
+                x=reconstructed_points[:, 0],
+                y=reconstructed_points[:, 1],
+                z=reconstructed_points[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=2,
+                    color=depths,
+                    colorscale='Viridis',
+                    opacity=0.8,
+                    colorbar=dict(title="Depth (m)")
+                ),
+                name='Reconstructed Points'
+            ))
+        else:
+            fig.add_trace(go.Scatter3d(
+                x=reconstructed_points[:, 0],
+                y=reconstructed_points[:, 1],
+                z=reconstructed_points[:, 2],
+                mode='markers',
+                marker=dict(size=2, color='red', opacity=0.8),
+                name='Reconstructed Points'
+            ))
 
     if points_in_frustums is not None:
         fig.add_trace(go.Scatter3d(
@@ -558,9 +613,9 @@ def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
     fig.update_layout(
         title=title,
         scene=dict(
-            xaxis=dict(title='X'),
-            yaxis=dict(title='Y'),
-            zaxis=dict(title='Z'),
+            xaxis=dict(title='X (m)'),
+            yaxis=dict(title='Y (m)'),
+            zaxis=dict(title='Z (m)'),
             aspectmode='data'
         ),
         margin=dict(l=0, r=0, b=0, t=40),

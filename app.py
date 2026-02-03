@@ -275,8 +275,15 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
             points_in_frustums = np.concatenate([points_in_frustums, points_in_frustum])
         
         if point_cloud_obj is not None:
-            fig = create_3d_scatter_plot(point_cloud_obj, None, None, None, None, points_in_frustums,
-                                         "Point Cloud with 2D→3D Frustum Projections")
+            fig = create_3d_scatter_plot(
+                points=point_cloud_obj,
+                labels=None,
+                mask_points=None,
+                cuboids=None,
+                rays=None,
+                points_in_frustums=points_in_frustums,
+                title="Point Cloud with 2D→3D Frustum Projections"
+            )
 
             # Add frustums to the figure
             camera_intrinsic = sample_data_full.get('camera_intrinsic')
@@ -516,14 +523,25 @@ def dbscan_page(point_cloud):
             cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
             if cluster_points is not None:
                 # Create custom figure showing only clustered points with colors
-                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
-                                             "Frustum-Based DBSCAN Results (Colored by Cluster)")
+                fig = create_3d_scatter_plot(
+                    points=cluster_points,
+                    labels=cluster_labels,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based DBSCAN Results (Colored by Cluster)"
+                )
             else:
-                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
-                                             "Frustum-Based DBSCAN Results")
+                fig = create_3d_scatter_plot(
+                    points=point_cloud,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based DBSCAN Results"
+                )
         else:
-            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
-                                         "DBSCAN Clustering Results")
+            fig = create_3d_scatter_plot(
+                points=point_cloud,
+                labels=result['labels'],
+                cuboids=st.session_state.cuboids,
+                title="DBSCAN Clustering Results"
+            )
         st.plotly_chart(fig, width='stretch', key='dbscan_clustering_chart')
 
         # Parameter summary
@@ -742,14 +760,25 @@ def optics_page(point_cloud):
             per_frustum_clusters = result.get('per_frustum_clusters', [])
             cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
             if cluster_points is not None:
-                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
-                                             "Frustum-Based OPTICS Results (Colored by Cluster)")
+                fig = create_3d_scatter_plot(
+                    points=cluster_points,
+                    labels=cluster_labels,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based OPTICS Results (Colored by Cluster)"
+                )
             else:
-                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
-                                             "Frustum-Based OPTICS Results")
+                fig = create_3d_scatter_plot(
+                    points=point_cloud,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based OPTICS Results"
+                )
         else:
-            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
-                                         "OPTICS Clustering Results")
+            fig = create_3d_scatter_plot(
+                points=point_cloud,
+                labels=result['labels'],
+                cuboids=st.session_state.cuboids,
+                title="OPTICS Clustering Results"
+            )
         st.plotly_chart(fig, width='stretch', key='optics_clustering_chart')
 
         # Parameter summary
@@ -924,14 +953,25 @@ def birch_page(point_cloud):
             per_frustum_clusters = result.get('per_frustum_clusters', [])
             cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
             if cluster_points is not None:
-                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
-                                             "Frustum-Based BIRCH Results (Colored by Cluster)")
+                fig = create_3d_scatter_plot(
+                    points=cluster_points,
+                    labels=cluster_labels,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based BIRCH Results (Colored by Cluster)"
+                )
             else:
-                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
-                                             "Frustum-Based BIRCH Results")
+                fig = create_3d_scatter_plot(
+                    points=point_cloud,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based BIRCH Results"
+                )
         else:
-            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
-                                         "BIRCH Clustering Results")
+            fig = create_3d_scatter_plot(
+                points=point_cloud,
+                labels=result['labels'],
+                cuboids=st.session_state.cuboids,
+                title="BIRCH Clustering Results"
+            )
         st.plotly_chart(fig, width='stretch', key='birch_clustering_chart')
 
         # Parameter summary
@@ -1110,14 +1150,25 @@ def agglomerative_page(point_cloud):
             per_frustum_clusters = result.get('per_frustum_clusters', [])
             cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
             if cluster_points is not None:
-                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
-                                             "Frustum-Based Agglomerative Results (Colored by Cluster)")
+                fig = create_3d_scatter_plot(
+                    points=cluster_points,
+                    labels=cluster_labels,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based Agglomerative Results (Colored by Cluster)"
+                )
             else:
-                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
-                                             "Frustum-Based Agglomerative Results")
+                fig = create_3d_scatter_plot(
+                    points=point_cloud,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based Agglomerative Results"
+                )
         else:
-            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
-                                         "Agglomerative Clustering Results")
+            fig = create_3d_scatter_plot(
+                points=point_cloud,
+                labels=result['labels'],
+                cuboids=st.session_state.cuboids,
+                title="Agglomerative Clustering Results"
+            )
         st.plotly_chart(fig, width='stretch', key='agglomerative_clustering_chart')
 
         # Parameter summary
@@ -1313,14 +1364,25 @@ def hdbscan_page(point_cloud):
             per_frustum_clusters = result.get('per_frustum_clusters', [])
             cluster_points, cluster_labels = FrustumManager.combine_cluster_results(per_frustum_clusters)
             if cluster_points is not None:
-                fig = create_3d_scatter_plot(cluster_points, cluster_labels, None, st.session_state.cuboids,
-                                             "Frustum-Based HDBSCAN Results (Colored by Cluster)")
+                fig = create_3d_scatter_plot(
+                    points=cluster_points,
+                    labels=cluster_labels,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based HDBSCAN Results (Colored by Cluster)"
+                )
             else:
-                fig = create_3d_scatter_plot(point_cloud, None, None, st.session_state.cuboids,
-                                             "Frustum-Based HDBSCAN Results")
+                fig = create_3d_scatter_plot(
+                    points=point_cloud,
+                    cuboids=st.session_state.cuboids,
+                    title="Frustum-Based HDBSCAN Results"
+                )
         else:
-            fig = create_3d_scatter_plot(point_cloud, result['labels'], None, st.session_state.cuboids,
-                                         "HDBSCAN Clustering Results")
+            fig = create_3d_scatter_plot(
+                points=point_cloud,
+                labels=result['labels'],
+                cuboids=st.session_state.cuboids,
+                title="HDBSCAN Clustering Results"
+            )
         st.plotly_chart(fig, width='stretch', key='hdbscan_clustering_chart')
 
         # Parameter summary
@@ -2135,58 +2197,19 @@ def depth_estimation_page():
     with col3:
         color_by_depth = st.checkbox("Color by Depth", value=True, key="color_by_depth")
     
-    # Create 3D visualization
-    fig = go.Figure()
-    
-    # Add original LiDAR points
-    if show_lidar and st.session_state.point_cloud is not None:
-        lidar_points = st.session_state.point_cloud.point_cloud_plane_removed
-        fig.add_trace(go.Scatter3d(
-            x=lidar_points[:, 0],
-            y=lidar_points[:, 1],
-            z=lidar_points[:, 2],
-            mode='markers',
-            marker=dict(size=1, color='blue', opacity=0.3),
-            name='LiDAR Points'
-        ))
-    
-    # Add reconstructed points
-    if show_reconstructed:
-        if color_by_depth:
-            # Calculate depth from origin
-            depths = np.linalg.norm(reconstructed_points, axis=1)
-            fig.add_trace(go.Scatter3d(
-                x=reconstructed_points[:, 0],
-                y=reconstructed_points[:, 1],
-                z=reconstructed_points[:, 2],
-                mode='markers',
-                marker=dict(
-                    size=2,
-                    color=depths,
-                    colorscale='Viridis',
-                    opacity=0.8,
-                    colorbar=dict(title="Depth (m)")
-                ),
-                name='Reconstructed Points'
-            ))
-        else:
-            fig.add_trace(go.Scatter3d(
-                x=reconstructed_points[:, 0],
-                y=reconstructed_points[:, 1],
-                z=reconstructed_points[:, 2],
-                mode='markers',
-                marker=dict(size=2, color='red', opacity=0.8),
-                name='Reconstructed Points'
-            ))
-    
-    fig.update_layout(
-        scene=dict(
-            xaxis_title='X (m)',
-            yaxis_title='Y (m)',
-            zaxis_title='Z (m)',
-            aspectmode='data'
-        ),
-        height=600,
+    # Create 3D visualization using the adapted helper function
+    point_cloud_obj = st.session_state.point_cloud
+    fig = create_3d_scatter_plot(
+        points=point_cloud_obj,
+        labels=None,
+        mask_points=None,
+        cuboids=None,
+        rays=None,
+        points_in_frustums=None,
+        reconstructed_points=reconstructed_points if show_reconstructed else None,
+        show_lidar=show_lidar,
+        show_reconstructed=show_reconstructed,
+        color_by_depth=color_by_depth,
         title="3D Point Cloud Comparison"
     )
     

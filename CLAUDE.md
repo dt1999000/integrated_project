@@ -184,3 +184,57 @@ dataset/nuscenes/
 - Primitive mesh creators in visualization_helper.py: `cuboid_from_minmax()`, `frustum_mesh()`
 - Higher-level functions: `create_3d_scatter_plot()`, `add_cuboids_to_figure()`
 - All use Plotly graph_objects for 3D rendering
+
+## Visualization Helper Function Updates
+
+### `create_3d_scatter_plot()` Function Signature
+
+**CRITICAL:** When calling `create_3d_scatter_plot()`, **always use keyword arguments** for parameters added after the original signature to avoid parameter mismatches.
+
+**Function Signature:**
+```python
+def create_3d_scatter_plot(
+    points, 
+    labels: Optional[np.ndarray] = None,
+    mask_points: Optional[Dict[int, np.ndarray]] = None,
+    cuboids: Optional[List[Dict]] = None,
+    rays: Optional[Dict[int, np.ndarray]] = None,
+    points_in_frustums: Optional[List[np.ndarray]] = None,
+    reconstructed_points: Optional[np.ndarray] = None,  # NEW: For depth estimation
+    show_lidar: bool = True,  # NEW: Control LiDAR point visibility
+    show_reconstructed: bool = True,  # NEW: Control reconstructed point visibility
+    color_by_depth: bool = False,  # NEW: Color reconstructed points by depth
+    title: str = "3D Point Cloud"
+) -> go.Figure
+```
+
+**Key Changes:**
+- Added `reconstructed_points` parameter for visualizing depth-estimated point clouds
+- Added `show_lidar`, `show_reconstructed`, and `color_by_depth` flags for visualization control
+- Function handles `None` points gracefully
+- Supports both PointCloud objects and numpy arrays
+
+**Usage Pattern:**
+```python
+# ✅ CORRECT: Use keyword arguments for new parameters
+fig = create_3d_scatter_plot(
+    points=point_cloud_obj,
+    labels=None,
+    cuboids=cuboids,
+    reconstructed_points=reconstructed_points,
+    show_lidar=True,
+    show_reconstructed=True,
+    color_by_depth=True,
+    title="3D Point Cloud Comparison"
+)
+
+# ❌ WRONG: Using positional arguments can cause parameter mismatches
+fig = create_3d_scatter_plot(point_cloud, None, None, cuboids, None, None, "Title")
+# This would pass "Title" as reconstructed_points, causing TypeError
+```
+
+**Why This Matters:**
+- When new parameters are added to a function, existing positional calls can break
+- String titles passed positionally can be interpreted as numpy arrays
+- Always use keyword arguments when calling functions with many optional parameters
+- This ensures code remains maintainable as the function signature evolves
