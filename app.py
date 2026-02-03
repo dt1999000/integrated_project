@@ -22,6 +22,7 @@ from segmentation_detection import SegmentationDetector
 from bounding_boxes import BoundingBoxes
 from segmentation_detection import SegmentationToPointCloud
 from pointcloud_projection import Projection
+from depth_estimation import DepthEstimator
 import matplotlib.pyplot as plt
 # Add the current directory to the path to import our modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -84,12 +85,18 @@ if 'all_rays' not in st.session_state:
     st.session_state.all_rays = {}
 if 'frustums' not in st.session_state:
     st.session_state.frustums = []  # List of (camera_origin, base_corners, category, bbox_2d) tuples
-if 'per_frustum_clusters' not in st.session_state:
-    st.session_state.per_frustum_clusters = []  # List of cluster results per frustum
 if 'depth_map' not in st.session_state:
     st.session_state.depth_map = None
 if 'depth_image' not in st.session_state:
     st.session_state.depth_image = None
+if 'reconstructed_points' not in st.session_state:
+    st.session_state.reconstructed_points = None
+if 'depth_estimator' not in st.session_state:
+    st.session_state.depth_estimator = None
+if 'sparse_depth_map' not in st.session_state:
+    st.session_state.sparse_depth_map = None
+if 'completed_depth_map' not in st.session_state:
+    st.session_state.completed_depth_map = None
 
 # Initialize centralized parameters dict
 if 'params' not in st.session_state:
@@ -103,7 +110,8 @@ if 'params' not in st.session_state:
             'validate_overlap': True,
             'overlap_threshold': 0.7,
             'use_templates': True,
-            'frustum_depth': 100
+            'frustum_depth': 100,
+            'clustering_algorithm': 'hdbscan'
         },
         # HDBSCAN parameters
         'hdbscan': {
@@ -114,7 +122,7 @@ if 'params' not in st.session_state:
         # DBSCAN parameters
         'dbscan': {
             'eps': 0.5,
-            'min_samples': 10,
+            'min_samples': 5,
             'metric': 'euclidean',
             'algorithm': 'auto',
             'leaf_size': 30
@@ -137,6 +145,15 @@ if 'params' not in st.session_state:
         'agglomerative': {
             'n_clusters': 5,
             'linkage': 'ward'
+        },
+        # Marigold-DC parameters
+        'marigold_dc': {
+            'num_inference_steps': 50,
+            'ensemble_size': 1,
+            'processing_resolution': 768,
+            'seed': 2024,
+            'use_full_precision': False,
+            'use_tiny_vae': False
         }
     }
 
@@ -214,7 +231,7 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
 
         # Frustum parameters
         with st.sidebar.expander("Frustum Parameters", expanded=True):
-            frustum_depth = st.slider("Frustum Depth (m)", min_value=5, max_value=100, value=30, step=5,
+            frustum_depth = st.slider("Frustum Depth (m)", min_value=5, max_value=100, value=100, step=5,
                                       key="frustum_depth_projection",
                                       help="How far to project the 2D bounding boxes into 3D space")
             frustum_opacity = st.slider("Frustum Opacity", min_value=0.05, max_value=0.5, value=0.2, step=0.05,
@@ -289,7 +306,7 @@ def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
             df = pd.DataFrame(frustum_data)
             st.dataframe(df, use_container_width=True)
 
-        st.info("Run any clustering algorithm on the other tabs to see per-frustum clustering results. "
+        st.info("Select a clustering algorithm in the sidebar to see per-frustum clustering results. "
                 "Clusters are automatically filtered by these frustums when using KITTI data.")
         return
 
@@ -332,8 +349,8 @@ def dbscan_page(point_cloud):
         algorithm = st.session_state.params['dbscan']['algorithm']
         leaf_size = st.session_state.params['dbscan']['leaf_size']
 
-    # Run clustering button
-    if st.sidebar.button("🚀 Run DBSCAN", key="run_dbscan"):
+    # Run clustering automatically for selected algorithm
+    if st.session_state.params['pipeline']['clustering_algorithm'] == 'dbscan':
         # Check if KITTI 2D bboxes are available for frustum filtering
         sample_data = st.session_state.get('sample_data', {})
         is_kitti = st.session_state.get('current_dataset') == 'kitti'
@@ -381,8 +398,6 @@ def dbscan_page(point_cloud):
                 )
                 bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
 
-                # Store per-frustum results
-                st.session_state.per_frustum_clusters = per_frustum_results
                 st.session_state.cuboids = cuboids
 
                 # Store results
@@ -566,8 +581,8 @@ def optics_page(point_cloud):
         min_cluster_size = st.session_state.params['optics']['min_cluster_size']
         metric = st.session_state.params['optics']['metric']
 
-    # Run clustering button
-    if st.sidebar.button("🚀 Run OPTICS", key="run_optics"):
+    # Run clustering automatically for selected algorithm
+    if st.session_state.params['pipeline']['clustering_algorithm'] == 'optics':
         # Check if KITTI 2D bboxes are available for frustum filtering
         sample_data = st.session_state.get('sample_data', {})
         is_kitti = st.session_state.get('current_dataset') == 'kitti'
@@ -615,8 +630,6 @@ def optics_page(point_cloud):
                 )
                 bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
 
-                # Store results
-                st.session_state.per_frustum_clusters = per_frustum_results
                 st.session_state.cuboids = cuboids
 
                 st.session_state.clustering_results['optics'] = {
@@ -770,8 +783,8 @@ def birch_page(point_cloud):
         branching_factor = st.session_state.params['birch']['branching_factor']
         n_clusters = st.session_state.params['birch']['n_clusters']
 
-    # Run clustering button
-    if st.sidebar.button("🚀 Run BIRCH", key="run_birch"):
+    # Run clustering automatically for selected algorithm
+    if st.session_state.params['pipeline']['clustering_algorithm'] == 'birch':
         # Check if KITTI 2D bboxes are available for frustum filtering
         sample_data = st.session_state.get('sample_data', {})
         is_kitti = st.session_state.get('current_dataset') == 'kitti'
@@ -805,8 +818,6 @@ def birch_page(point_cloud):
                 )
                 bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
 
-                # Store results
-                st.session_state.per_frustum_clusters = per_frustum_results
                 st.session_state.cuboids = cuboids
 
                 st.session_state.clustering_results['birch'] = {
@@ -948,8 +959,8 @@ def agglomerative_page(point_cloud):
         n_clusters = st.session_state.params['agglomerative']['n_clusters']
         linkage = st.session_state.params['agglomerative']['linkage']
 
-    # Run clustering button
-    if st.sidebar.button("🚀 Run Agglomerative", key="run_agglomerative"):
+    # Run clustering automatically for selected algorithm
+    if st.session_state.params['pipeline']['clustering_algorithm'] == 'agglomerative':
         # Check if KITTI 2D bboxes are available for frustum filtering
         sample_data = st.session_state.get('sample_data', {})
         is_kitti = st.session_state.get('current_dataset') == 'kitti'
@@ -994,8 +1005,7 @@ def agglomerative_page(point_cloud):
                 )
                 bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
 
-                # Store results
-                st.session_state.per_frustum_clusters = per_frustum_results
+                
                 st.session_state.cuboids = cuboids
 
                 st.session_state.clustering_results['agglomerative'] = {
@@ -1143,8 +1153,8 @@ def hdbscan_page(point_cloud):
         min_samples = st.session_state.params['hdbscan']['min_samples']
         cluster_selection_method = st.session_state.params['hdbscan']['cluster_selection_method']
 
-    # Run clustering button
-    if st.sidebar.button("🚀 Run HDBSCAN", key="run_hdbscan"):
+    # Run clustering automatically for selected algorithm
+    if st.session_state.params['pipeline']['clustering_algorithm'] == 'hdbscan':
         # Check if KITTI 2D bboxes are available for frustum filtering
         sample_data = st.session_state.get('sample_data', {})
         is_kitti = st.session_state.get('current_dataset') == 'kitti'
@@ -1190,8 +1200,7 @@ def hdbscan_page(point_cloud):
                 )
                 bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
 
-                # Store per-frustum results
-                st.session_state.per_frustum_clusters = per_frustum_results
+                
                 st.session_state.cuboids = cuboids
 
                 # Store results
@@ -1354,7 +1363,7 @@ def kitti_groundtruth_page():
 
     # Note: Frustum-based clustering is now automatic
     st.sidebar.info("Frustum filtering is automatic when running clustering on KITTI data. "
-                    "Run DBSCAN, BIRCH, or Agglomerative on the other tabs.")
+                    "Select a clustering algorithm in the sidebar to update results.")
 
 
     # Display camera image with optional 2D bounding boxes
@@ -1664,7 +1673,7 @@ def statistics_page():
             with c1:
                 eps = st.number_input("Epsilon", 0.1, 5.0, 0.5, 0.1, key="stats_dbscan_eps")
             with c2:
-                min_samples = st.number_input("Min Samples", 2, 50, 10, key="stats_dbscan_ms")
+                min_samples = st.number_input("Min Samples", 2, 50, 5, key="stats_dbscan_ms")
             clustering_params = {
                 'min_cluster_size': min_samples,
                 'min_samples': min_samples,
@@ -2010,6 +2019,467 @@ def statistics_page():
             st.json(export_data)
 
 
+def depth_estimation_page():
+    """Depth Estimation and 3D Reconstruction page"""
+    st.header("🔍 Depth Estimation & 3D Reconstruction")
+    
+    # Check if data is loaded
+    if 'sample_data' not in st.session_state or st.session_state.sample_data is None:
+        st.info("👈 Load a sample from the sidebar and click 'Estimate Depth' to get started")
+        st.markdown("""
+        ### How to use:
+        1. Load a KITTI sample using the sidebar controls
+        2. Select depth estimation model in the sidebar (Marigold or Depth Anything)
+        3. Click the **🔍 Estimate Depth** button in the sidebar
+        4. Wait for the depth estimation to complete (may take 10-30 seconds)
+        5. View the depth map and reconstructed 3D point cloud below
+        
+        **Available Models:**
+        - **Marigold**: High-quality metric depth estimation (requires GPU/CUDA for best performance)
+        - **Depth Anything**: Fast depth estimation, works on CPU
+        
+        The tool reconstructs a dense 3D point cloud from the depth map that can be combined with LiDAR data.
+        """)
+        
+        # Show system information
+        try:
+            from depth_estimation import MARIGOLD_AVAILABLE, DEPTH_ANYTHING_AVAILABLE
+            with st.expander("📋 Model Availability"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    if MARIGOLD_AVAILABLE:
+                        st.success("✅ Marigold Available")
+                    else:
+                        st.warning("⚠️ Marigold Unavailable")
+                        st.caption("Install with: pip install diffusers")
+                with col2:
+                    if DEPTH_ANYTHING_AVAILABLE:
+                        st.success("✅ Depth Anything V2 Available")
+                    else:
+                        st.info("ℹ️ Using Depth Anything Small (HF)")
+        except:
+            pass
+        
+        return
+    
+    sample_data = st.session_state.sample_data
+    
+    # Check if depth has been estimated
+    if st.session_state.depth_map is None:
+        st.warning("⚠️ No depth map available. Click '🔍 Estimate Depth' in the sidebar to run depth estimation.")
+        return
+    
+    depth_map = st.session_state.depth_map
+    reconstructed_points = st.session_state.reconstructed_points
+    
+    # Display statistics
+    st.subheader("📊 Depth Estimation Statistics")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Depth Map Shape", f"{depth_map.shape[0]}×{depth_map.shape[1]}")
+    with col2:
+        st.metric("Min Depth", f"{depth_map.min():.2f}m")
+    with col3:
+        st.metric("Max Depth", f"{depth_map.max():.2f}m")
+    with col4:
+        st.metric("Reconstructed Points", f"{len(reconstructed_points):,}")
+    
+    # Display depth map visualization
+    st.subheader("🗺️ Depth Map Visualization")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**Original Image**")
+        img = cv2.imread(sample_data['image_path'])
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        st.image(img_rgb, use_container_width=True)
+    
+    with col2:
+        st.markdown("**Estimated Depth Map**")
+        # Create colorized depth map
+        fig, ax = plt.subplots(figsize=(10, 6))
+        im = ax.imshow(depth_map, cmap='viridis')
+        ax.set_title("Depth Map (meters)")
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        st.pyplot(fig)
+        plt.close()
+    
+    # 3D Visualization of reconstructed points
+    st.subheader("🎯 3D Reconstructed Point Cloud")
+    
+    # Options for visualization
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        show_lidar = st.checkbox("Show Original LiDAR", value=True, key="show_lidar_depth")
+    with col2:
+        show_reconstructed = st.checkbox("Show Reconstructed Points", value=True, key="show_reconstructed_depth")
+    with col3:
+        color_by_depth = st.checkbox("Color by Depth", value=True, key="color_by_depth")
+    
+    # Create 3D visualization
+    fig = go.Figure()
+    
+    # Add original LiDAR points
+    if show_lidar and st.session_state.point_cloud is not None:
+        lidar_points = st.session_state.point_cloud.point_cloud_plane_removed
+        fig.add_trace(go.Scatter3d(
+            x=lidar_points[:, 0],
+            y=lidar_points[:, 1],
+            z=lidar_points[:, 2],
+            mode='markers',
+            marker=dict(size=1, color='blue', opacity=0.3),
+            name='LiDAR Points'
+        ))
+    
+    # Add reconstructed points
+    if show_reconstructed:
+        if color_by_depth:
+            # Calculate depth from origin
+            depths = np.linalg.norm(reconstructed_points, axis=1)
+            fig.add_trace(go.Scatter3d(
+                x=reconstructed_points[:, 0],
+                y=reconstructed_points[:, 1],
+                z=reconstructed_points[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=2,
+                    color=depths,
+                    colorscale='Viridis',
+                    opacity=0.8,
+                    colorbar=dict(title="Depth (m)")
+                ),
+                name='Reconstructed Points'
+            ))
+        else:
+            fig.add_trace(go.Scatter3d(
+                x=reconstructed_points[:, 0],
+                y=reconstructed_points[:, 1],
+                z=reconstructed_points[:, 2],
+                mode='markers',
+                marker=dict(size=2, color='red', opacity=0.8),
+                name='Reconstructed Points'
+            ))
+    
+    fig.update_layout(
+        scene=dict(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='Z (m)',
+            aspectmode='data'
+        ),
+        height=600,
+        title="3D Point Cloud Comparison"
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Statistics comparison
+    st.subheader("📈 Point Cloud Comparison")
+    if st.session_state.point_cloud is not None:
+        lidar_points = st.session_state.point_cloud.point_cloud_plane_removed
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("LiDAR Points", f"{len(lidar_points):,}")
+            st.caption(f"X: [{lidar_points[:, 0].min():.1f}, {lidar_points[:, 0].max():.1f}]")
+            st.caption(f"Y: [{lidar_points[:, 1].min():.1f}, {lidar_points[:, 1].max():.1f}]")
+            st.caption(f"Z: [{lidar_points[:, 2].min():.1f}, {lidar_points[:, 2].max():.1f}]")
+        
+        with col2:
+            st.metric("Reconstructed Points", f"{len(reconstructed_points):,}")
+            st.caption(f"X: [{reconstructed_points[:, 0].min():.1f}, {reconstructed_points[:, 0].max():.1f}]")
+            st.caption(f"Y: [{reconstructed_points[:, 1].min():.1f}, {reconstructed_points[:, 1].max():.1f}]")
+            st.caption(f"Z: [{reconstructed_points[:, 2].min():.1f}, {reconstructed_points[:, 2].max():.1f}]")
+        
+        with col3:
+            combined_count = len(lidar_points) + len(reconstructed_points)
+            st.metric("Combined Total", f"{combined_count:,}")
+            density_increase = (len(reconstructed_points) / len(lidar_points)) * 100
+            st.caption(f"Density increase: +{density_increase:.1f}%")
+    
+    # Option to add reconstructed points to point cloud
+    st.subheader("🔧 Point Cloud Integration")
+    st.markdown("""
+    You can add the reconstructed points to the current point cloud for use in clustering algorithms.
+    This will create a denser point cloud by combining LiDAR and depth-based reconstruction.
+    """)
+    
+    if st.button("➕ Add Reconstructed Points to Point Cloud", key="add_reconstructed"):
+        if st.session_state.point_cloud is not None:
+            st.session_state.point_cloud.add_projected_points(reconstructed_points)
+            st.success(f"✅ Added {len(reconstructed_points):,} reconstructed points to point cloud!")
+            st.info("The combined point cloud is now available for clustering algorithms.")
+        else:
+            st.error("No point cloud loaded. Load a sample first.")
+    
+    # Export options
+    with st.expander("💾 Export Options"):
+        st.markdown("**Export reconstructed point cloud**")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Download as .npy", key="export_npy"):
+                np.save('reconstructed_points.npy', reconstructed_points)
+                st.success("Saved to reconstructed_points.npy")
+        with col2:
+            if st.button("Download depth map", key="export_depth"):
+                np.save('depth_map.npy', depth_map)
+                st.success("Saved to depth_map.npy")
+
+def depth_completion_page():
+    """Depth Completion page using Marigold-DC"""
+    st.header("🎯 Depth Completion (Marigold-DC)")
+    
+    # Check if data is loaded
+    if 'sample_data' not in st.session_state or st.session_state.sample_data is None:
+        st.info("👈 Load a sample from the sidebar and click '🎯 Complete Depth' to get started")
+        st.markdown("""
+        ### How to use:
+        1. Load a KITTI sample using the sidebar controls
+        2. Initialize depth estimator (click '🔍 Estimate Depth' or it will auto-initialize)
+        3. Adjust Marigold-DC parameters in the sidebar (expand 'Marigold-DC Parameters')
+        4. Click the **🎯 Complete Depth** button in the sidebar
+        5. Wait for depth completion to finish (may take 30-120 seconds depending on settings)
+        6. View the sparse depth map, completed depth map, and comparison below
+        
+        **What is Depth Completion?**
+        - Takes sparse depth measurements (from LiDAR) and completes them to dense depth maps
+        - Uses Marigold-DC diffusion model to fill in missing depth values
+        - Combines the accuracy of LiDAR with the density of monocular depth estimation
+        
+        **Parameters:**
+        - **Inference Steps**: More steps = better quality but slower (10-100)
+        - **Ensemble Size**: Multiple predictions averaged together (1-4)
+        - **Processing Resolution**: Higher resolution = better quality but slower (256-1024)
+        """)
+        
+        # Show system information
+        try:
+            from depth_estimation import MARIGOLD_AVAILABLE
+            with st.expander("📋 Model Availability"):
+                if MARIGOLD_AVAILABLE:
+                    st.success("✅ Marigold-DC Available")
+                else:
+                    st.warning("⚠️ Marigold-DC Unavailable")
+                    st.caption("Install with: pip install diffusers")
+        except:
+            pass
+        
+        return
+    
+    sample_data = st.session_state.sample_data
+    
+    # Check if depth completion has been run
+    if st.session_state.completed_depth_map is None:
+        st.warning("⚠️ No completed depth map available. Click '🎯 Complete Depth' in the sidebar to run depth completion.")
+        
+        # Show info about what will happen
+        if st.session_state.point_cloud is not None:
+            point_cloud = st.session_state.point_cloud.point_cloud_plane_removed
+            st.info(f"Ready to process: {len(point_cloud):,} LiDAR points will be projected to create sparse depth map.")
+        return
+    
+    sparse_depth = st.session_state.sparse_depth_map
+    completed_depth = st.session_state.completed_depth_map
+    
+    # Display statistics
+    st.subheader("📊 Depth Completion Statistics")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Sparse Points", f"{np.sum(sparse_depth > 0):,}")
+        coverage = 100 * np.sum(sparse_depth > 0) / (sparse_depth.shape[0] * sparse_depth.shape[1])
+        st.caption(f"Coverage: {coverage:.2f}%")
+    with col2:
+        st.metric("Completed Pixels", f"{np.sum(completed_depth > 0):,}")
+        st.caption(f"Coverage: 100%")
+    with col3:
+        if np.sum(sparse_depth > 0) > 0:
+            st.metric("Sparse Depth Range", f"{sparse_depth[sparse_depth>0].min():.1f}-{sparse_depth[sparse_depth>0].max():.1f}m")
+        else:
+            st.metric("Sparse Depth Range", "N/A")
+    with col4:
+        st.metric("Completed Depth Range", f"{completed_depth.min():.1f}-{completed_depth.max():.1f}m")
+    
+    # Display visualizations
+    st.subheader("🖼️ Depth Map Comparison")
+    
+    # Load original image
+    img = cv2.imread(sample_data['image_path'])
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("**Original Image**")
+        st.image(img_rgb, use_container_width=True)
+    
+    with col2:
+        st.markdown("**Sparse Depth Map**")
+        fig_sparse, ax_sparse = plt.subplots(figsize=(8, 6))
+        im_sparse = ax_sparse.imshow(sparse_depth, cmap='viridis', vmin=0, vmax=completed_depth.max())
+        ax_sparse.set_title("Sparse Depth (from LiDAR)")
+        ax_sparse.axis('off')
+        plt.colorbar(im_sparse, ax=ax_sparse, fraction=0.046, pad=0.04, label="Depth (m)")
+        st.pyplot(fig_sparse)
+        plt.close()
+    
+    with col3:
+        st.markdown("**Completed Depth Map**")
+        fig_completed, ax_completed = plt.subplots(figsize=(8, 6))
+        im_completed = ax_completed.imshow(completed_depth, cmap='viridis', vmin=0, vmax=completed_depth.max())
+        ax_completed.set_title("Completed Depth (Marigold-DC)")
+        ax_completed.axis('off')
+        plt.colorbar(im_completed, ax=ax_completed, fraction=0.046, pad=0.04, label="Depth (m)")
+        st.pyplot(fig_completed)
+        plt.close()
+    
+    # Side-by-side comparison
+    st.subheader("📈 Detailed Comparison")
+    
+    # Create overlay visualization
+    fig_overlay, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Sparse depth overlay
+    axes[0].imshow(img_rgb)
+    sparse_overlay = axes[0].imshow(sparse_depth, cmap='viridis', alpha=0.6, vmin=0, vmax=completed_depth.max())
+    axes[0].set_title("Sparse Depth Overlay")
+    axes[0].axis('off')
+    plt.colorbar(sparse_overlay, ax=axes[0], fraction=0.046, pad=0.04, label="Depth (m)")
+    
+    # Completed depth overlay
+    axes[1].imshow(img_rgb)
+    completed_overlay = axes[1].imshow(completed_depth, cmap='viridis', alpha=0.6, vmin=0, vmax=completed_depth.max())
+    axes[1].set_title("Completed Depth Overlay")
+    axes[1].axis('off')
+    plt.colorbar(completed_overlay, ax=axes[1], fraction=0.046, pad=0.04, label="Depth (m)")
+    
+    plt.tight_layout()
+    st.pyplot(fig_overlay)
+    plt.close()
+    
+    # Depth difference analysis
+    st.subheader("🔍 Depth Analysis")
+    
+    # Compare sparse and completed depths where sparse exists
+    sparse_mask = sparse_depth > 0
+    if np.sum(sparse_mask) > 0:
+        sparse_values = sparse_depth[sparse_mask]
+        completed_values_at_sparse = completed_depth[sparse_mask]
+        
+        depth_diff = completed_values_at_sparse - sparse_values
+        depth_diff_pct = 100 * depth_diff / (sparse_values + 1e-6)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Mean Absolute Error", f"{np.mean(np.abs(depth_diff)):.3f}m")
+        with col2:
+            st.metric("Mean Relative Error", f"{np.mean(np.abs(depth_diff_pct)):.2f}%")
+        with col3:
+            st.metric("RMSE", f"{np.sqrt(np.mean(depth_diff**2)):.3f}m")
+        with col4:
+            st.metric("Max Error", f"{np.max(np.abs(depth_diff)):.3f}m")
+        
+        # Error distribution
+        fig_error, ax_error = plt.subplots(figsize=(10, 4))
+        ax_error.hist(depth_diff, bins=50, alpha=0.7, edgecolor='black')
+        ax_error.axvline(0, color='red', linestyle='--', label='Zero Error')
+        ax_error.set_xlabel("Depth Error (m)")
+        ax_error.set_ylabel("Frequency")
+        ax_error.set_title("Depth Completion Error Distribution")
+        ax_error.legend()
+        ax_error.grid(True, alpha=0.3)
+        st.pyplot(fig_error)
+        plt.close()
+    
+    # 3D Visualization option
+    st.subheader("🎯 3D Visualization")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        show_sparse_3d = st.checkbox("Show Sparse 3D Points", value=True, key="show_sparse_3d")
+    with col2:
+        show_completed_3d = st.checkbox("Show Completed 3D Points", value=True, key="show_completed_3d")
+    
+    if show_sparse_3d or show_completed_3d:
+        # Reconstruct 3D points from completed depth
+        if show_completed_3d:
+            # Ensure camera parameters are set
+            if st.session_state.depth_estimator.camera_intrinsic is None:
+                st.session_state.depth_estimator.set_camera_params(
+                    camera_intrinsic=sample_data['camera_intrinsic'],
+                    camera_to_lidar_transform=sample_data['camera_to_lidar_transform']
+                )
+            
+            completed_points = st.session_state.depth_estimator.reconstruct_points_from_depth(
+                depth_map=completed_depth,
+                stride=2  # Subsample for visualization
+            )
+        else:
+            completed_points = None
+        
+        # Create 3D visualization
+        fig_3d = go.Figure()
+        
+        # Add sparse points (from original point cloud)
+        if show_sparse_3d and st.session_state.point_cloud is not None:
+            sparse_points_3d = st.session_state.point_cloud.point_cloud_plane_removed
+            fig_3d.add_trace(go.Scatter3d(
+                x=sparse_points_3d[:, 0],
+                y=sparse_points_3d[:, 1],
+                z=sparse_points_3d[:, 2],
+                mode='markers',
+                marker=dict(size=2, color='blue', opacity=0.5),
+                name='Sparse LiDAR Points'
+            ))
+        
+        # Add completed points
+        if show_completed_3d and completed_points is not None:
+            depths_completed = np.linalg.norm(completed_points, axis=1)
+            fig_3d.add_trace(go.Scatter3d(
+                x=completed_points[:, 0],
+                y=completed_points[:, 1],
+                z=completed_points[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=1,
+                    color=depths_completed,
+                    colorscale='Viridis',
+                    opacity=0.8,
+                    colorbar=dict(title="Depth (m)")
+                ),
+                name='Completed Depth Points'
+            ))
+        
+        fig_3d.update_layout(
+            scene=dict(
+                xaxis_title='X (m)',
+                yaxis_title='Y (m)',
+                zaxis_title='Z (m)',
+                aspectmode='data'
+            ),
+            height=600,
+            title="3D Point Cloud Comparison"
+        )
+        
+        st.plotly_chart(fig_3d, use_container_width=True)
+    
+    # Export options
+    with st.expander("💾 Export Options"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("Download Sparse Depth", key="export_sparse"):
+                np.save('sparse_depth.npy', sparse_depth)
+                st.success("Saved to sparse_depth.npy")
+        with col2:
+            if st.button("Download Completed Depth", key="export_completed"):
+                np.save('completed_depth.npy', completed_depth)
+                st.success("Saved to completed_depth.npy")
+        with col3:
+            if st.button("Download Both", key="export_both"):
+                np.save('sparse_depth.npy', sparse_depth)
+                np.save('completed_depth.npy', completed_depth)
+                st.success("Saved both files")
+
 def main():
     """Main application function"""
     # Header
@@ -2031,7 +2501,7 @@ def main():
     ### Getting Started:
     1. Load a dataset sample using the controls in the sidebar
     2. Navigate to different clustering algorithm pages
-    3. Adjust parameters and run clustering
+    3. Adjust parameters (clustering updates automatically)
     4. Analyze the results through visualizations and metrics
     """)
     
@@ -2076,6 +2546,19 @@ def main():
         key="filter_forward_only",
         help="Keep only points in front of vehicle (x > 0). Enable for forward-facing camera datasets like KITTI.")
 
+    st.sidebar.markdown("### Clustering Algorithm")
+    algorithm_options = ['hdbscan', 'dbscan', 'optics', 'birch', 'agglomerative']
+    current_algorithm = st.session_state.params['pipeline'].get('clustering_algorithm', 'hdbscan')
+    if current_algorithm not in algorithm_options:
+        current_algorithm = 'hdbscan'
+        st.session_state.params['pipeline']['clustering_algorithm'] = current_algorithm
+    st.session_state.params['pipeline']['clustering_algorithm'] = st.sidebar.selectbox(
+        "Algorithm",
+        options=algorithm_options,
+        index=algorithm_options.index(current_algorithm),
+        key="pipeline_clustering_algorithm"
+    )
+
     # Load data button
     if st.sidebar.button("🔄 Load Sample", key="load_sample"):
         with st.spinner(f"Loading {dataset.upper()} sample {sample_index}..."):
@@ -2104,12 +2587,177 @@ def main():
                     st.success(f"✅ {dataset.upper()} sample {sample_index} loaded!")
                 st.rerun()
 
-    if st.sidebar.button("Estimate Depth", key="estimate_depth"):
+    # Depth estimation settings
+    st.sidebar.markdown("### Depth Estimation")
+    use_marigold = st.sidebar.checkbox(
+        "Use Marigold (better quality, slower)",
+        value=True,
+        key="use_marigold_checkbox",
+        help="Marigold provides metric depth. Falls back to Depth Anything if unavailable."
+    )
+    
+    # Marigold-DC parameters
+    with st.sidebar.expander("Marigold-DC Parameters", expanded=False):
+        st.session_state.params['marigold_dc'] = st.session_state.params.get('marigold_dc', {
+            'num_inference_steps': 50,
+            'ensemble_size': 1,
+            'processing_resolution': 768,
+            'seed': 2024,
+            'use_full_precision': False,
+            'use_tiny_vae': False
+        })
+        
+        st.session_state.params['marigold_dc']['num_inference_steps'] = st.slider(
+            "Inference Steps", min_value=10, max_value=100, 
+            value=st.session_state.params['marigold_dc']['num_inference_steps'],
+            step=5, key="dc_num_steps",
+            help="Number of denoising steps (more = better quality, slower)")
+        
+        st.session_state.params['marigold_dc']['ensemble_size'] = st.slider(
+            "Ensemble Size", min_value=1, max_value=4,
+            value=st.session_state.params['marigold_dc']['ensemble_size'],
+            step=1, key="dc_ensemble_size",
+            help="Number of predictions to ensemble (more = better quality, slower)")
+        
+        st.session_state.params['marigold_dc']['processing_resolution'] = st.slider(
+            "Processing Resolution", min_value=256, max_value=1024,
+            value=st.session_state.params['marigold_dc']['processing_resolution'],
+            step=64, key="dc_resolution",
+            help="Resolution for processing (higher = better quality, slower)")
+        
+        st.session_state.params['marigold_dc']['seed'] = st.number_input(
+            "Random Seed", min_value=0, max_value=9999,
+            value=st.session_state.params['marigold_dc']['seed'],
+            step=1, key="dc_seed",
+            help="Random seed for reproducibility")
+        
+        st.session_state.params['marigold_dc']['use_full_precision'] = st.checkbox(
+            "Use Full Precision (float32)",
+            value=st.session_state.params['marigold_dc']['use_full_precision'],
+            key="dc_full_precision",
+            help="Use float32 instead of float16/bf16 (slower but more accurate)")
+        
+        st.session_state.params['marigold_dc']['use_tiny_vae'] = st.checkbox(
+            "Use Tiny VAE",
+            value=st.session_state.params['marigold_dc']['use_tiny_vae'],
+            key="dc_tiny_vae",
+            help="Use lightweight VAE for faster processing (lower quality)")
+    
+    if st.sidebar.button("🔍 Estimate Depth", key="estimate_depth"):
         sample_data = st.session_state.get("sample_data")
         if not sample_data:
-            st.warning("Load a sample first to estimate depth.")
+            st.sidebar.warning("Load a sample first to estimate depth.")
         else:
-            pass
+            with st.spinner("Initializing depth estimation model..."):
+                # Initialize depth estimator if not already done or settings changed
+                dc_params = st.session_state.params.get('marigold_dc', {})
+                use_full_precision = dc_params.get('use_full_precision', False)
+                use_tiny_vae = dc_params.get('use_tiny_vae', False)
+                
+                # Initialize or update camera parameters
+                needs_init = st.session_state.depth_estimator is None
+                if needs_init:
+                    try:
+                        st.session_state.depth_estimator = DepthEstimator(
+                            use_marigold=use_marigold,
+                            use_full_precision=use_full_precision,
+                            use_tiny_vae=use_tiny_vae,
+                            camera_intrinsic=sample_data['camera_intrinsic'],
+                            camera_to_lidar_transform=sample_data['camera_to_lidar_transform']
+                        )
+                    except Exception as e:
+                        st.sidebar.error(f"Failed to initialize depth estimator: {str(e)}")
+                        st.sidebar.info("Try unchecking 'Use Marigold' to use Depth Anything instead.")
+                        st.stop()
+                else:
+                    # Update camera parameters if they changed
+                    st.session_state.depth_estimator.set_camera_params(
+                        camera_intrinsic=sample_data['camera_intrinsic'],
+                        camera_to_lidar_transform=sample_data['camera_to_lidar_transform']
+                    )
+                
+                # Load image
+                try:
+                    img = cv2.imread(sample_data['image_path'])
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    
+                    # Run depth estimation and reconstruction
+                    result = st.session_state.depth_estimator.estimate_depth_and_reconstruct(
+                        image=img_rgb,
+                        use_marigold=use_marigold,
+                        stride=2,  # Subsample to reduce point count
+                        depth_threshold_min=0.5,
+                        depth_threshold_max=80.0
+                    )
+                    
+                    # Store results
+                    st.session_state.depth_map = result['depth_map']
+                    st.session_state.reconstructed_points = result['points_lidar']
+                    
+                    st.sidebar.success(f"✅ Depth estimated! Reconstructed {len(result['points_lidar']):,} points")
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"Depth estimation failed: {str(e)}")
+                    import traceback
+                    st.sidebar.code(traceback.format_exc())
+    
+    # Depth completion button
+    st.sidebar.markdown("### Depth Completion")
+    if st.sidebar.button("🎯 Complete Depth", key="complete_depth"):
+        sample_data = st.session_state.get("sample_data")
+        if not sample_data:
+            st.sidebar.warning("Load a sample first.")
+        elif st.session_state.point_cloud is None:
+            st.sidebar.warning("Point cloud not available. Load a sample first.")
+        elif st.session_state.depth_estimator is None or st.session_state.depth_estimator.dc_pipe is None:
+            st.sidebar.warning("Marigold-DC pipeline not initialized. Please initialize depth estimator first.")
+        else:
+            with st.spinner("Creating sparse depth map and completing depth..."):
+                try:
+                    # Load image
+                    img = cv2.imread(sample_data['image_path'])
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    h, w = img_rgb.shape[:2]
+                    
+                    # Get point cloud
+                    point_cloud = st.session_state.point_cloud.point_cloud_plane_removed
+                    
+                    # Ensure camera parameters are set
+                    if st.session_state.depth_estimator.camera_intrinsic is None:
+                        st.session_state.depth_estimator.set_camera_params(
+                            camera_intrinsic=sample_data['camera_intrinsic'],
+                            camera_to_lidar_transform=sample_data['camera_to_lidar_transform']
+                        )
+                    
+                    # Create sparse depth map
+                    sparse_depth = st.session_state.depth_estimator.create_sparse_depth_map(
+                        point_cloud=point_cloud,
+                        image_shape=(h, w)
+                    )
+                    
+                    st.session_state.sparse_depth_map = sparse_depth
+                    
+                    # Get DC parameters
+                    dc_params = st.session_state.params.get('marigold_dc', {})
+                    
+                    # Complete depth
+                    completed_depth = st.session_state.depth_estimator.complete_depth(
+                        image=img_rgb,
+                        sparse_depth=sparse_depth,
+                        num_inference_steps=dc_params.get('num_inference_steps', 50),
+                        ensemble_size=dc_params.get('ensemble_size', 1),
+                        processing_resolution=dc_params.get('processing_resolution', 768),
+                        seed=dc_params.get('seed', 2024)
+                    )
+                    
+                    st.session_state.completed_depth_map = completed_depth
+                    st.sidebar.success(f"✅ Depth completed! Coverage: {100*np.sum(sparse_depth>0)/(h*w):.1f}% → 100%")
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"Depth completion failed: {str(e)}")
+                    import traceback
+                    st.sidebar.code(traceback.format_exc())
+    
     # Navigation tabs
     point_cloud = st.session_state.point_cloud
     if point_cloud is None:
@@ -2157,13 +2805,17 @@ def main():
         st.session_state.overlap_threshold = st.session_state.params['pipeline']['overlap_threshold']
         st.session_state.use_templates = st.session_state.params['pipeline']['use_templates']
     # Main navigation
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "SEGMENTATION AND PROJECTION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "SEGMENTATION AND PROJECTION", "DEPTH ESTIMATION", "DEPTH COMPLETION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
     ])
 
     with tab1:
         project_segmentation_mask_on_pointcloud_page(st.session_state.sample_data, points)
     with tab2:
+        depth_estimation_page()
+    with tab3:
+        depth_completion_page()
+    with tab4:
         cluster_tab1, cluster_tab2, cluster_tab3, cluster_tab4, cluster_tab5 = st.tabs([
             "HDBSCAN", "DBSCAN", "BIRCH", "Agglomerative", "OPTICS"
         ])
@@ -2177,9 +2829,9 @@ def main():
             agglomerative_page(point_cloud)
         with cluster_tab5:
             optics_page(point_cloud)
-    with tab3:
+    with tab5:
         kitti_groundtruth_page()
-    with tab4:
+    with tab6:
         statistics_page()
         
 

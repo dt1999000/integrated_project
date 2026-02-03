@@ -18,6 +18,13 @@ torch>=2.0.0
 torchvision>=0.15.0
 ultralytics>=8.0.0
 
+# Marigold depth estimation dependencies
+diffusers>=0.21.0
+accelerate>=0.20.0
+transformers>=4.30.0
+safetensors>=0.3.0
+pillow>=9.0.0
+
 # Optional clustering algorithms
 hdbscan>=0.8.29
 
