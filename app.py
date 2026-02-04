@@ -1,40 +1,11 @@
 import streamlit as st
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from visualization_helper import (
-    draw_2d_boxes_on_image,
-    draw_projected_cuboid_bboxes,
-    add_frustums_to_figure,
-    add_cuboids_to_figure,
-    create_3d_scatter_plot,
-    create_comparison_plot,
-)
-from frustum_manager import FrustumManager
-from evaluation import compute_3d_iou, run_pipeline_on_sample
-import time
 import sys
 import os
-from typing import Dict, List, Optional
-import pandas as pd
 import cv2
-from segmentation_detection import SegmentationDetector
-from bounding_boxes import BoundingBoxes
-from segmentation_detection import SegmentationToPointCloud
-from pointcloud_projection import Projection
 from depth_estimation import DepthEstimator
-import matplotlib.pyplot as plt
 # Add the current directory to the path to import our modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Import our pipeline components
-from kitti_dataset_loader import KITTIDatasetLoader
-from pointcloud_projection import PointCloud, Projection
-from clustering_manager import ClusteringManager
-from segmentation_detection import SegmentationDetector
-
-from pointcloud_projection import filter_points_in_frustum
-
 # Import page functions from pages module
 from pages.project_segmentation_mask_on_pointcloud import project_segmentation_mask_on_pointcloud_page
 from pages.dbscan import dbscan_page

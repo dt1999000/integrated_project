@@ -105,6 +105,9 @@ def cuboid_from_corners(corners, color="blue", opacity=0.2, name="cuboid"):
     )
     return cuboid
 
+def cuboid_kitti_format(center, yaw, length, width, height, color="blue", opacity=0.2, name="cuboid"):
+    cuboid = go.Mesh3d()
+    return cuboid
 
 def frustum_from_camera_and_corners(camera_origin: np.ndarray,
                                      base_corners: np.ndarray,

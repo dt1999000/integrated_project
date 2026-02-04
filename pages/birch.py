@@ -4,23 +4,12 @@ Page module - extracted from app.py
 import streamlit as st
 import numpy as np
 import pandas as pd
-import cv2
 import time
-import matplotlib.pyplot as plt
-from typing import Dict, List, Optional
 
-from visualization_helper import (
-    draw_2d_boxes_on_image,
-    draw_projected_cuboid_bboxes,
-    add_frustums_to_figure,
-    add_cuboids_to_figure,
-    create_3d_scatter_plot,
-    create_comparison_plot,
-)
+from visualization_helper import create_3d_scatter_plot
+
 from frustum_manager import FrustumManager
-from evaluation import compute_3d_iou, run_pipeline_on_sample
 from clustering_manager import ClusteringManager
-from pointcloud_projection import filter_points_in_frustum
 
 def birch_page(point_cloud):
     """BIRCH algorithm parameter control and visualization page"""
