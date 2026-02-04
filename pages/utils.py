@@ -64,3 +64,4 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3,
 
     return sample_data, point_cloud
 
+
