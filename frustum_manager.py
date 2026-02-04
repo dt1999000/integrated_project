@@ -241,7 +241,10 @@ class FrustumManager:
         overlap_threshold: float = 0.7,
         use_templates: bool = True,
         clustering_params: Optional[Dict[str, Dict]] = None,
-        ground_plane_model: Optional[np.ndarray] = None
+        ground_plane_model: Optional[np.ndarray] = None,
+        use_pose_estimation: bool = False,
+        pose_estimation_method: str = 'pca',
+        template_dims: Optional[Dict[str, Dict[str, float]]] = None
     ) -> Tuple[List[Dict], List[FrustumClusterResult]]:
         """
         Run clustering on points inside each frustum and generate cuboids.
@@ -262,10 +265,14 @@ class FrustumManager:
                               These override the default ClusteringManager params.
             ground_plane_model: Optional [a, b, c, d] plane equation from RANSAC.
                                Used to compute ground z for template cuboids.
+            use_pose_estimation: If True, use pose estimation (PCA or L-shape) instead of templates
+            pose_estimation_method: 'pca' or 'l_shape' - method for pose estimation
+            template_dims: Optional dict mapping category to {'length', 'width', 'height'}.
+                          Used when use_pose_estimation=True to get dimensions.
 
         Returns:
             Tuple of:
-                - cuboids: List of cuboid dicts with category info
+                - cuboids: List of cuboid dicts with category info (KITTI format if use_pose_estimation=True)
                 - results: List of FrustumClusterResult objects
         """
         all_cuboids = []
@@ -325,46 +332,100 @@ class FrustumManager:
                         frustum.bbox_2d,
                         overlap_threshold
                     )
-                    if selected and use_templates:
-                        # Create template cuboid for the selected cluster
+                    if selected:
                         cluster_label = selected.get('label', -1)
                         if cluster_label >= 0:
                             cluster_points = points_in_frustum[labels == cluster_label]
-
-                            # Compute ground_z at cluster centroid using plane model
-                            ground_z = None
-                            if ground_plane_model is not None:
-                                a, b, c, d = ground_plane_model
-                                if abs(c) > 1e-6:
-                                    center_x = np.mean(cluster_points[:, 0])
-                                    center_y = np.mean(cluster_points[:, 1])
-                                    ground_z = -(a * center_x + b * center_y + d) / c
-
-                            template_cuboid = cluster_manager.generate_cuboid_from_template(
-                                cluster_points, frustum.category, cluster_label, ground_z=ground_z
-                            )
-                            if template_cuboid:
-                                template_cuboid['category'] = frustum.category
-                                template_cuboid['source_bbox_idx'] = frustum.idx
-                                template_cuboid['selected_points'] = selected.get('selected_points')
-                                template_cuboid['selected_labels'] = selected.get('selected_labels')
-
-                                # Project template cuboid back to 2D and recalculate IoU
-                                template_projected = self.projection.cuboid_to_2d(template_cuboid)
-                                if template_projected is not None:
-                                    template_bbox_2d = template_projected['bbox_2d']
-                                    template_iou = compute_bbox_iou(template_bbox_2d, frustum.bbox_2d)
-                                    template_cuboid['projected_bbox_2d'] = template_bbox_2d
-                                    template_cuboid['iou'] = template_iou
-                                    template_cuboid['need_review'] = template_iou < overlap_threshold
-                                    print(f"template cuboid: iou={template_iou:.3f}, need_review={template_cuboid['need_review']}")
+                            
+                            if use_pose_estimation:
+                                # Use pose estimation instead of templates
+                                from pose_estimation import estimate_pose_pca, estimate_pose_l_shape, cuboid_from_pose
+                                
+                                # Compute ground_z at cluster centroid using plane model
+                                ground_z = None
+                                if ground_plane_model is not None:
+                                    a, b, c, d = ground_plane_model
+                                    if abs(c) > 1e-6:
+                                        center_x = np.mean(cluster_points[:, 0])
+                                        center_y = np.mean(cluster_points[:, 1])
+                                        ground_z = -(a * center_x + b * center_y + d) / c
+                                
+                                # Estimate pose
+                                if pose_estimation_method == 'pca':
+                                    pose_result = estimate_pose_pca(cluster_points)
+                                elif pose_estimation_method == 'l_shape':
+                                    pose_result = estimate_pose_l_shape(cluster_points, ground_plane_model=ground_plane_model)
                                 else:
-                                    # Template cuboid is behind camera, use axis-aligned values
-                                    template_cuboid['projected_bbox_2d'] = selected.get('projected_bbox_2d')
-                                    template_cuboid['iou'] = selected.get('iou')
-                                    template_cuboid['need_review'] = True
+                                    raise ValueError(f"Unknown pose estimation method: {pose_estimation_method}")
+                                
+                                # Get template dimensions for this category if available
+                                category_template = template_dims.get(frustum.category) if template_dims else None
+                                
+                                # Create KITTI-format cuboid from pose
+                                pose_cuboid = cuboid_from_pose(
+                                    pose_result,
+                                    category=frustum.category,
+                                    template_dims=category_template,
+                                    ground_z=ground_z
+                                )
+                                pose_cuboid['source_bbox_idx'] = frustum.idx
+                                pose_cuboid['selected_points'] = cluster_points
+                                pose_cuboid['selected_labels'] = labels[labels == cluster_label]
+                                
+                                # Project pose cuboid back to 2D and calculate IoU
+                                pose_projected = self.projection.cuboid_to_2d(pose_cuboid)
+                                if pose_projected is not None:
+                                    pose_bbox_2d = pose_projected['bbox_2d']
+                                    pose_iou = compute_bbox_iou(pose_bbox_2d, frustum.bbox_2d)
+                                    pose_cuboid['projected_bbox_2d'] = pose_bbox_2d
+                                    pose_cuboid['iou'] = pose_iou
+                                    pose_cuboid['need_review'] = pose_iou < overlap_threshold
+                                    print(f"pose cuboid ({pose_estimation_method}): iou={pose_iou:.3f}, need_review={pose_cuboid['need_review']}")
+                                else:
+                                    # Pose cuboid is behind camera
+                                    pose_cuboid['projected_bbox_2d'] = selected.get('projected_bbox_2d')
+                                    pose_cuboid['iou'] = selected.get('iou', 0)
+                                    pose_cuboid['need_review'] = True
+                                
+                                cuboid = pose_cuboid
+                            elif use_templates:
+                                # Create template cuboid for the selected cluster
+                                # Compute ground_z at cluster centroid using plane model
+                                ground_z = None
+                                if ground_plane_model is not None:
+                                    a, b, c, d = ground_plane_model
+                                    if abs(c) > 1e-6:
+                                        center_x = np.mean(cluster_points[:, 0])
+                                        center_y = np.mean(cluster_points[:, 1])
+                                        ground_z = -(a * center_x + b * center_y + d) / c
 
-                                cuboid = template_cuboid
+                                template_cuboid = cluster_manager.generate_cuboid_from_template(
+                                    cluster_points, frustum.category, cluster_label, ground_z=ground_z
+                                )
+                                if template_cuboid:
+                                    template_cuboid['category'] = frustum.category
+                                    template_cuboid['source_bbox_idx'] = frustum.idx
+                                    template_cuboid['selected_points'] = selected.get('selected_points')
+                                    template_cuboid['selected_labels'] = selected.get('selected_labels')
+
+                                    # Project template cuboid back to 2D and recalculate IoU
+                                    template_projected = self.projection.cuboid_to_2d(template_cuboid)
+                                    if template_projected is not None:
+                                        template_bbox_2d = template_projected['bbox_2d']
+                                        template_iou = compute_bbox_iou(template_bbox_2d, frustum.bbox_2d)
+                                        template_cuboid['projected_bbox_2d'] = template_bbox_2d
+                                        template_cuboid['iou'] = template_iou
+                                        template_cuboid['need_review'] = template_iou < overlap_threshold
+                                        print(f"template cuboid: iou={template_iou:.3f}, need_review={template_cuboid['need_review']}")
+                                    else:
+                                        # Template cuboid is behind camera, use axis-aligned values
+                                        template_cuboid['projected_bbox_2d'] = selected.get('projected_bbox_2d')
+                                        template_cuboid['iou'] = selected.get('iou')
+                                        template_cuboid['need_review'] = True
+
+                                    cuboid = template_cuboid
+                                else:
+                                    cuboid = selected
                             else:
                                 cuboid = selected
                         else:

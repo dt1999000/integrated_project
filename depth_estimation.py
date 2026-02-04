@@ -465,8 +465,7 @@ class DepthEstimator:
                                       depth_threshold_min: float = 0.1,
                                       depth_threshold_max: float = 100.0,
                                       stride: int = 1,
-                                      lidar_point_cloud: np.ndarray = None,
-                                      use_sparse_depth_prior: bool = True,
+                                      sparse_depth: np.array = None,
                                       num_inference_steps: int = 50,
                                       ensemble_size: int = 1,
                                       processing_resolution: int = 768,
@@ -509,22 +508,16 @@ class DepthEstimator:
         print("DEPTH ESTIMATION AND 3D RECONSTRUCTION PIPELINE")
         print("="*60)
         
-        # Determine if we should use sparse depth prior
-        use_prior = use_sparse_depth_prior and lidar_point_cloud is not None and self.dc_pipe is not None
-        
-        if use_prior:
-            print("\n[Step 1/3] Creating sparse depth map from LiDAR points...")
-            h, w = image.shape[:2]
-            sparse_depth = self.create_sparse_depth_map(
-                point_cloud=lidar_point_cloud,
-                image_shape=(h, w)
-            )
-            
+        use_prior = sparse_depth is not None 
+        h, w = image.shape[:2]
+        if (h, w) != sparse_depth.shape:
+            print(f"Warning: Sparse depth shape {sparse_depth.shape} does not match image shape {h,w}. Falling back to regular Marigold.")
+        if use_prior:            
             # Check if we have enough sparse points to be useful
             n_sparse_points = np.sum(sparse_depth > 0)
             coverage = 100 * n_sparse_points / (h * w)
             
-            if coverage < 0.1:  # Less than 0.1% coverage
+            if coverage < 0.1:
                 print(f"Warning: Sparse depth coverage is very low ({coverage:.2f}%). Falling back to regular Marigold.")
                 use_prior = False
             else:
@@ -541,14 +534,7 @@ class DepthEstimator:
                     seed=seed
                 )
         else:
-            if lidar_point_cloud is not None and not use_sparse_depth_prior:
-                print("\n[Step 1/2] Estimating depth map (without sparse depth prior)...")
-            elif lidar_point_cloud is None:
-                print("\n[Step 1/2] Estimating depth map (no LiDAR points provided)...")
-            else:
-                print("\n[Step 1/2] Estimating depth map...")
-            
-            # Use regular Marigold depth estimation
+            print("Estimating depth map (without sparse depth prior)...")
             depth_map = self.get_depth_map_marigold(image)
             sparse_depth = None
             

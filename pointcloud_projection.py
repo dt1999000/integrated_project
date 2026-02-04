@@ -463,8 +463,11 @@ class Projection:
         Project a 3D cuboid to 2D bounding box and projected corners.
 
         Args:
-            cuboid: Dict with either 'corners' (8x3) or min/max bounds
-                    (min_x, max_x, min_y, max_y, min_z, max_z)
+            cuboid: Dict with one of:
+                    - 'corners' (8x3) - 8 corner points
+                    - min/max bounds: 'min_x', 'max_x', 'min_y', 'max_y', 'min_z', 'max_z'
+                    - KITTI format: 'center' (3,), 'yaw' (float), 'length', 'width', 'height'
+                      (if 'format' == 'kitti' or all KITTI keys are present)
 
         Returns:
             Dict with:
@@ -477,6 +480,44 @@ class Projection:
         # Get 8 corners of cuboid
         if 'corners' in cuboid and cuboid['corners'] is not None:
             corners_3d = np.array(cuboid['corners'])
+        elif cuboid.get('format') == 'kitti' or ('center' in cuboid and 'yaw' in cuboid and 
+                                                   'length' in cuboid and 'width' in cuboid and 'height' in cuboid):
+            # KITTI format: center, yaw, length, width, height
+            center = np.asarray(cuboid['center']).flatten()
+            yaw = cuboid['yaw']
+            length = cuboid['length']
+            width = cuboid['width']
+            height = cuboid['height']
+            
+            # Half-dimensions
+            l_half = length / 2.0
+            w_half = width / 2.0
+            h_half = height / 2.0
+            
+            # Create 8 corners in local coordinate system (centered at origin, axis-aligned)
+            corners_local = np.array([
+                [-l_half, -w_half, -h_half],  # 0: bottom front-left
+                [ l_half, -w_half, -h_half],  # 1: bottom front-right
+                [ l_half,  w_half, -h_half],  # 2: bottom back-right
+                [-l_half,  w_half, -h_half],  # 3: bottom back-left
+                [-l_half, -w_half,  h_half],  # 4: top front-left
+                [ l_half, -w_half,  h_half],  # 5: top front-right
+                [ l_half,  w_half,  h_half],  # 6: top back-right
+                [-l_half,  w_half,  h_half],  # 7: top back-left
+            ])
+            
+            # Rotation matrix around Z-axis (yaw)
+            cos_yaw = np.cos(yaw)
+            sin_yaw = np.sin(yaw)
+            R_z = np.array([
+                [cos_yaw, -sin_yaw, 0],
+                [sin_yaw,  cos_yaw, 0],
+                [0,        0,       1]
+            ])
+            
+            # Rotate corners and translate to center
+            corners_rotated = (R_z @ corners_local.T).T
+            corners_3d = corners_rotated + center
         else:
             # Build corners from min/max bounds
             min_x, max_x = cuboid['min_x'], cuboid['max_x']

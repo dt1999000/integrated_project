@@ -106,8 +106,60 @@ def cuboid_from_corners(corners, color="blue", opacity=0.2, name="cuboid"):
     return cuboid
 
 def cuboid_kitti_format(center, yaw, length, width, height, color="blue", opacity=0.2, name="cuboid"):
-    cuboid = go.Mesh3d()
-    return cuboid
+    """
+    Create a 3D cuboid mesh from KITTI format parameters (center, yaw, dimensions).
+    
+    Args:
+        center: np.ndarray (3,) - Center position [x, y, z] in LiDAR coordinates
+        yaw: float - Rotation angle around Z-axis (in radians)
+        length: float - Length of cuboid along X-axis (forward direction)
+        width: float - Width of cuboid along Y-axis (lateral direction)
+        height: float - Height of cuboid along Z-axis (vertical direction)
+        color: Color of the cuboid
+        opacity: Opacity of the cuboid (0.0 to 1.0)
+        name: Name for the mesh trace
+    
+    Returns:
+        go.Mesh3d: Plotly Mesh3d object representing the cuboid
+    """
+    center = np.asarray(center).flatten()
+    if center.shape != (3,):
+        raise ValueError(f"Expected center shape (3,), got {center.shape}")
+    
+    # Half-dimensions
+    l_half = length / 2.0
+    w_half = width / 2.0
+    h_half = height / 2.0
+    
+    # Create 8 corners in local coordinate system (centered at origin, axis-aligned)
+    # Order: bottom face first (z=-h_half), then top face (z=+h_half)
+    # Each face: front-left, front-right, back-right, back-left
+    corners_local = np.array([
+        [-l_half, -w_half, -h_half],  # 0: bottom front-left
+        [ l_half, -w_half, -h_half],  # 1: bottom front-right
+        [ l_half,  w_half, -h_half],  # 2: bottom back-right
+        [-l_half,  w_half, -h_half],  # 3: bottom back-left
+        [-l_half, -w_half,  h_half],  # 4: top front-left
+        [ l_half, -w_half,  h_half],  # 5: top front-right
+        [ l_half,  w_half,  h_half],  # 6: top back-right
+        [-l_half,  w_half,  h_half],  # 7: top back-left
+    ])
+    
+    # Rotation matrix around Z-axis (yaw)
+    cos_yaw = np.cos(yaw)
+    sin_yaw = np.sin(yaw)
+    R_z = np.array([
+        [cos_yaw, -sin_yaw, 0],
+        [sin_yaw,  cos_yaw, 0],
+        [0,        0,       1]
+    ])
+    
+    # Rotate corners and translate to center
+    corners_rotated = (R_z @ corners_local.T).T
+    corners = corners_rotated + center
+    
+    # Use cuboid_from_corners to create the mesh
+    return cuboid_from_corners(corners, color=color, opacity=opacity, name=name)
 
 def frustum_from_camera_and_corners(camera_origin: np.ndarray,
                                      base_corners: np.ndarray,
@@ -434,6 +486,20 @@ def add_cuboids_to_figure(fig: go.Figure, cuboids: List[Dict],
                 opacity=opacity,
                 name=cuboid_name
             ))
+        elif cuboid.get('format') == 'kitti' or ('center' in cuboid and 'yaw' in cuboid and 
+                                                  'length' in cuboid and 'width' in cuboid and 'height' in cuboid):
+            # KITTI format: use cuboid_kitti_format
+            mesh = cuboid_kitti_format(
+                center=cuboid['center'],
+                yaw=cuboid['yaw'],
+                length=cuboid['length'],
+                width=cuboid['width'],
+                height=cuboid['height'],
+                color=color,
+                opacity=opacity,
+                name=cuboid_name
+            )
+            fig.add_trace(mesh)
         else:
             # Fallback to min/max format
             mesh = cuboid_from_minmax(

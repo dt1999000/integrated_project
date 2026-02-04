@@ -1,5 +1,6 @@
 """
 Page module - extracted from app.py
+Combines depth estimation and depth completion functionality.
 """
 import streamlit as st
 import numpy as np
@@ -7,16 +8,10 @@ import pandas as pd
 import cv2
 import time
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from typing import Dict, List, Optional
 
-from visualization_helper import (
-    draw_2d_boxes_on_image,
-    draw_projected_cuboid_bboxes,
-    add_frustums_to_figure,
-    add_cuboids_to_figure,
-    create_3d_scatter_plot,
-    create_comparison_plot,
-)
+from visualization_helper import create_3d_scatter_plot
 from frustum_manager import FrustumManager
 from evaluation import compute_3d_iou, run_pipeline_on_sample
 from clustering_manager import ClusteringManager
@@ -107,7 +102,15 @@ def depth_estimation_page():
     
     # Display depth map visualization
     st.subheader("🗺️ Depth Map Visualization")
-    col1, col2 = st.columns(2)
+    
+    # Show sparse depth map if available
+    show_sparse = st.session_state.get('sparse_depth_map') is not None
+    if show_sparse:
+        col1, col2, col3 = st.columns(3)
+        sparse_depth = st.session_state.sparse_depth_map
+    else:
+        col1, col2 = st.columns(2)
+        sparse_depth = None
     
     with col1:
         st.markdown("**Original Image**")
@@ -115,16 +118,106 @@ def depth_estimation_page():
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         st.image(img_rgb, use_container_width=True)
     
-    with col2:
-        st.markdown("**Estimated Depth Map**")
-        # Create colorized depth map
-        fig, ax = plt.subplots(figsize=(10, 6))
-        im = ax.imshow(depth_map, cmap='viridis')
-        ax.set_title("Depth Map (meters)")
-        ax.axis('off')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        st.pyplot(fig)
-        plt.close()
+    if show_sparse:
+        with col2:
+            st.markdown("**Sparse Depth Map**")
+            fig_sparse, ax_sparse = plt.subplots(figsize=(8, 6))
+            completed_depth = st.session_state.get('completed_depth_map', depth_map)
+            im_sparse = ax_sparse.imshow(sparse_depth, cmap='viridis', vmin=0, vmax=completed_depth.max())
+            ax_sparse.set_title("Sparse Depth (from LiDAR)")
+            ax_sparse.axis('off')
+            plt.colorbar(im_sparse, ax=ax_sparse, fraction=0.046, pad=0.04, label="Depth (m)")
+            st.pyplot(fig_sparse)
+            plt.close()
+        
+        with col3:
+            # Show completed depth if available, otherwise show estimated depth
+            if st.session_state.get('completed_depth_map') is not None:
+                st.markdown("**Completed Depth Map**")
+                completed_depth = st.session_state.completed_depth_map
+                fig, ax = plt.subplots(figsize=(8, 6))
+                im = ax.imshow(completed_depth, cmap='viridis', vmin=0, vmax=completed_depth.max())
+                ax.set_title("Completed Depth (Marigold-DC)")
+                ax.axis('off')
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Depth (m)")
+            else:
+                st.markdown("**Estimated Depth Map**")
+                fig, ax = plt.subplots(figsize=(8, 6))
+                im = ax.imshow(depth_map, cmap='viridis')
+                ax.set_title("Depth Map (meters)")
+                ax.axis('off')
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            st.pyplot(fig)
+            plt.close()
+    else:
+        with col2:
+            st.markdown("**Estimated Depth Map**")
+            # Create colorized depth map
+            fig, ax = plt.subplots(figsize=(10, 6))
+            im = ax.imshow(depth_map, cmap='viridis')
+            ax.set_title("Depth Map (meters)")
+            ax.axis('off')
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            st.pyplot(fig)
+            plt.close()
+    
+    # Show depth completion section if completed depth is available
+    if st.session_state.get('completed_depth_map') is not None:
+        st.subheader("🎯 Depth Completion Results")
+        completed_depth = st.session_state.completed_depth_map
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("**Sparse Depth Map**")
+            fig_sparse, ax_sparse = plt.subplots(figsize=(8, 6))
+            sparse_d = st.session_state.sparse_depth_map if st.session_state.get('sparse_depth_map') is not None else np.zeros_like(completed_depth)
+            im_sparse = ax_sparse.imshow(sparse_d, cmap='viridis', vmin=0, vmax=completed_depth.max())
+            ax_sparse.set_title("Sparse Depth (from LiDAR)")
+            ax_sparse.axis('off')
+            plt.colorbar(im_sparse, ax=ax_sparse, fraction=0.046, pad=0.04, label="Depth (m)")
+            st.pyplot(fig_sparse)
+            plt.close()
+        
+        with col2:
+            st.markdown("**Completed Depth Map**")
+            fig_completed, ax_completed = plt.subplots(figsize=(8, 6))
+            im_completed = ax_completed.imshow(completed_depth, cmap='viridis', vmin=0, vmax=completed_depth.max())
+            ax_completed.set_title("Completed Depth (Marigold-DC)")
+            ax_completed.axis('off')
+            plt.colorbar(im_completed, ax=ax_completed, fraction=0.046, pad=0.04, label="Depth (m)")
+            st.pyplot(fig_completed)
+            plt.close()
+        
+        with col3:
+            st.markdown("**Comparison**")
+            fig_overlay, ax_overlay = plt.subplots(figsize=(8, 6))
+            ax_overlay.imshow(img_rgb)
+            overlay = ax_overlay.imshow(completed_depth, cmap='viridis', alpha=0.6, vmin=0, vmax=completed_depth.max())
+            ax_overlay.set_title("Completed Depth Overlay")
+            ax_overlay.axis('off')
+            plt.colorbar(overlay, ax=ax_overlay, fraction=0.046, pad=0.04, label="Depth (m)")
+            st.pyplot(fig_overlay)
+            plt.close()
+        
+        # Depth completion statistics
+        if sparse_d is not None and np.sum(sparse_d > 0) > 0:
+            sparse_mask = sparse_d > 0
+            sparse_values = sparse_d[sparse_mask]
+            completed_values_at_sparse = completed_depth[sparse_mask]
+            
+            depth_diff = completed_values_at_sparse - sparse_values
+            depth_diff_pct = 100 * depth_diff / (sparse_values + 1e-6)
+            
+            st.subheader("🔍 Depth Completion Analysis")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Mean Absolute Error", f"{np.mean(np.abs(depth_diff)):.3f}m")
+            with col2:
+                st.metric("Mean Relative Error", f"{np.mean(np.abs(depth_diff_pct)):.2f}%")
+            with col3:
+                st.metric("RMSE", f"{np.sqrt(np.mean(depth_diff**2)):.3f}m")
+            with col4:
+                st.metric("Max Error", f"{np.max(np.abs(depth_diff)):.3f}m")
     
     # 3D Visualization of reconstructed points
     st.subheader("🎯 3D Reconstructed Point Cloud")

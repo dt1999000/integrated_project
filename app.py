@@ -16,7 +16,6 @@ from pages.hdbscan import hdbscan_page
 from pages.kitti_groundtruth import kitti_groundtruth_page
 from pages.statistics import statistics_page
 from pages.depth_estimation import depth_estimation_page
-from pages.depth_completion import depth_completion_page
 from pages.utils import load_dataset_sample
 
 # Configure Streamlit page
@@ -259,6 +258,22 @@ def main():
         help="Marigold provides metric depth. Falls back to Depth Anything if unavailable."
     )
     
+    # Pose estimation parameters
+    st.sidebar.markdown("### Pose Estimation")
+    pose_estimation_method = st.sidebar.selectbox(
+        "Pose Estimation Method",
+        options=['pca', 'l_shape'],
+        index=0,
+        key="pose_estimation_method",
+        help="PCA: Fast, works well for dense point clouds. L-Shape: Robust to partial views, slower."
+    )
+    use_pose_estimation = st.sidebar.checkbox(
+        "Use Pose Estimation",
+        value=False,
+        key="use_pose_estimation_checkbox",
+        help="Use pose estimation (PCA/L-Shape) instead of template cuboids for better orientation"
+    )
+    
     # Marigold-DC parameters
     with st.sidebar.expander("Marigold-DC Parameters", expanded=False):
         st.session_state.params['marigold_dc'] = st.session_state.params.get('marigold_dc', {
@@ -345,106 +360,92 @@ def main():
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                     
                     # Get LiDAR point cloud if available for sparse depth prior
-                    lidar_points = None
+                    # Use original point cloud (before ground removal) for sparse depth map
+                    h, w = img_rgb.shape[:2]
+                    
                     if st.session_state.point_cloud is not None:
-                        lidar_points = st.session_state.point_cloud.point_cloud_plane_removed
-                        print(f"Using {len(lidar_points):,} LiDAR points as sparse depth prior")
+                        # Use original point cloud for sparse depth creation
+                        lidar_points_original = st.session_state.point_cloud.original_point_cloud
+                        print(f"Using {len(lidar_points_original):,} original LiDAR points for sparse depth map")
+                        
+                        # Create sparse depth map from original point cloud
+                        sparse_depth = st.session_state.depth_estimator.create_sparse_depth_map(
+                            point_cloud=lidar_points_original,
+                            image_shape=(h, w)
+                        )
+                        st.session_state.sparse_depth_map = sparse_depth
+                        print(f"Created sparse depth map: {np.sum(sparse_depth > 0):,} valid depth points")
+                        
+                        # Get DC parameters
+                        dc_params = st.session_state.params.get('marigold_dc', {})
+                        
+                        # Complete depth using Marigold-DC
+                        print("Running depth completion with Marigold-DC...")
+                        completed_depth = st.session_state.depth_estimator.complete_depth(
+                            image=img_rgb,
+                            sparse_depth=sparse_depth,
+                            num_inference_steps=dc_params.get('num_inference_steps', 50),
+                            ensemble_size=dc_params.get('ensemble_size', 1),
+                            processing_resolution=dc_params.get('processing_resolution', 768),
+                            seed=dc_params.get('seed', 2024)
+                        )
+                        st.session_state.completed_depth_map = completed_depth
+                        st.session_state.depth_map = completed_depth
+                        
+                        # Reconstruct 3D points from completed depth
+                        print("Reconstructing 3D points from completed depth...")
+                        reconstructed_points = st.session_state.depth_estimator.reconstruct_points_from_depth(
+                            depth_map=completed_depth,
+                            stride=2,  # Subsample to reduce point count
+                            depth_threshold_min=0.5,
+                            depth_threshold_max=80.0
+                        )
+                        st.session_state.reconstructed_points = reconstructed_points
+                        print(f"Reconstructed {len(reconstructed_points):,} points from completed depth")
+                        
+                        # Add reconstructed points to original point cloud
+                        print(f"Adding {len(reconstructed_points):,} reconstructed points to original point cloud...")
+                        st.session_state.point_cloud.original_point_cloud = np.vstack([
+                            st.session_state.point_cloud.original_point_cloud,
+                            reconstructed_points
+                        ])
+                        print(f"Combined point cloud now has {len(st.session_state.point_cloud.original_point_cloud):,} points")
+                        
+                        # Re-run ground plane removal on combined point cloud
+                        print("Re-running ground plane removal on combined point cloud...")
+                        st.session_state.point_cloud.remove_ground_plane_ransac(
+                            distance_threshold=st.session_state.params['pipeline']['distance_threshold'],
+                            ransac_n=st.session_state.params['pipeline']['ransac_n'],
+                            num_iterations=st.session_state.params['pipeline']['num_iterations'],
+                            filter_forward_only=st.session_state.params['pipeline']['filter_forward_only']
+                        )
+                        
+                        # Update ground_z in session state
+                        ground_z = st.session_state.point_cloud.get_ground_z(x=0.0, y=0.0)
+                        st.session_state.ground_z = ground_z
+                        st.session_state.ground_plane_model = st.session_state.point_cloud.ground_plane_model
+                        
+                        n_sparse = np.sum(sparse_depth > 0)
+                        coverage = 100 * n_sparse / (h * w)
+                        st.sidebar.success(f"✅ Depth completed and reconstructed! Coverage: {coverage:.1f}% → 100%. Added {len(reconstructed_points):,} points to point cloud.")
+                    else:
+                        # No point cloud available, use regular depth estimation
+                        depth_map = st.session_state.depth_estimator.get_depth_map_marigold(img_rgb)
+                        st.session_state.depth_map = depth_map
+                        reconstructed_points = st.session_state.depth_estimator.reconstruct_points_from_depth(
+                            depth_map=depth_map,
+                            stride=2,
+                            depth_threshold_min=0.5,
+                            depth_threshold_max=80.0
+                        )
+                        st.session_state.reconstructed_points = reconstructed_points
+                        st.sidebar.success(f"✅ Depth estimated! Reconstructed {len(reconstructed_points):,} points")
                     
-                    # Get DC parameters for sparse depth prior
-                    dc_params = st.session_state.params.get('marigold_dc', {})
-                    
-                    # Run depth estimation and reconstruction with optional sparse depth prior
-                    result = st.session_state.depth_estimator.estimate_depth_and_reconstruct(
-                        image=img_rgb,
-                        use_marigold=use_marigold,
-                        stride=2,  # Subsample to reduce point count
-                        depth_threshold_min=0.5,
-                        depth_threshold_max=80.0,
-                        lidar_point_cloud=lidar_points,
-                        use_sparse_depth_prior=True,  # Use sparse depth prior if LiDAR available
-                        num_inference_steps=dc_params.get('num_inference_steps', 50),
-                        ensemble_size=dc_params.get('ensemble_size', 1),
-                        processing_resolution=dc_params.get('processing_resolution', 768),
-                        seed=dc_params.get('seed', 2024)
-                    )
-                    
-                    # Store results
-                    st.session_state.depth_map = result['depth_map']
-                    st.session_state.reconstructed_points = result['points_lidar']
-                    
-                    # Store sparse depth if it was used
-                    if 'sparse_depth' in result:
-                        st.session_state.sparse_depth_map = result['sparse_depth']
-                    
-                    prior_info = ""
-                    if result.get('used_sparse_prior', False):
-                        n_sparse = np.sum(result['sparse_depth'] > 0)
-                        prior_info = f" (with {n_sparse:,} sparse depth points as prior)"
-                    
-                    st.sidebar.success(f"✅ Depth estimated{prior_info}! Reconstructed {len(result['points_lidar']):,} points")
                     st.rerun()
                 except Exception as e:
                     st.sidebar.error(f"Depth estimation failed: {str(e)}")
                     import traceback
                     st.sidebar.code(traceback.format_exc())
-    
-    # Depth completion button
-    st.sidebar.markdown("### Depth Completion")
-    if st.sidebar.button("🎯 Complete Depth", key="complete_depth"):
-        sample_data = st.session_state.get("sample_data")
-        if not sample_data:
-            st.sidebar.warning("Load a sample first.")
-        elif st.session_state.point_cloud is None:
-            st.sidebar.warning("Point cloud not available. Load a sample first.")
-        elif st.session_state.depth_estimator is None or st.session_state.depth_estimator.dc_pipe is None:
-            st.sidebar.warning("Marigold-DC pipeline not initialized. Please initialize depth estimator first.")
-        else:
-            with st.spinner("Creating sparse depth map and completing depth..."):
-                try:
-                    # Load image
-                    img = cv2.imread(sample_data['image_path'])
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    h, w = img_rgb.shape[:2]
-                    
-                    # Get point cloud
-                    point_cloud = st.session_state.point_cloud.point_cloud_plane_removed
-                    
-                    # Ensure camera parameters are set
-                    if st.session_state.depth_estimator.camera_intrinsic is None:
-                        st.session_state.depth_estimator.set_camera_params(
-                            camera_intrinsic=sample_data['camera_intrinsic'],
-                            camera_to_lidar_transform=sample_data['camera_to_lidar_transform']
-                        )
-                    
-                    # Create sparse depth map
-                    sparse_depth = st.session_state.depth_estimator.create_sparse_depth_map(
-                        point_cloud=point_cloud,
-                        image_shape=(h, w)
-                    )
-                    
-                    st.session_state.sparse_depth_map = sparse_depth
-                    
-                    # Get DC parameters
-                    dc_params = st.session_state.params.get('marigold_dc', {})
-                    
-                    # Complete depth
-                    completed_depth = st.session_state.depth_estimator.complete_depth(
-                        image=img_rgb,
-                        sparse_depth=sparse_depth,
-                        num_inference_steps=dc_params.get('num_inference_steps', 50),
-                        ensemble_size=dc_params.get('ensemble_size', 1),
-                        processing_resolution=dc_params.get('processing_resolution', 768),
-                        seed=dc_params.get('seed', 2024)
-                    )
-                    
-                    st.session_state.completed_depth_map = completed_depth
-                    st.sidebar.success(f"✅ Depth completed! Coverage: {100*np.sum(sparse_depth>0)/(h*w):.1f}% → 100%")
-                    st.rerun()
-                except Exception as e:
-                    st.sidebar.error(f"Depth completion failed: {str(e)}")
-                    import traceback
-                    st.sidebar.code(traceback.format_exc())
-    
     # Navigation tabs
     point_cloud = st.session_state.point_cloud
     if point_cloud is None:
@@ -492,8 +493,8 @@ def main():
         st.session_state.overlap_threshold = st.session_state.params['pipeline']['overlap_threshold']
         st.session_state.use_templates = st.session_state.params['pipeline']['use_templates']
     # Main navigation
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "SEGMENTATION AND PROJECTION", "DEPTH ESTIMATION", "DEPTH COMPLETION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "SEGMENTATION AND PROJECTION", "DEPTH ESTIMATION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
     ])
 
     with tab1:
@@ -501,8 +502,6 @@ def main():
     with tab2:
         depth_estimation_page()
     with tab3:
-        depth_completion_page()
-    with tab4:
         cluster_tab1, cluster_tab2, cluster_tab3, cluster_tab4, cluster_tab5 = st.tabs([
             "HDBSCAN", "DBSCAN", "BIRCH", "Agglomerative", "OPTICS"
         ])
@@ -516,9 +515,9 @@ def main():
             agglomerative_page(point_cloud)
         with cluster_tab5:
             optics_page(point_cloud)
-    with tab5:
+    with tab4:
         kitti_groundtruth_page()
-    with tab6:
+    with tab5:
         statistics_page()
         
 
