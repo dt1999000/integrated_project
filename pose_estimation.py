@@ -141,8 +141,7 @@ def estimate_pose_l_shape(points: np.ndarray, d_theta: float = 0.01,
     best_width = 0.0
     
     # Search through angles (0 to 90 degrees is sufficient for a box due to symmetry)
-    # Actually, we need 0 to 180 degrees because length/width are different
-    for theta in np.arange(0, np.pi, d_theta):
+    for theta in np.arange(0, np.pi/2, d_theta):
         # Rotation matrix
         R = np.array([
             [np.cos(theta), -np.sin(theta)], 
