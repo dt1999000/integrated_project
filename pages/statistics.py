@@ -4,10 +4,7 @@ Page module - extracted from app.py
 import streamlit as st
 import numpy as np
 import pandas as pd
-import cv2
-import time
-import matplotlib.pyplot as plt
-from typing import Dict, List, Optional
+import plotly.graph_objects as go
 
 from visualization_helper import (
     draw_2d_boxes_on_image,
@@ -155,10 +152,41 @@ def statistics_page():
         'use_templates': True,
         'frustum_depth': 100
     })
+    
+    # Get pose estimation settings from session state (set in app.py sidebar)
+    use_pose_estimation = st.session_state.get('use_pose_estimation_checkbox', False)
+    pose_estimation_method = st.session_state.get('pose_estimation_method', 'pca')
+    
+    # Add pose estimation parameters to pipeline params
+    pipeline_params['use_pose_estimation'] = use_pose_estimation
+    pipeline_params['pose_estimation_method'] = pose_estimation_method
+    
+    # When pose estimation is enabled, also enable depth estimation to get more points
+    pipeline_params['use_depth_estimation'] = use_pose_estimation
+    
+    # Get depth estimation settings from session state
+    use_marigold = st.session_state.get('use_marigold_checkbox', True)
+    dc_params = st.session_state.params.get('marigold_dc', {})
+    pipeline_params['use_marigold'] = use_marigold
+    pipeline_params['use_full_precision'] = dc_params.get('use_full_precision', False)
+    pipeline_params['use_tiny_vae'] = dc_params.get('use_tiny_vae', False)
+    pipeline_params['use_sparse_depth_prior'] = True  # Use sparse depth from LiDAR when available
+    pipeline_params['marigold_dc'] = dc_params
+    pipeline_params['depth_stride'] = 2  # Subsample to reduce point count
+    pipeline_params['depth_threshold_min'] = 0.5
+    pipeline_params['depth_threshold_max'] = 80.0
+    
+    # Get template dimensions for pose estimation if available
+    from clustering_manager import KITTI_CUBOID_TEMPLATES
+    template_dims = KITTI_CUBOID_TEMPLATES if use_pose_estimation else None
+    if template_dims:
+        pipeline_params['template_dims'] = template_dims
 
     # Show current settings
+    pose_info = f" | Pose Estimation: {pose_estimation_method.upper()}" if use_pose_estimation else ""
+    depth_info = " | Depth Estimation: ON" if pipeline_params.get('use_depth_estimation', False) else ""
     st.info(f"**Current Settings:** Validate Overlap: {pipeline_params['validate_overlap']} | "
-            f"2D IoU Threshold: {pipeline_params['overlap_threshold']} | Use Templates: {pipeline_params['use_templates']}")
+            f"2D IoU Threshold: {pipeline_params['overlap_threshold']} | Use Templates: {pipeline_params['use_templates']}{pose_info}{depth_info}")
 
     # Run button
     st.markdown("---")
