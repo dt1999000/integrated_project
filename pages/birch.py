@@ -59,17 +59,34 @@ def birch_page(point_cloud):
                 frustums = fm.create_frustums_from_bboxes(ground_truth_boxes, depth=100)
                 st.session_state.frustums = frustums
 
-                # Get points
+                # Get points - combine ground-removed LiDAR with reconstructed points if available
                 points = st.session_state.point_cloud.point_cloud_plane_removed
+                if st.session_state.get('reconstructed_points') is not None:
+                    reconstructed = st.session_state.reconstructed_points
+                    points = np.vstack([points, reconstructed])
+                    print(f"Using combined point cloud: {len(points):,} points ({len(st.session_state.point_cloud.point_cloud_plane_removed):,} LiDAR + {len(reconstructed):,} reconstructed)")
+
                 clustering_params = {'birch': {'threshold': threshold, 'branching_factor': branching_factor, 'n_clusters': n_clusters}}
+                
+                # Get pose estimation settings - always enabled, prefer l_shape
+                use_pose_estimation = True  # Always use pose estimation
+                pose_estimation_method = st.session_state.get('pose_estimation_method', 'l_shape')
+                
+                # Get template dimensions (only used for PCA, L-shape returns its own dimensions)
+                from clustering_manager import KITTI_CUBOID_TEMPLATES
+                template_dims = KITTI_CUBOID_TEMPLATES if pose_estimation_method == 'pca' else None
+
                 # Run per-frustum clustering
                 cuboids, per_frustum_results = fm.cluster_in_frustums(
                     points, frustums, min_cluster_size=5, min_samples=3, algorithm='birch',
                     validate_overlap=st.session_state.validate_overlap,
                     overlap_threshold=st.session_state.overlap_threshold,
-                    use_templates=st.session_state.use_templates,
+                    use_templates=st.session_state.use_templates and not use_pose_estimation,
                     clustering_params=clustering_params,
-                    ground_plane_model=st.session_state.get('ground_plane_model')
+                    ground_plane_model=st.session_state.get('ground_plane_model'),
+                    use_pose_estimation=use_pose_estimation,
+                    pose_estimation_method=pose_estimation_method,
+                    template_dims=template_dims
                 )
                 bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
 
