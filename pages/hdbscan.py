@@ -85,6 +85,7 @@ def hdbscan_page(point_cloud):
                 template_dims = KITTI_CUBOID_TEMPLATES if pose_estimation_method == 'pca' else None
 
                 # Run per-frustum clustering with HDBSCAN and overlap validation
+                depth_map = st.session_state.get('depth_map')
                 cuboids, per_frustum_results = fm.cluster_in_frustums(
                     points, frustums,
                     min_cluster_size=min_cluster_size,
@@ -97,7 +98,8 @@ def hdbscan_page(point_cloud):
                     ground_plane_model=st.session_state.get('ground_plane_model'),
                     use_pose_estimation=use_pose_estimation,
                     pose_estimation_method=pose_estimation_method,
-                    template_dims=template_dims
+                    template_dims=template_dims,
+                    depth_map=depth_map
                 )
                 bbox_results = FrustumManager.results_to_bbox_summary(per_frustum_results)
 

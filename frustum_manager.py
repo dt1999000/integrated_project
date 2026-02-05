@@ -182,20 +182,20 @@ class FrustumManager:
         cuboids: List[Dict],
         points: np.ndarray,
         labels: np.ndarray,
-        original_bbox_2d: Dict[str, float]
+        original_bbox_2d: Dict[str, float],
+        depth_map: Optional[np.ndarray] = None
     ) -> Optional[Dict]:
         """
-        Find the best cuboid by projecting each to 2D and selecting the one with highest IoU.
-
-        Project all given cuboids onto 2D and returns the one with highest IoU overlap
+        Find the best cuboid by selecting the cluster closest to the reprojected 3D point
+        at the middle of the bounding box (if depth map available), or by IoU (if no depth map).
 
         Args:
             cuboids: List of cuboid dicts from clustering
             points: Nx3 array of points in the frustum
             labels: N array of cluster labels
             original_bbox_2d: Dict with 'left', 'top', 'right', 'bottom' (the original 2D detection)
-            overlap_threshold: IoU threshold (unused here, kept for API compatibility)
-            pose_estimation: If True, use pose estimation instead of templates
+            depth_map: Optional depth map (H, W) in meters. If provided, selects cluster closest
+                      to the reprojected 3D point at middle of bounding box (no IoU used).
         Returns:
             Best cuboid dict with added 'selected_points', 'selected_labels', 'iou',
             and 'projected_bbox_2d' keys, or None if no valid cuboids
@@ -203,10 +203,76 @@ class FrustumManager:
         if not cuboids:
             return None
 
-        # Iterate from nearest to farthest
-        best_cuboid = {'iou': 0}
-        for cuboid in cuboids:
+        # If depth map is available, use depth-based selection (no IoU)
+        if depth_map is not None and depth_map.ndim == 2:
+            # Compute middle point of bounding box
+            u_center = int((original_bbox_2d['left'] + original_bbox_2d['right']) / 2)
+            v_center = int((original_bbox_2d['top'] + original_bbox_2d['bottom']) / 2)
             
+            # Clamp to valid image bounds
+            h, w = depth_map.shape
+            u_center = max(0, min(w - 1, u_center))
+            v_center = max(0, min(h - 1, v_center))
+            
+            # Get depth at middle point
+            target_depth = depth_map[v_center, u_center]
+            
+            if target_depth > 0:
+                # Back-project pixel to 3D in LiDAR coordinates
+                # [X, Y, Z]^T = d * K^-1 @ [u, v, 1]^T, then transform to LiDAR
+                K_inv = np.linalg.inv(self.camera_intrinsic)
+                pixel_homo = np.array([u_center, v_center, 1.0])
+                
+                # Back-project to normalized camera coordinates
+                point_normalized = K_inv @ pixel_homo  # (3,)
+                
+                # Scale by depth to get 3D point in camera coordinates
+                point_camera = point_normalized * target_depth  # (3,)
+                
+                # Transform to LiDAR coordinates
+                point_camera_homo = np.append(point_camera, 1.0)  # (4,)
+                target_point_3d = (self.camera_to_lidar_transform @ point_camera_homo)[:3]  # (3,)
+                
+                print(f"Target 3D point at bbox center ({u_center}, {v_center}): depth={target_depth:.2f}m, 3D={target_point_3d}")
+                
+                # Find cluster with center closest to target 3D point
+                best_cuboid = None
+                min_distance = float('inf')
+                
+                for cuboid in cuboids:
+                    if 'center' not in cuboid:
+                        continue
+                    
+                    cluster_center = cuboid['center']
+                    # Compute Euclidean distance in 3D
+                    distance = np.linalg.norm(cluster_center - target_point_3d)
+                    
+                    print(f"  Cluster {cuboid.get('label', -1)}: center={cluster_center}, distance={distance:.2f}m")
+                    
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_cuboid = cuboid.copy()
+                        best_cuboid['selected_points'] = points[labels == best_cuboid['label']]
+                        best_cuboid['selected_labels'] = labels[labels == best_cuboid['label']]
+                        
+                        # Project to 2D for IoU calculation (for reporting, not selection)
+                        projected = self.projection.cuboid_to_2d(best_cuboid)
+                        if projected is not None:
+                            best_cuboid['projected_bbox_2d'] = projected['bbox_2d']
+                            best_cuboid['iou'] = compute_bbox_iou(projected['bbox_2d'], original_bbox_2d)
+                        else:
+                            best_cuboid['projected_bbox_2d'] = None
+                            best_cuboid['iou'] = 0.0
+                
+                if best_cuboid:
+                    print(f"Best cuboid (depth-based): distance={min_distance:.2f}m, IoU={best_cuboid.get('iou', 0):.3f}, source bbox idx: {best_cuboid['source_bbox_idx']}")
+                return best_cuboid
+        
+        # Fallback to IoU-based selection when depth map is not available
+        best_cuboid = None
+        best_iou = -1.0
+        
+        for cuboid in cuboids:
             # Project cuboid to 2D
             projected = self.projection.cuboid_to_2d(cuboid)
             if projected is None:
@@ -217,14 +283,17 @@ class FrustumManager:
             
             # Compute IoU between projected bbox and original detection bbox
             iou = compute_bbox_iou(projected_bbox, original_bbox_2d)
-            if iou > best_cuboid['iou']:
-                best_cuboid = cuboid
+            
+            if iou > best_iou:
+                best_iou = iou
+                best_cuboid = cuboid.copy()
                 best_cuboid['iou'] = iou
                 best_cuboid['projected_bbox_2d'] = projected_bbox
                 best_cuboid['selected_points'] = points[labels == best_cuboid['label']]
                 best_cuboid['selected_labels'] = labels[labels == best_cuboid['label']]
 
-        print(f"best cuboid (axis-aligned): iou={best_cuboid['iou']}, source bbox idx: {best_cuboid['source_bbox_idx']}")
+        if best_cuboid:
+            print(f"Best cuboid (IoU-based): IoU={best_cuboid['iou']:.3f}, source bbox idx: {best_cuboid['source_bbox_idx']}")
         return best_cuboid
 
     def cluster_in_frustums(
@@ -241,7 +310,8 @@ class FrustumManager:
         ground_plane_model: Optional[np.ndarray] = None,
         use_pose_estimation: bool = True,
         pose_estimation_method: str = 'pca',
-        template_dims: Optional[Dict[str, Dict[str, float]]] = None
+        template_dims: Optional[Dict[str, Dict[str, float]]] = None,
+        depth_map: Optional[np.ndarray] = None
     ) -> Tuple[List[Dict], List[FrustumClusterResult]]:
         """
         Run clustering on points inside each frustum and generate cuboids.
@@ -266,6 +336,8 @@ class FrustumManager:
             pose_estimation_method: 'pca' or 'l_shape' - method for pose estimation
             template_dims: Optional dict mapping category to {'length', 'width', 'height'}.
                           Used when use_pose_estimation=True to get dimensions.
+            depth_map: Optional depth map (H, W) in meters. If provided, used to select
+                      clusters with center close to depth at middle of bounding box.
 
         Returns:
             Tuple of:
@@ -374,7 +446,8 @@ class FrustumManager:
                         cuboids,
                         points_in_frustum,
                         labels,
-                        frustum.bbox_2d
+                        frustum.bbox_2d,
+                        depth_map=depth_map
                     )
                     if selected:
                         cluster_label = selected.get('label', -1)

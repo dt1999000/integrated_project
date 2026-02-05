@@ -410,30 +410,6 @@ def main():
                             depth_threshold_max=80.0
                         )
                         print(f"Reconstructed {len(reconstructed_points):,} points from completed depth")
-                        
-                        # Filter out points close to the ground using ground plane model
-                        if st.session_state.point_cloud.ground_removed and st.session_state.point_cloud.ground_plane_model is not None:
-                            ground_plane_model = st.session_state.point_cloud.ground_plane_model
-                            a, b, c, d = ground_plane_model
-                            
-                            # Compute distance from each point to the ground plane
-                            # Distance = |ax + by + cz + d| / sqrt(a² + b² + c²)
-                            plane_normal_norm = np.sqrt(a**2 + b**2 + c**2)
-                            if plane_normal_norm > 1e-6:
-                                # Signed distance: (ax + by + cz + d) / ||normal||
-                                distances = (reconstructed_points[:, 0] * a + 
-                                            reconstructed_points[:, 1] * b + 
-                                            reconstructed_points[:, 2] * c + d) / plane_normal_norm
-                                
-                                # Filter out points too close to ground (within distance_threshold)
-                                distance_threshold = st.session_state.params['pipeline']['distance_threshold']
-                                above_ground_mask = distances > distance_threshold
-                                n_filtered = np.sum(~above_ground_mask)
-                                
-                                reconstructed_points = reconstructed_points[above_ground_mask]
-                                print(f"Filtered {n_filtered:,} points close to ground (threshold: {distance_threshold:.2f}m)")
-                                print(f"Remaining reconstructed points: {len(reconstructed_points):,}")
-                        
                         st.session_state.reconstructed_points = reconstructed_points
                         
                         # Add reconstructed points to original point cloud and update session_state

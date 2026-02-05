@@ -514,6 +514,7 @@ def run_pipeline_on_sample(
     
     # If depth estimation is enabled, estimate depth and reconstruct points
     original_points = sample_data['point_cloud'].copy()
+    depth_map = None  # Initialize depth map variable
     if use_depth_estimation:
         try:
             # Load image
@@ -632,7 +633,8 @@ def run_pipeline_on_sample(
         ground_plane_model=point_cloud.ground_plane_model,
         use_pose_estimation=pipeline_params.get('use_pose_estimation', False),
         pose_estimation_method=pipeline_params.get('pose_estimation_method', 'pca'),
-        template_dims=pipeline_params.get('template_dims', None)
+        template_dims=pipeline_params.get('template_dims', None),
+        depth_map=depth_map
     )
 
     print(f"Sample {sample_index}: {len(cuboids)} cuboids from {len(frustums)} frustums, {len(ground_truth_boxes)} GT")
