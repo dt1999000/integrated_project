@@ -5,19 +5,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-
-from visualization_helper import (
-    draw_2d_boxes_on_image,
-    draw_projected_cuboid_bboxes,
-    add_frustums_to_figure,
-    add_cuboids_to_figure,
-    create_3d_scatter_plot,
-    create_comparison_plot,
-)
-from frustum_manager import FrustumManager
 from evaluation import compute_3d_iou, run_pipeline_on_sample
-from clustering_manager import ClusteringManager
-from pointcloud_projection import filter_points_in_frustum
 
 def statistics_page():
     """Batch evaluation statistics page for KITTI dataset"""
@@ -153,9 +141,9 @@ def statistics_page():
         'frustum_depth': 100
     })
     
-    # Get pose estimation settings from session state (set in app.py sidebar)
-    use_pose_estimation = st.session_state.get('use_pose_estimation_checkbox', False)
-    pose_estimation_method = st.session_state.get('pose_estimation_method', 'pca')
+    # Get pose estimation settings - always enabled, prefer l_shape
+    use_pose_estimation = True  # Always use pose estimation
+    pose_estimation_method = st.session_state.get('pose_estimation_method', 'l_shape')
     
     # Add pose estimation parameters to pipeline params
     pipeline_params['use_pose_estimation'] = use_pose_estimation
@@ -176,14 +164,14 @@ def statistics_page():
     pipeline_params['depth_threshold_min'] = 0.5
     pipeline_params['depth_threshold_max'] = 80.0
     
-    # Get template dimensions for pose estimation if available
+    # Get template dimensions (only used for PCA, L-shape returns its own dimensions)
     from clustering_manager import KITTI_CUBOID_TEMPLATES
-    template_dims = KITTI_CUBOID_TEMPLATES if use_pose_estimation else None
+    template_dims = KITTI_CUBOID_TEMPLATES if pose_estimation_method == 'pca' else None
     if template_dims:
         pipeline_params['template_dims'] = template_dims
 
     # Show current settings
-    pose_info = f" | Pose Estimation: {pose_estimation_method.upper()}" if use_pose_estimation else ""
+    pose_info = f" | Pose Estimation: {pose_estimation_method.upper()}"  # Always shown since always enabled
     depth_info = " | Depth Estimation: ON" if pipeline_params.get('use_depth_estimation', False) else ""
     st.info(f"**Current Settings:** Validate Overlap: {pipeline_params['validate_overlap']} | "
             f"2D IoU Threshold: {pipeline_params['overlap_threshold']} | Use Templates: {pipeline_params['use_templates']}{pose_info}{depth_info}")

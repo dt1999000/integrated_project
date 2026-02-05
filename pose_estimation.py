@@ -206,7 +206,7 @@ def cuboid_from_pose(pose_result: Dict, category: str,
         pose_result: Dictionary from estimate_pose_pca or estimate_pose_l_shape
         category: Object category (e.g., 'Car', 'Pedestrian')
         template_dims: Optional dict with 'length', 'width', 'height' from templates.
-                      If provided, uses these instead of estimated dimensions.
+                      Only used for PCA method (L-shape returns its own dimensions).
         ground_z: Optional ground z value at cuboid center. If provided, uses this
                   for base_z calculation.
     
@@ -225,15 +225,23 @@ def cuboid_from_pose(pose_result: Dict, category: str,
     center = pose_result['center']
     yaw = pose_result['yaw']
     
-    # Use template dimensions if available, otherwise use estimated dimensions
-    if template_dims is not None:
-        length = template_dims.get('length', pose_result.get('length', 4.0))
-        width = template_dims.get('width', pose_result.get('width', 1.8))
-        height = template_dims.get('height', pose_result.get('height', 1.5))
+    # Prefer dimensions from pose_result (L-shape returns them), fallback to templates for PCA
+    # L-shape method returns accurate dimensions, so use them if available
+    if 'length' in pose_result and 'width' in pose_result and 'height' in pose_result:
+        # Use dimensions from pose estimation (L-shape method)
+        length = pose_result['length']
+        width = pose_result['width']
+        height = pose_result['height']
+    elif template_dims is not None:
+        # Fallback to templates (for PCA method which doesn't return dimensions)
+        length = template_dims.get('length', 4.0)
+        width = template_dims.get('width', 1.8)
+        height = template_dims.get('height', 1.5)
     else:
-        length = pose_result.get('length', 4.0)
-        width = pose_result.get('width', 1.8)
-        height = pose_result.get('height', 1.5)
+        # Final fallback to defaults
+        length = 4.0
+        width = 1.8
+        height = 1.5
     
     # Calculate base z (ground level)
     if ground_z is not None:

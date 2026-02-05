@@ -325,8 +325,10 @@ class FrustumManager:
                         if len(cluster_points) < 4:
                             continue
                         
-                        # Get template dimensions for this category if available
-                        category_template = template_dims.get(frustum.category) if template_dims else None
+                        # Get template dimensions only for PCA (L-shape returns its own dimensions)
+                        category_template = None
+                        if pose_estimation_method == 'pca' and template_dims:
+                            category_template = template_dims.get(frustum.category)
                         
                         pose_cuboid = cluster_manager.generate_cuboid_from_pose_estimation(
                             cluster_points=cluster_points,

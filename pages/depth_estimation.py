@@ -23,13 +23,13 @@ def depth_estimation_page():
     
     # Check if data is loaded
     if 'sample_data' not in st.session_state or st.session_state.sample_data is None:
-        st.info("👈 Load a sample from the sidebar and click 'Estimate Depth' to get started")
+        st.info("👈 Load a sample from the sidebar and click 'Reconstruct Points' to get started")
         st.markdown("""
         ### How to use:
         1. Load a KITTI sample using the sidebar controls
         2. Select depth estimation model in the sidebar (Marigold or Depth Anything)
-        3. Click the **🔍 Estimate Depth** button in the sidebar
-        4. Wait for the depth estimation to complete (may take 10-30 seconds)
+        3. Click the **🔧 Reconstruct Points** button in the sidebar
+        4. Wait for the reconstruction to complete (may take 10-30 seconds)
         5. View the depth map and reconstructed 3D point cloud below
         
         **Available Models:**
@@ -71,7 +71,7 @@ def depth_estimation_page():
     
     # Check if depth has been estimated
     if st.session_state.depth_map is None:
-        st.warning("⚠️ No depth map available. Click '🔍 Estimate Depth' in the sidebar to run depth estimation.")
+        st.warning("⚠️ No depth map available. Click '🔧 Reconstruct Points' in the sidebar to run reconstruction.")
         return
     
     depth_map = st.session_state.depth_map

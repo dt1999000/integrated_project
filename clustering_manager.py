@@ -458,7 +458,7 @@ class ClusteringManager:
             ground_plane_model: Optional [a, b, c, d] plane equation from RANSAC.
                               Used to compute ground z for height calculation.
             template_dims: Optional dict with 'length', 'width', 'height' from templates.
-                          If provided, uses these instead of estimated dimensions.
+                          Only used for PCA method (L-shape returns its own dimensions).
 
         Returns:
             KITTI-format cuboid dict with 'center', 'yaw', 'length', 'width', 'height',
@@ -481,14 +481,15 @@ class ClusteringManager:
         # Estimate pose
         if pose_estimation_method == 'pca':
             pose_result = estimate_pose_pca(cluster_points)
+            # PCA doesn't return dimensions, so we need templates
+            if template_dims is None:
+                template_dims = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
         elif pose_estimation_method == 'l_shape':
             pose_result = estimate_pose_l_shape(cluster_points, ground_plane_model=ground_plane_model)
+            # L-shape returns dimensions, so don't use templates
+            template_dims = None
         else:
             raise ValueError(f"Unknown pose estimation method: {pose_estimation_method}")
-
-        # Get template dimensions for this category if available
-        if template_dims is None:
-            template_dims = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
 
         # Create KITTI-format cuboid from pose
         pose_cuboid = cuboid_from_pose(
