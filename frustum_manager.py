@@ -182,15 +182,12 @@ class FrustumManager:
         cuboids: List[Dict],
         points: np.ndarray,
         labels: np.ndarray,
-        original_bbox_2d: Dict[str, float],
-        overlap_threshold: float = 0.3
+        original_bbox_2d: Dict[str, float]
     ) -> Optional[Dict]:
         """
         Find the best cuboid by projecting each to 2D and selecting the one with highest IoU.
 
-        Projects all axis-aligned cuboids to 2D and returns the one with highest IoU overlap
-        with the original 2D bounding box. Note: 'need_review' is NOT set here - it should
-        be computed after template cuboid generation in cluster_in_frustums().
+        Project all given cuboids onto 2D and returns the one with highest IoU overlap
 
         Args:
             cuboids: List of cuboid dicts from clustering
@@ -198,7 +195,7 @@ class FrustumManager:
             labels: N array of cluster labels
             original_bbox_2d: Dict with 'left', 'top', 'right', 'bottom' (the original 2D detection)
             overlap_threshold: IoU threshold (unused here, kept for API compatibility)
-
+            pose_estimation: If True, use pose estimation instead of templates
         Returns:
             Best cuboid dict with added 'selected_points', 'selected_labels', 'iou',
             and 'projected_bbox_2d' keys, or None if no valid cuboids
@@ -239,10 +236,10 @@ class FrustumManager:
         algorithm: str = "hdbscan",
         validate_overlap: bool = False,
         overlap_threshold: float = 0.7,
-        use_templates: bool = True,
+        use_templates: bool = False,
         clustering_params: Optional[Dict[str, Dict]] = None,
         ground_plane_model: Optional[np.ndarray] = None,
-        use_pose_estimation: bool = False,
+        use_pose_estimation: bool = True,
         pose_estimation_method: str = 'pca',
         template_dims: Optional[Dict[str, Dict[str, float]]] = None
     ) -> Tuple[List[Dict], List[FrustumClusterResult]]:
@@ -316,63 +313,39 @@ class FrustumManager:
                 labels = cluster_manager.run_clustering(algorithm, **override_params)
                 print(f"labels: {np.unique(labels)}")
                 n_clusters = len(np.unique(labels))
-                # First generate axis-aligned cuboids for selection/validation
-                cuboids = cluster_manager.generate_cuboids_from_clusters(labels)
-
-                # Add category info to each cuboid
-                for cuboid in cuboids:
-                    cuboid['category'] = frustum.category
-                    cuboid['source_bbox_idx'] = frustum.idx
-                # Find best cuboid via overlap validation, then create template cuboid
-                if validate_overlap and cuboids:
-                    selected = self.find_best_cuboid(
-                        cuboids,
-                        points_in_frustum,
-                        labels,
-                        frustum.bbox_2d,
-                        overlap_threshold
-                    )
-                    if selected:
-                        cluster_label = selected.get('label', -1)
-                        if cluster_label >= 0:
-                            cluster_points = points_in_frustum[labels == cluster_label]
+                # Generate cuboids based on method
+                if use_pose_estimation:
+                    # Generate cuboids using pose estimation for each cluster
+                    unique_labels = np.unique(labels)
+                    cuboids = []
+                    for cluster_label in unique_labels:
+                        if cluster_label == -1:  # Skip noise points
+                            continue
+                        cluster_points = points_in_frustum[labels == cluster_label]
+                        if len(cluster_points) < 4:
+                            continue
+                        
+                        # Get template dimensions only for PCA (L-shape returns its own dimensions)
+                        category_template = None
+                        if pose_estimation_method == 'pca' and template_dims:
+                            category_template = template_dims.get(frustum.category)
+                        
+                        pose_cuboid = cluster_manager.generate_cuboid_from_pose_estimation(
+                            cluster_points=cluster_points,
+                            category=frustum.category,
+                            cluster_label=cluster_label,
+                            pose_estimation_method=pose_estimation_method,
+                            ground_plane_model=ground_plane_model,
+                            template_dims=category_template
+                        )
+                        if pose_cuboid:
+                            pose_cuboid['category'] = frustum.category
+                            pose_cuboid['source_bbox_idx'] = frustum.idx
+                            pose_cuboid['selected_points'] = cluster_points
+                            pose_cuboid['selected_labels'] = labels[labels == cluster_label]
                             
-                            if use_pose_estimation:
-                                # Use pose estimation instead of templates
-                                from pose_estimation import estimate_pose_pca, estimate_pose_l_shape, cuboid_from_pose
-                                
-                                # Compute ground_z at cluster centroid using plane model
-                                ground_z = None
-                                if ground_plane_model is not None:
-                                    a, b, c, d = ground_plane_model
-                                    if abs(c) > 1e-6:
-                                        center_x = np.mean(cluster_points[:, 0])
-                                        center_y = np.mean(cluster_points[:, 1])
-                                        ground_z = -(a * center_x + b * center_y + d) / c
-                                
-                                # Estimate pose
-                                if pose_estimation_method == 'pca':
-                                    pose_result = estimate_pose_pca(cluster_points)
-                                elif pose_estimation_method == 'l_shape':
-                                    pose_result = estimate_pose_l_shape(cluster_points, ground_plane_model=ground_plane_model)
-                                else:
-                                    raise ValueError(f"Unknown pose estimation method: {pose_estimation_method}")
-                                
-                                # Get template dimensions for this category if available
-                                category_template = template_dims.get(frustum.category) if template_dims else None
-                                
-                                # Create KITTI-format cuboid from pose
-                                pose_cuboid = cuboid_from_pose(
-                                    pose_result,
-                                    category=frustum.category,
-                                    template_dims=category_template,
-                                    ground_z=ground_z
-                                )
-                                pose_cuboid['source_bbox_idx'] = frustum.idx
-                                pose_cuboid['selected_points'] = cluster_points
-                                pose_cuboid['selected_labels'] = labels[labels == cluster_label]
-                                
-                                # Project pose cuboid back to 2D and calculate IoU
+                            # Project pose cuboid back to 2D and calculate IoU for validation
+                            if validate_overlap:
                                 pose_projected = self.projection.cuboid_to_2d(pose_cuboid)
                                 if pose_projected is not None:
                                     pose_bbox_2d = pose_projected['bbox_2d']
@@ -382,12 +355,35 @@ class FrustumManager:
                                     pose_cuboid['need_review'] = pose_iou < overlap_threshold
                                     print(f"pose cuboid ({pose_estimation_method}): iou={pose_iou:.3f}, need_review={pose_cuboid['need_review']}")
                                 else:
-                                    # Pose cuboid is behind camera
-                                    pose_cuboid['projected_bbox_2d'] = selected.get('projected_bbox_2d')
-                                    pose_cuboid['iou'] = selected.get('iou', 0)
+                                    # Pose cuboid is behind camera, set IoU to 0
+                                    pose_cuboid['iou'] = 0.0
                                     pose_cuboid['need_review'] = True
-                                
-                                cuboid = pose_cuboid
+                            
+                            cuboids.append(pose_cuboid)
+                else:
+                    # Generate axis-aligned cuboids for selection/validation
+                    cuboids = cluster_manager.generate_cuboids_from_clusters(labels)
+                    # Add category info to each cuboid
+                    for cuboid in cuboids:
+                        cuboid['category'] = frustum.category
+                        cuboid['source_bbox_idx'] = frustum.idx
+
+                # Find best cuboid via overlap validation, then create template cuboid if needed
+                if validate_overlap and cuboids:
+                    selected = self.find_best_cuboid(
+                        cuboids,
+                        points_in_frustum,
+                        labels,
+                        frustum.bbox_2d
+                    )
+                    if selected:
+                        cluster_label = selected.get('label', -1)
+                        if cluster_label >= 0:
+                            cluster_points = points_in_frustum[labels == cluster_label]
+                            
+                            if use_pose_estimation:
+                                # Pose estimation cuboid already generated and validated in the loop above
+                                cuboid = selected
                             elif use_templates:
                                 # Create template cuboid for the selected cluster
                                 # Compute ground_z at cluster centroid using plane model
@@ -430,12 +426,19 @@ class FrustumManager:
                                 cuboid = selected
                         else:
                             cuboid = selected
-                    elif selected:
-                        # Not using templates - set need_review based on axis-aligned IoU
-                        selected['need_review'] = selected.get('iou', 0) < overlap_threshold
-                        cuboid = selected
                     else:
-                        cuboid = None  # No cuboid met the overlap threshold
+                        # No cuboid met the overlap threshold
+                        cuboid = None
+                elif cuboids:
+                    # No overlap validation, use first cuboid or best one
+                    if use_pose_estimation:
+                        # For pose estimation, use the first one (they're already validated)
+                        cuboid = cuboids[0] if cuboids else None
+                    else:
+                        # For axis-aligned, use first one
+                        cuboid = cuboids[0] if cuboids else None
+                else:
+                    cuboid = None
 
                 if cuboid:
                     all_cuboids.append(cuboid)

@@ -73,6 +73,8 @@ if 'depth_image' not in st.session_state:
     st.session_state.depth_image = None
 if 'reconstructed_points' not in st.session_state:
     st.session_state.reconstructed_points = None
+if 'original_point_cloud_before_reconstruction' not in st.session_state:
+    st.session_state.original_point_cloud_before_reconstruction = None
 if 'depth_estimator' not in st.session_state:
     st.session_state.depth_estimator = None
 if 'sparse_depth_map' not in st.session_state:
@@ -180,13 +182,19 @@ def main():
 
     # Sample selection (max value depends on dataset)
     max_sample = 7480
-    sample_index = st.sidebar.text_input(
+    sample_index_str = st.sidebar.text_input(
         "Sample Index",
-        value=0,
+        value="0",
         key="sample_index",
         help=f"0-{max_sample} for {dataset.upper()}"
     )
-    sample_index = int(sample_index)
+    # Handle empty or invalid input
+    if sample_index_str.strip() == "":
+        sample_index = 0
+    else:
+        sample_index = int(sample_index_str)
+        # Clamp to valid range
+        sample_index = max(0, min(sample_index, max_sample))
 
     # RANSAC parameters for ground plane removal
     st.sidebar.markdown("### Ground Plane Removal")
@@ -258,21 +266,18 @@ def main():
         help="Marigold provides metric depth. Falls back to Depth Anything if unavailable."
     )
     
-    # Pose estimation parameters
+    # Pose estimation parameters - always enabled, prefer l_shape_fitting
     st.sidebar.markdown("### Pose Estimation")
     pose_estimation_method = st.sidebar.selectbox(
         "Pose Estimation Method",
-        options=['pca', 'l_shape'],
+        options=['l_shape', 'pca'],
         index=0,
         key="pose_estimation_method",
-        help="PCA: Fast, works well for dense point clouds. L-Shape: Robust to partial views, slower."
+        help="L-Shape: Robust to partial views (preferred). PCA: Fast, works well for dense point clouds."
     )
-    use_pose_estimation = st.sidebar.checkbox(
-        "Use Pose Estimation",
-        value=False,
-        key="use_pose_estimation_checkbox",
-        help="Use pose estimation (PCA/L-Shape) instead of template cuboids for better orientation"
-    )
+    # Always use pose estimation
+    use_pose_estimation = True
+    st.session_state.use_pose_estimation_checkbox = True
     
     # Marigold-DC parameters
     with st.sidebar.expander("Marigold-DC Parameters", expanded=False):
@@ -321,10 +326,10 @@ def main():
             key="dc_tiny_vae",
             help="Use lightweight VAE for faster processing (lower quality)")
     
-    if st.sidebar.button("🔍 Estimate Depth", key="estimate_depth"):
+    if st.sidebar.button("🔧 Reconstruct Points", key="reconstruct_points"):
         sample_data = st.session_state.get("sample_data")
         if not sample_data:
-            st.sidebar.warning("Load a sample first to estimate depth.")
+            st.sidebar.warning("Load a sample first to reconstruct points.")
         else:
             with st.spinner("Initializing depth estimation model..."):
                 # Initialize depth estimator if not already done or settings changed
@@ -364,6 +369,10 @@ def main():
                     h, w = img_rgb.shape[:2]
                     
                     if st.session_state.point_cloud is not None:
+                        # Keep a separate copy of the original point cloud before reconstruction
+                        if 'original_point_cloud_before_reconstruction' not in st.session_state:
+                            st.session_state.original_point_cloud_before_reconstruction = st.session_state.point_cloud.copy()
+                        
                         # Use original point cloud for sparse depth creation
                         lidar_points_original = st.session_state.point_cloud.original_point_cloud
                         print(f"Using {len(lidar_points_original):,} original LiDAR points for sparse depth map")
@@ -400,11 +409,35 @@ def main():
                             depth_threshold_min=0.5,
                             depth_threshold_max=80.0
                         )
-                        st.session_state.reconstructed_points = reconstructed_points
                         print(f"Reconstructed {len(reconstructed_points):,} points from completed depth")
                         
-                        # Add reconstructed points to original point cloud
-                        print(f"Adding {len(reconstructed_points):,} reconstructed points to original point cloud...")
+                        # Filter out points close to the ground using ground plane model
+                        if st.session_state.point_cloud.ground_removed and st.session_state.point_cloud.ground_plane_model is not None:
+                            ground_plane_model = st.session_state.point_cloud.ground_plane_model
+                            a, b, c, d = ground_plane_model
+                            
+                            # Compute distance from each point to the ground plane
+                            # Distance = |ax + by + cz + d| / sqrt(a² + b² + c²)
+                            plane_normal_norm = np.sqrt(a**2 + b**2 + c**2)
+                            if plane_normal_norm > 1e-6:
+                                # Signed distance: (ax + by + cz + d) / ||normal||
+                                distances = (reconstructed_points[:, 0] * a + 
+                                            reconstructed_points[:, 1] * b + 
+                                            reconstructed_points[:, 2] * c + d) / plane_normal_norm
+                                
+                                # Filter out points too close to ground (within distance_threshold)
+                                distance_threshold = st.session_state.params['pipeline']['distance_threshold']
+                                above_ground_mask = distances > distance_threshold
+                                n_filtered = np.sum(~above_ground_mask)
+                                
+                                reconstructed_points = reconstructed_points[above_ground_mask]
+                                print(f"Filtered {n_filtered:,} points close to ground (threshold: {distance_threshold:.2f}m)")
+                                print(f"Remaining reconstructed points: {len(reconstructed_points):,}")
+                        
+                        st.session_state.reconstructed_points = reconstructed_points
+                        
+                        # Add reconstructed points to original point cloud and update session_state
+                        print(f"Adding {len(reconstructed_points):,} reconstructed points to point cloud...")
                         st.session_state.point_cloud.original_point_cloud = np.vstack([
                             st.session_state.point_cloud.original_point_cloud,
                             reconstructed_points
@@ -427,7 +460,7 @@ def main():
                         
                         n_sparse = np.sum(sparse_depth > 0)
                         coverage = 100 * n_sparse / (h * w)
-                        st.sidebar.success(f"✅ Depth completed and reconstructed! Coverage: {coverage:.1f}% → 100%. Added {len(reconstructed_points):,} points to point cloud.")
+                        st.sidebar.success(f"✅ Points reconstructed! Coverage: {coverage:.1f}% → 100%. Added {len(reconstructed_points):,} points to point cloud.")
                     else:
                         # No point cloud available, use regular depth estimation
                         depth_map = st.session_state.depth_estimator.get_depth_map_marigold(img_rgb)
@@ -494,7 +527,7 @@ def main():
         st.session_state.use_templates = st.session_state.params['pipeline']['use_templates']
     # Main navigation
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "SEGMENTATION AND PROJECTION", "DEPTH ESTIMATION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
+        "SEGMENTATION AND PROJECTION", "DEPTH ESTIMATION AND RECONSTRUCTION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
     ])
 
     with tab1:

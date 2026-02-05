@@ -438,4 +438,68 @@ class ClusteringManager:
 
         return cuboid
 
+    def generate_cuboid_from_pose_estimation(
+        self,
+        cluster_points: np.ndarray,
+        category: str,
+        cluster_label: int = -1,
+        pose_estimation_method: str = 'pca',
+        ground_plane_model: Optional[np.ndarray] = None,
+        template_dims: Optional[Dict[str, float]] = None
+    ) -> Optional[Dict]:
+        """
+        Generate a KITTI-format cuboid using pose estimation (PCA or L-shape fitting).
+
+        Args:
+            cluster_points: Nx3 array of points in the cluster
+            category: Object category (e.g., 'Car', 'Pedestrian')
+            cluster_label: Cluster label for reference
+            pose_estimation_method: 'pca' or 'l_shape' - method for pose estimation
+            ground_plane_model: Optional [a, b, c, d] plane equation from RANSAC.
+                              Used to compute ground z for height calculation.
+            template_dims: Optional dict with 'length', 'width', 'height' from templates.
+                          Only used for PCA method (L-shape returns its own dimensions).
+
+        Returns:
+            KITTI-format cuboid dict with 'center', 'yaw', 'length', 'width', 'height',
+            'corners', and min/max bounds, or None if insufficient points
+        """
+        if len(cluster_points) < 4:
+            return None
+
+        from pose_estimation import estimate_pose_pca, estimate_pose_l_shape, cuboid_from_pose
+
+        # Compute ground_z at cluster centroid using plane model
+        ground_z = None
+        if ground_plane_model is not None:
+            a, b, c, d = ground_plane_model
+            if abs(c) > 1e-6:
+                center_x = np.mean(cluster_points[:, 0])
+                center_y = np.mean(cluster_points[:, 1])
+                ground_z = -(a * center_x + b * center_y + d) / c
+
+        # Estimate pose
+        if pose_estimation_method == 'pca':
+            pose_result = estimate_pose_pca(cluster_points)
+            # PCA doesn't return dimensions, so we need templates
+            if template_dims is None:
+                template_dims = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
+        elif pose_estimation_method == 'l_shape':
+            pose_result = estimate_pose_l_shape(cluster_points, ground_plane_model=ground_plane_model)
+            # L-shape returns dimensions, so don't use templates
+            template_dims = None
+        else:
+            raise ValueError(f"Unknown pose estimation method: {pose_estimation_method}")
+
+        # Create KITTI-format cuboid from pose
+        pose_cuboid = cuboid_from_pose(
+            pose_result,
+            category=category,
+            template_dims=template_dims,
+            ground_z=ground_z
+        )
+        pose_cuboid['label'] = cluster_label
+
+        return pose_cuboid
+
     

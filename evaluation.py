@@ -14,6 +14,8 @@ from shapely.geometry import Polygon
 from kitti_dataset_loader import KITTIDatasetLoader
 from pointcloud_projection import PointCloud
 from frustum_manager import FrustumManager
+from depth_estimation import DepthEstimator
+import cv2
 
 
 # =============================================================================
@@ -506,8 +508,79 @@ def run_pipeline_on_sample(
         print(f"Sample {sample_index}: Failed to load sample data")
         return None
 
-    # Process point cloud
-    point_cloud = PointCloud(sample_data['point_cloud'])
+    # Check if pose estimation is enabled - if so, also use depth estimation to get more points
+    use_pose_estimation = pipeline_params.get('use_pose_estimation', False)
+    use_depth_estimation = pipeline_params.get('use_depth_estimation', use_pose_estimation)
+    
+    # If depth estimation is enabled, estimate depth and reconstruct points
+    original_points = sample_data['point_cloud'].copy()
+    if use_depth_estimation:
+        try:
+            # Load image
+            image_path = sample_data.get('image_path')
+            if image_path:
+                img = cv2.imread(image_path)
+                if img is not None:
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    
+                    # Initialize depth estimator
+                    depth_estimator = DepthEstimator(
+                        use_marigold=pipeline_params.get('use_marigold', True),
+                        use_full_precision=pipeline_params.get('use_full_precision', False),
+                        use_tiny_vae=pipeline_params.get('use_tiny_vae', False),
+                        camera_intrinsic=sample_data['camera_intrinsic'],
+                        camera_to_lidar_transform=sample_data['camera_to_lidar_transform']
+                    )
+                    
+                    # Get depth estimation parameters
+                    dc_params = pipeline_params.get('marigold_dc', {})
+                    use_sparse_depth = pipeline_params.get('use_sparse_depth_prior', True)
+                    
+                    # Try to use sparse depth prior if available
+                    if use_sparse_depth and len(original_points) > 0:
+                        h, w = img_rgb.shape[:2]
+                        sparse_depth = depth_estimator.create_sparse_depth_map(
+                            point_cloud=original_points,
+                            image_shape=(h, w)
+                        )
+                        
+                        if sparse_depth is not None:
+                            n_sparse_points = np.sum(sparse_depth > 0)
+                            coverage = 100 * n_sparse_points / (h * w)
+                            
+                            if coverage >= 0.1:  # Use sparse depth if coverage is sufficient
+                                depth_map = depth_estimator.complete_depth(
+                                    image=img_rgb,
+                                    sparse_depth=sparse_depth,
+                                    num_inference_steps=dc_params.get('num_inference_steps', 50),
+                                    ensemble_size=dc_params.get('ensemble_size', 1),
+                                    processing_resolution=dc_params.get('processing_resolution', 768),
+                                    seed=dc_params.get('seed', 2024)
+                                )
+                            else:
+                                depth_map = depth_estimator.get_depth_map_marigold(img_rgb)
+                        else:
+                            depth_map = depth_estimator.get_depth_map_marigold(img_rgb)
+                    else:
+                        depth_map = depth_estimator.get_depth_map_marigold(img_rgb)
+                    
+                    # Reconstruct points from depth
+                    reconstructed_points = depth_estimator.reconstruct_points_from_depth(
+                        depth_map=depth_map,
+                        stride=pipeline_params.get('depth_stride', 2),
+                        depth_threshold_min=pipeline_params.get('depth_threshold_min', 0.5),
+                        depth_threshold_max=pipeline_params.get('depth_threshold_max', 80.0)
+                    )
+                    
+                    # Add reconstructed points to original point cloud
+                    if len(reconstructed_points) > 0:
+                        original_points = np.vstack([original_points, reconstructed_points])
+                        print(f"Sample {sample_index}: Added {len(reconstructed_points):,} reconstructed points from depth estimation")
+        except Exception as e:
+            print(f"Sample {sample_index}: Depth estimation failed: {str(e)}, using LiDAR points only")
+    
+    # Process point cloud (with or without reconstructed points)
+    point_cloud = PointCloud(original_points)
     point_cloud.remove_ground_plane_ransac(
         distance_threshold=pipeline_params['distance_threshold'],
         ransac_n=pipeline_params['ransac_n'],
@@ -556,7 +629,10 @@ def run_pipeline_on_sample(
         overlap_threshold=pipeline_params['overlap_threshold'],
         use_templates=pipeline_params['use_templates'],
         clustering_params={algorithm: clustering_params},
-        ground_plane_model=point_cloud.ground_plane_model
+        ground_plane_model=point_cloud.ground_plane_model,
+        use_pose_estimation=pipeline_params.get('use_pose_estimation', False),
+        pose_estimation_method=pipeline_params.get('pose_estimation_method', 'pca'),
+        template_dims=pipeline_params.get('template_dims', None)
     )
 
     print(f"Sample {sample_index}: {len(cuboids)} cuboids from {len(frustums)} frustums, {len(ground_truth_boxes)} GT")
