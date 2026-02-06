@@ -3,7 +3,6 @@ import numpy as np
 from PIL import Image
 import os
 import logging
-import warnings
 import diffusers
 
 if not torch.cuda.is_available():
