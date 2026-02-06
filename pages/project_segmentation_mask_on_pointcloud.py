@@ -9,7 +9,7 @@ import time
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional
 
-from visualization_helper import (
+from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
     draw_projected_cuboid_bboxes,
     add_frustums_to_figure,
@@ -17,10 +17,10 @@ from visualization_helper import (
     create_3d_scatter_plot,
     create_comparison_plot,
 )
-from frustum_manager import FrustumManager
-from evaluation import compute_3d_iou, run_pipeline_on_sample
-from clustering_manager import ClusteringManager
-from pointcloud_projection import filter_points_in_frustum
+from components.core.frustum_manager import FrustumManager
+from components.core.evaluation import compute_3d_iou, run_pipeline_on_sample
+from components.core.clustering_manager import ClusteringManager
+from components.core.pointcloud_projection import filter_points_in_frustum
 
 def project_segmentation_mask_on_pointcloud_page(sample_data, point_cloud):
     st.header("🎯 Projection & Frustum Visualization")

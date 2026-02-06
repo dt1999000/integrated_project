@@ -292,7 +292,8 @@ class AnnotationVisualizer:
                 geometries.append(ann_pcd)
         
         # Add detected clusters in different colors
-        colors = plt.cm.tab20(np.linspace(0, 1, len(detected_clusters)))[:, :3]
+                import matplotlib.pyplot as plt
+                colors = plt.cm.tab20(np.linspace(0, 1, len(detected_clusters)))[:, :3]
         for i, cluster_indices in enumerate(detected_clusters):
             if len(cluster_indices) > 0:
                 cluster_pcd = o3d.geometry.PointCloud()

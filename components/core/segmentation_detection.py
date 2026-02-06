@@ -11,7 +11,7 @@ from typing import List, Dict, Tuple, Optional, Union
 import matplotlib.pyplot as plt
 from pathlib import Path
 from ultralytics.models.sam import SAM2DynamicInteractivePredictor
-from bounding_boxes import BoundingBoxes
+from ..utils.bounding_boxes import BoundingBoxes
 
 
 class SegmentationDetector:

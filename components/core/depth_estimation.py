@@ -290,7 +290,7 @@ class DepthEstimator:
         # Create projection if not cached or if point cloud changed
         if self._projection is None or (point_cloud is not None and 
                                        not np.array_equal(self._projection.point_cloud, point_cloud)):
-            from pointcloud_projection import Projection
+            from .pointcloud_projection import Projection
             
             # Use dummy point cloud if none provided (will be updated when needed)
             dummy_pc = point_cloud if point_cloud is not None else np.array([[0, 0, 0]])

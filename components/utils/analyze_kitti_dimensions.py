@@ -10,7 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from typing import Dict, List
-from kitti_dataset_loader import KITTIDatasetLoader
+from ..dataset_loaders.kitti_dataset_loader import KITTIDatasetLoader
 
 
 def collect_cuboid_dimensions(dataroot: str = "dataset/kitti") -> Dict[str, Dict[str, List[float]]]:

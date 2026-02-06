@@ -12,7 +12,7 @@ from sklearn.neighbors import NearestNeighbors
 import open3d as o3d
 
 # Import the new clustering manager
-from clustering_manager import ClusteringManager
+from .clustering_manager import ClusteringManager
 
 
 # =============================================================================

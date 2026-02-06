@@ -11,11 +11,11 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from typing import Dict, List, Optional
 
-from visualization_helper import create_3d_scatter_plot
-from frustum_manager import FrustumManager
-from evaluation import compute_3d_iou, run_pipeline_on_sample
-from clustering_manager import ClusteringManager
-from pointcloud_projection import filter_points_in_frustum
+from components.utils.visualization_helper import create_3d_scatter_plot
+from components.core.frustum_manager import FrustumManager
+from components.core.evaluation import compute_3d_iou, run_pipeline_on_sample
+from components.core.clustering_manager import ClusteringManager
+from components.core.pointcloud_projection import filter_points_in_frustum
 
 def depth_estimation_page():
     """Depth Estimation and 3D Reconstruction page"""

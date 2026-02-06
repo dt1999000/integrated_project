@@ -5,7 +5,8 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from evaluation import compute_3d_iou, run_pipeline_on_sample
+from components.core.evaluation import compute_3d_iou, run_pipeline_on_sample
+from components.core.constants import KITTI_CUBOID_TEMPLATES
 
 def statistics_page():
     """Batch evaluation statistics page for KITTI dataset"""
@@ -165,7 +166,6 @@ def statistics_page():
     pipeline_params['depth_threshold_max'] = 80.0
     
     # Get template dimensions (only used for PCA, L-shape returns its own dimensions)
-    from clustering_manager import KITTI_CUBOID_TEMPLATES
     template_dims = KITTI_CUBOID_TEMPLATES if pose_estimation_method == 'pca' else None
     if template_dims:
         pipeline_params['template_dims'] = template_dims

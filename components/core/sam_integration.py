@@ -175,50 +175,75 @@ class SAMModelManager:
         results = self.model(image)
         return results
     
-    def get_segmentation_masks(self, results: Dict) -> np.ndarray:
+    def get_segmentation_masks(self, results: Dict, image_shape: Optional[Tuple[int, int]] = None) -> np.ndarray:
         """
         Extract segmentation masks from prediction results.
         
         Args:
-            results: Dictionary with prediction results
+            results: Dictionary with prediction results or list of results
+            image_shape: Optional (height, width) tuple for mask dimensions.
+                        If None, will try to infer from results.
             
         Returns:
             Segmentation mask as numpy array (H, W) with integer labels
         """
+        # Determine image shape
+        if image_shape is None:
+            # Try to infer from results
+            if results and len(results) > 0:
+                if hasattr(results[0], 'masks') and results[0].masks is not None:
+                    mask_shape = results[0].masks[0].shape[-2:]
+                    image_shape = (mask_shape[0], mask_shape[1])
+                else:
+                    # Default shape if can't infer
+                    image_shape = (1024, 1024)
+            else:
+                image_shape = (1024, 1024)
+        
+        h, w = image_shape
+        
         if self.model_type.startswith("sam2"):
             # Extract masks from SAM2 results
             if results and len(results) > 0:
                 # Create empty mask
-                mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                mask = np.zeros((h, w), dtype=np.uint8)
                 
                 # Process each result
                 for i, result in enumerate(results):
                     if result.masks is not None and len(result.masks) > 0:
                         # Get the first mask
                         seg_mask = result.masks[0].cpu().numpy()
+                        # Resize if needed
+                        if seg_mask.shape[-2:] != (h, w):
+                            import cv2
+                            seg_mask = cv2.resize(seg_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
                         # Add to mask with unique label
                         mask[seg_mask > 0.5] = i + 1
                 
                 return mask
             else:
-                return np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                return np.zeros((h, w), dtype=np.uint8)
         else:
             # For other SAM models, extract masks differently
             if results and hasattr(results[0], 'masks'):
                 # Create empty mask
-                mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                mask = np.zeros((h, w), dtype=np.uint8)
                 
                 # Process each result
                 for i, result in enumerate(results):
                     if result.masks is not None and len(result.masks) > 0:
                         # Get the first mask
                         seg_mask = result.masks[0].cpu().numpy()
+                        # Resize if needed
+                        if seg_mask.shape[-2:] != (h, w):
+                            import cv2
+                            seg_mask = cv2.resize(seg_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
                         # Add to mask with unique label
                         mask[seg_mask > 0.5] = i + 1
                 
                 return mask
             else:
-                return np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                return np.zeros((h, w), dtype=np.uint8)
 
 
 class BoundingBoxToSAM:
@@ -283,6 +308,7 @@ class BoundingBoxToSAM:
         results = self.sam_manager.predict_from_bboxes(image, bboxes)
         
         # Extract masks
-        mask = self.sam_manager.get_segmentation_masks(results)
+        image_shape = (image.shape[0], image.shape[1]) if image is not None else None
+        mask = self.sam_manager.get_segmentation_masks(results, image_shape=image_shape)
         
         return mask

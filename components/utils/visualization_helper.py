@@ -9,7 +9,7 @@ import plotly.express as px
 import cv2
 from typing import Dict, List, Optional
 
-from pointcloud_projection import Projection
+from ..core.pointcloud_projection import Projection
 
 
 # =============================================================================

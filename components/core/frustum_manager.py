@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 import numpy as np
 
-from pointcloud_projection import Projection, filter_points_in_frustum
-from clustering_manager import ClusteringManager
+from .pointcloud_projection import Projection, filter_points_in_frustum
+from .clustering_manager import ClusteringManager
 
 
 def compute_bbox_iou(bbox1: Dict[str, float], bbox2: Dict[str, float]) -> float:

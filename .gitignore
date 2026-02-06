@@ -23,3 +23,6 @@ nul
 .cursor
 checkpoints/
 req.txt
+media/*
+cvat_export/*
+cvat_example_export/*

@@ -6,11 +6,11 @@ import streamlit as st
 import sys
 import os
 
-# Add the current directory to the path to import our modules
+# Add the components directory to the path to import our modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from kitti_dataset_loader import KITTIDatasetLoader
-from pointcloud_projection import PointCloud
+from components.dataset_loaders.kitti_dataset_loader import KITTIDatasetLoader
+from components.core.pointcloud_projection import PointCloud
 
 
 def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3, 

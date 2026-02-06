@@ -11,10 +11,10 @@ import numpy as np
 
 from shapely.geometry import Polygon
 
-from kitti_dataset_loader import KITTIDatasetLoader
-from pointcloud_projection import PointCloud
-from frustum_manager import FrustumManager
-from depth_estimation import DepthEstimator
+from ..dataset_loaders.kitti_dataset_loader import KITTIDatasetLoader
+from .pointcloud_projection import PointCloud
+from .frustum_manager import FrustumManager
+from .depth_estimation import DepthEstimator
 import cv2
 
 

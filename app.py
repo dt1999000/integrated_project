@@ -3,7 +3,7 @@ import numpy as np
 import sys
 import os
 import cv2
-from depth_estimation import DepthEstimator
+from components.core.depth_estimation import DepthEstimator
 # Add the current directory to the path to import our modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Import page functions from pages module
