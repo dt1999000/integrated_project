@@ -6,9 +6,10 @@ import numpy as np
 import pandas as pd
 import time
 
-from visualization_helper import create_3d_scatter_plot
-from frustum_manager import FrustumManager
-from clustering_manager import ClusteringManager
+from components.utils.visualization_helper import create_3d_scatter_plot
+from components.core.frustum_manager import FrustumManager
+from components.core.clustering_manager import ClusteringManager
+from components.core.constants import KITTI_CUBOID_TEMPLATES
 
 def dbscan_page(point_cloud):
     """DBSCAN algorithm parameter control and visualization page"""
@@ -93,7 +94,6 @@ def dbscan_page(point_cloud):
                 pose_estimation_method = st.session_state.get('pose_estimation_method', 'l_shape')
                 
                 # Get template dimensions (only used for PCA, L-shape returns its own dimensions)
-                from clustering_manager import KITTI_CUBOID_TEMPLATES
                 template_dims = KITTI_CUBOID_TEMPLATES if pose_estimation_method == 'pca' else None
 
                 # Run per-frustum clustering with overlap validation
