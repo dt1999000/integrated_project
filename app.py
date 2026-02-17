@@ -3,20 +3,15 @@ import numpy as np
 import sys
 import os
 import cv2
-from depth_estimation import DepthEstimator
+import time
+from components.core.depth_estimation import DepthEstimator
 # Add the current directory to the path to import our modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Import page functions from pages module
 from pages.project_segmentation_mask_on_pointcloud import project_segmentation_mask_on_pointcloud_page
-from pages.dbscan import dbscan_page
-from pages.optics import optics_page
-from pages.birch import birch_page
-from pages.agglomerative import agglomerative_page
-from pages.hdbscan import hdbscan_page
 from pages.kitti_groundtruth import kitti_groundtruth_page
-from pages.statistics import statistics_page
 from pages.depth_estimation import depth_estimation_page
-from pages.utils import load_dataset_sample
+from components.core.utils import load_dataset_sample
 
 # Configure Streamlit page
 st.set_page_config(
@@ -73,14 +68,18 @@ if 'depth_image' not in st.session_state:
     st.session_state.depth_image = None
 if 'reconstructed_points' not in st.session_state:
     st.session_state.reconstructed_points = None
-if 'original_point_cloud_before_reconstruction' not in st.session_state:
-    st.session_state.original_point_cloud_before_reconstruction = None
 if 'depth_estimator' not in st.session_state:
     st.session_state.depth_estimator = None
 if 'sparse_depth_map' not in st.session_state:
     st.session_state.sparse_depth_map = None
 if 'completed_depth_map' not in st.session_state:
     st.session_state.completed_depth_map = None
+if 'sam_masks' not in st.session_state:
+    st.session_state.sam_masks = None  # List of masks, one per bbox/instance
+if 'sam_integration' not in st.session_state:
+    st.session_state.sam_integration = None
+if 'sam_model_type' not in st.session_state:
+    st.session_state.sam_model_type = 'sam2_t'
 
 # Initialize centralized parameters dict
 if 'params' not in st.session_state:
@@ -257,15 +256,41 @@ def main():
                     st.success(f"✅ {dataset.upper()} sample {sample_index} loaded!")
                 st.rerun()
 
-    # Depth estimation settings
-    st.sidebar.markdown("### Depth Estimation")
-    use_marigold = st.sidebar.checkbox(
-        "Use Marigold (better quality, slower)",
-        value=True,
-        key="use_marigold_checkbox",
-        help="Marigold provides metric depth. Falls back to Depth Anything if unavailable."
+    # SAM segmentation settings
+    st.sidebar.markdown("### SAM Segmentation")
+    sam_model_type = st.sidebar.selectbox(
+        "SAM Model",
+        options=['sam2_t', 'sam3'],
+        index=0,
+        key="sam_model_type",
+        help="SAM2: Uses bounding boxes as prompts. SAM3: Uses text prompts for class-based segmentation."
     )
     
+    # Initialize SAM integration if not already done, if None, or if model type changed
+    # Use a separate key to track the initialized model type (can't modify widget key directly)
+    initialized_model_type = st.session_state.get('sam_initialized_model_type')
+    needs_init = (
+        'sam_integration' not in st.session_state or 
+        st.session_state.sam_integration is None or
+        initialized_model_type != sam_model_type
+    )
+    
+    if needs_init:
+        try:
+            from components.core.sam_integration import SAMIntegration
+            st.session_state.sam_integration = SAMIntegration(model_type=sam_model_type)
+            st.session_state.sam_initialized_model_type = sam_model_type
+            print(f"SAM integration initialized successfully with model type: {sam_model_type}")
+        except Exception as e:
+            error_msg = str(e)
+            st.sidebar.warning(f"SAM initialization failed: {error_msg}")
+            print(f"SAM initialization error: {error_msg}")
+            import traceback
+            print(traceback.format_exc())
+            st.session_state.sam_integration = None
+    
+    # Depth estimation settings (sparse depth only in this branch)
+    st.sidebar.markdown("### Depth Estimation (Sparse Depth Only)")
     # Pose estimation parameters - always enabled, prefer l_shape_fitting
     st.sidebar.markdown("### Pose Estimation")
     pose_estimation_method = st.sidebar.selectbox(
@@ -325,160 +350,153 @@ def main():
             value=st.session_state.params['marigold_dc']['use_tiny_vae'],
             key="dc_tiny_vae",
             help="Use lightweight VAE for faster processing (lower quality)")
+        
+    reconstruct_full = st.sidebar.button("🔧 Generate SAM Masks", key="reconstruct_points")
+    reconstruct_per_bbox = False
     
-    if st.sidebar.button("🔧 Reconstruct Points", key="reconstruct_points"):
+    if reconstruct_full:
+        per_bbox_mode = False
         sample_data = st.session_state.get("sample_data")
         if not sample_data:
             st.sidebar.warning("Load a sample first to reconstruct points.")
         else:
-            with st.spinner("Initializing depth estimation model..."):
-                # Initialize depth estimator if not already done or settings changed
-                dc_params = st.session_state.params.get('marigold_dc', {})
-                use_full_precision = dc_params.get('use_full_precision', False)
-                use_tiny_vae = dc_params.get('use_tiny_vae', False)
-                
-                # Initialize or update camera parameters
-                needs_init = st.session_state.depth_estimator is None
-                if needs_init:
-                    try:
-                        st.session_state.depth_estimator = DepthEstimator(
-                            use_marigold=use_marigold,
-                            use_full_precision=use_full_precision,
-                            use_tiny_vae=use_tiny_vae,
-                            camera_intrinsic=sample_data['camera_intrinsic'],
-                            camera_to_lidar_transform=sample_data['camera_to_lidar_transform']
+            # Load image
+            img = cv2.imread(sample_data['image_path'])
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            # Generate SAM masks if SAM integration is available and we have KITTI data
+            sam_masks = None
+            if st.session_state.sam_integration is not None:
+                ground_truth_boxes = sample_data.get('ground_truth_boxes', [])
+                if ground_truth_boxes:
+                    sam_integration = st.session_state.sam_integration
+
+                    if st.session_state.sam_model_type.startswith('sam2'):
+                        masks = []
+                        for gt_box in ground_truth_boxes:
+                            bbox_2d = gt_box.get('bbox_2d')
+                            if bbox_2d is not None:
+                                bbox_list = [
+                                    bbox_2d['left'],
+                                    bbox_2d['top'],
+                                    bbox_2d['right'],
+                                    bbox_2d['bottom'],
+                                ]
+                                mask = sam_integration.get_mask_from_bbox(img_rgb, bbox_list)
+                                masks.append(mask)
+                        sam_masks = masks
+                        print(f"Generated {len(masks)} masks using SAM2 from bounding boxes")
+
+                    elif st.session_state.sam_model_type == 'sam3':
+                        class_names = list(
+                            set([box.get('category', 'unknown') for box in ground_truth_boxes])
                         )
-                    except Exception as e:
-                        st.sidebar.error(f"Failed to initialize depth estimator: {str(e)}")
-                        st.sidebar.info("Try unchecking 'Use Marigold' to use Depth Anything instead.")
-                        st.stop()
-                else:
-                    # Update camera parameters if they changed
-                    st.session_state.depth_estimator.set_camera_params(
-                        camera_intrinsic=sample_data['camera_intrinsic'],
-                        camera_to_lidar_transform=sample_data['camera_to_lidar_transform']
-                    )
+                        class_names = [
+                            c for c in class_names if c != 'unknown' and c != 'DontCare'
+                        ]
+
+                        if class_names:
+                            segment_results = sam_integration.segment_by_classes(
+                                img_rgb, class_names
+                            )
+                            all_masks = segment_results['masks']
+
+                            bboxes_list = []
+                            for gt_box in ground_truth_boxes:
+                                bbox_2d = gt_box.get('bbox_2d')
+                                if bbox_2d is not None:
+                                    bboxes_list.append(
+                                        [
+                                            bbox_2d['left'],
+                                            bbox_2d['top'],
+                                            bbox_2d['right'],
+                                            bbox_2d['bottom'],
+                                        ]
+                                    )
+
+                            if bboxes_list:
+                                matches = sam_integration.match_instances_to_bboxes(
+                                    all_masks, bboxes_list, iou_threshold=0.3
+                                )
+
+                                masks = [None] * len(bboxes_list)
+                                for mask_idx, bbox_idx in matches.items():
+                                    masks[bbox_idx] = all_masks[mask_idx]
+
+                                sam_masks = [m for m in masks if m is not None]
+                                print(
+                                    f"Generated {len(all_masks)} masks using SAM3, "
+                                    f"matched {len(sam_masks)} to bounding boxes"
+                                )
+                            else:
+                                sam_masks = all_masks
+                                print(
+                                    f"Generated {len(all_masks)} masks using SAM3 (no bbox matching)"
+                                )
+
+            st.session_state.sam_masks = sam_masks
+            
+            # Get boundaries from masks and remove boundary points from reprojected points
+            if sam_masks is not None and len(sam_masks) > 0:
+                # Get combined boundary mask from all masks
+                boundary_mask = sam_integration.get_object_boundaries(sam_masks)
                 
-                # Load image
-                try:
-                    img = cv2.imread(sample_data['image_path'])
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                # Remove boundary points from colored_sparse_points
+                if (st.session_state.get('colored_sparse_points') is not None and 
+                    len(st.session_state.get('colored_sparse_points', [])) > 0):
                     
-                    # Get LiDAR point cloud if available for sparse depth prior
-                    # Use original point cloud (before ground removal) for sparse depth map
+                    colored_points = st.session_state.colored_sparse_points
+                    colored_colors = st.session_state.colored_sparse_colors
+                    
+                    # Project points to 2D to check if they're at boundaries
+                    from components.core.pointcloud_projection import Projection
+                    projection = Projection(
+                        camera_intrinsic=sample_data['camera_intrinsic'],
+                        camera_extrinsic=sample_data.get('camera_extrinsic', np.eye(4)),
+                        camera_to_lidar_transform=sample_data['camera_to_lidar_transform'],
+                        point_cloud=colored_points
+                    )
+                    
+                    pixels, valid_mask = projection.point_to_pixel(colored_points)
                     h, w = img_rgb.shape[:2]
                     
-                    if st.session_state.point_cloud is not None:
-                        # Keep a separate copy of the original point cloud before reconstruction
-                        if 'original_point_cloud_before_reconstruction' not in st.session_state:
-                            st.session_state.original_point_cloud_before_reconstruction = st.session_state.point_cloud.copy()
-                        
-                        # Use original point cloud for sparse depth creation
-                        lidar_points_original = st.session_state.point_cloud.original_point_cloud
-                        print(f"Using {len(lidar_points_original):,} original LiDAR points for sparse depth map")
-                        
-                        # Create sparse depth map from original point cloud
-                        sparse_depth = st.session_state.depth_estimator.create_sparse_depth_map(
-                            point_cloud=lidar_points_original,
-                            image_shape=(h, w)
-                        )
-                        st.session_state.sparse_depth_map = sparse_depth
-                        print(f"Created sparse depth map: {np.sum(sparse_depth > 0):,} valid depth points")
-                        
-                        # Get DC parameters
-                        dc_params = st.session_state.params.get('marigold_dc', {})
-                        
-                        # Complete depth using Marigold-DC
-                        print("Running depth completion with Marigold-DC...")
-                        completed_depth = st.session_state.depth_estimator.complete_depth(
-                            image=img_rgb,
-                            sparse_depth=sparse_depth,
-                            num_inference_steps=dc_params.get('num_inference_steps', 50),
-                            ensemble_size=dc_params.get('ensemble_size', 1),
-                            processing_resolution=dc_params.get('processing_resolution', 768),
-                            seed=dc_params.get('seed', 2024)
-                        )
-                        st.session_state.completed_depth_map = completed_depth
-                        st.session_state.depth_map = completed_depth
-                        
-                        # Reconstruct 3D points from completed depth
-                        print("Reconstructing 3D points from completed depth...")
-                        reconstructed_points = st.session_state.depth_estimator.reconstruct_points_from_depth(
-                            depth_map=completed_depth,
-                            stride=2,  # Subsample to reduce point count
-                            depth_threshold_min=0.5,
-                            depth_threshold_max=80.0
-                        )
-                        print(f"Reconstructed {len(reconstructed_points):,} points from completed depth")
-                        
-                        # Filter out points close to the ground using ground plane model
-                        if st.session_state.point_cloud.ground_removed and st.session_state.point_cloud.ground_plane_model is not None:
-                            ground_plane_model = st.session_state.point_cloud.ground_plane_model
-                            a, b, c, d = ground_plane_model
-                            
-                            # Compute distance from each point to the ground plane
-                            # Distance = |ax + by + cz + d| / sqrt(a² + b² + c²)
-                            plane_normal_norm = np.sqrt(a**2 + b**2 + c**2)
-                            if plane_normal_norm > 1e-6:
-                                # Signed distance: (ax + by + cz + d) / ||normal||
-                                distances = (reconstructed_points[:, 0] * a + 
-                                            reconstructed_points[:, 1] * b + 
-                                            reconstructed_points[:, 2] * c + d) / plane_normal_norm
-                                
-                                # Filter out points too close to ground (within distance_threshold)
-                                distance_threshold = st.session_state.params['pipeline']['distance_threshold']
-                                above_ground_mask = distances > distance_threshold
-                                n_filtered = np.sum(~above_ground_mask)
-                                
-                                reconstructed_points = reconstructed_points[above_ground_mask]
-                                print(f"Filtered {n_filtered:,} points close to ground (threshold: {distance_threshold:.2f}m)")
-                                print(f"Remaining reconstructed points: {len(reconstructed_points):,}")
-                        
-                        st.session_state.reconstructed_points = reconstructed_points
-                        
-                        # Add reconstructed points to original point cloud and update session_state
-                        print(f"Adding {len(reconstructed_points):,} reconstructed points to point cloud...")
-                        st.session_state.point_cloud.original_point_cloud = np.vstack([
-                            st.session_state.point_cloud.original_point_cloud,
-                            reconstructed_points
-                        ])
-                        print(f"Combined point cloud now has {len(st.session_state.point_cloud.original_point_cloud):,} points")
-                        
-                        # Re-run ground plane removal on combined point cloud
-                        print("Re-running ground plane removal on combined point cloud...")
-                        st.session_state.point_cloud.remove_ground_plane_ransac(
-                            distance_threshold=st.session_state.params['pipeline']['distance_threshold'],
-                            ransac_n=st.session_state.params['pipeline']['ransac_n'],
-                            num_iterations=st.session_state.params['pipeline']['num_iterations'],
-                            filter_forward_only=st.session_state.params['pipeline']['filter_forward_only']
-                        )
-                        
-                        # Update ground_z in session state
-                        ground_z = st.session_state.point_cloud.get_ground_z(x=0.0, y=0.0)
-                        st.session_state.ground_z = ground_z
-                        st.session_state.ground_plane_model = st.session_state.point_cloud.ground_plane_model
-                        
-                        n_sparse = np.sum(sparse_depth > 0)
-                        coverage = 100 * n_sparse / (h * w)
-                        st.sidebar.success(f"✅ Points reconstructed! Coverage: {coverage:.1f}% → 100%. Added {len(reconstructed_points):,} points to point cloud.")
-                    else:
-                        # No point cloud available, use regular depth estimation
-                        depth_map = st.session_state.depth_estimator.get_depth_map_marigold(img_rgb)
-                        st.session_state.depth_map = depth_map
-                        reconstructed_points = st.session_state.depth_estimator.reconstruct_points_from_depth(
-                            depth_map=depth_map,
-                            stride=2,
-                            depth_threshold_min=0.5,
-                            depth_threshold_max=80.0
-                        )
-                        st.session_state.reconstructed_points = reconstructed_points
-                        st.sidebar.success(f"✅ Depth estimated! Reconstructed {len(reconstructed_points):,} points")
+                    # Check which points are at boundaries
+                    in_bounds = (
+                        (pixels[:, 0] >= 0) & (pixels[:, 0] < w) &
+                        (pixels[:, 1] >= 0) & (pixels[:, 1] < h)
+                    )
+                    valid_mask &= in_bounds
                     
-                    st.rerun()
-                except Exception as e:
-                    st.sidebar.error(f"Depth estimation failed: {str(e)}")
-                    import traceback
-                    st.sidebar.code(traceback.format_exc())
+                    # Filter out points at boundaries
+                    keep_mask = np.ones(len(colored_points), dtype=bool)
+                    valid_pixels = pixels[valid_mask].astype(int)
+                    valid_indices = np.where(valid_mask)[0]
+                    
+                    for i, (u, v) in enumerate(valid_pixels):
+                        if 0 <= v < h and 0 <= u < w:
+                            if boundary_mask[v, u] > 0:
+                                # Point is at boundary, mark for removal
+                                point_idx = valid_indices[i]
+                                keep_mask[point_idx] = False
+                    
+                    # Filter points and colors
+                    filtered_points = colored_points[keep_mask]
+                    
+                    # Handle colors (should be numpy array with same length as points)
+                    if isinstance(colored_colors, np.ndarray) and len(colored_colors) == len(colored_points):
+                        filtered_colors = colored_colors[keep_mask]
+                    else:
+                        # Fallback: keep original colors if format doesn't match
+                        filtered_colors = colored_colors
+                    
+                    n_removed = np.sum(~keep_mask)
+                    print(f"Removed {n_removed} boundary points from {len(colored_points)} reprojected points")
+                    
+                    # Update session state
+                    st.session_state.colored_sparse_points = filtered_points
+                    st.session_state.colored_sparse_colors = filtered_colors
+            
+            st.rerun()
     # Navigation tabs
     point_cloud = st.session_state.point_cloud
     if point_cloud is None:
@@ -526,8 +544,8 @@ def main():
         st.session_state.overlap_threshold = st.session_state.params['pipeline']['overlap_threshold']
         st.session_state.use_templates = st.session_state.params['pipeline']['use_templates']
     # Main navigation
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "SEGMENTATION AND PROJECTION", "DEPTH ESTIMATION AND RECONSTRUCTION", "CLUSTERING", "KITTI Ground Truth", "Statistics"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "SEGMENTATION AND PROJECTION", "DEPTH ESTIMATION AND RECONSTRUCTION", "DETECTION RESULTS", "KITTI Ground Truth", "Mask & Backprojection", "Clustering"
     ])
 
     with tab1:
@@ -535,24 +553,16 @@ def main():
     with tab2:
         depth_estimation_page()
     with tab3:
-        cluster_tab1, cluster_tab2, cluster_tab3, cluster_tab4, cluster_tab5 = st.tabs([
-            "HDBSCAN", "DBSCAN", "BIRCH", "Agglomerative", "OPTICS"
-        ])
-        with cluster_tab1:
-            hdbscan_page(point_cloud)
-        with cluster_tab2:
-            dbscan_page(point_cloud)
-        with cluster_tab3:
-            birch_page(point_cloud)
-        with cluster_tab4:
-            agglomerative_page(point_cloud)
-        with cluster_tab5:
-            optics_page(point_cloud)
+        from pages.detection_result import detection_result_page
+        detection_result_page()
     with tab4:
         kitti_groundtruth_page()
     with tab5:
-        statistics_page()
-        
+        from pages.sam_segmentation import sam_segmentation_page
+        sam_segmentation_page()
+    with tab6:
+        from pages.clustering import clustering_page
+        clustering_page()
 
 if __name__ == "__main__":
     main()

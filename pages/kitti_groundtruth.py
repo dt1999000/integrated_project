@@ -9,7 +9,7 @@ import time
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional
 
-from visualization_helper import (
+from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
     draw_projected_cuboid_bboxes,
     add_frustums_to_figure,
@@ -17,10 +17,10 @@ from visualization_helper import (
     create_3d_scatter_plot,
     create_comparison_plot,
 )
-from frustum_manager import FrustumManager
-from evaluation import compute_3d_iou, run_pipeline_on_sample
-from clustering_manager import ClusteringManager
-from pointcloud_projection import filter_points_in_frustum
+from components.core.frustum_manager import FrustumManager
+from components.core.evaluation import compute_3d_iou, run_pipeline_on_sample
+from components.core.clustering_manager import ClusteringManager
+from components.core.pointcloud_projection import filter_points_in_frustum
 
 def kitti_groundtruth_page():
     """KITTI Ground Truth Comparison page - Uses same pipeline as other pages"""
@@ -145,73 +145,25 @@ def kitti_groundtruth_page():
     else:
         st.warning("No ground truth boxes available for this sample")
 
-    # Check if user has run clustering
+    # Check if detection results are available
     st.subheader("🔴 Pipeline Detection Results")
     detected_cuboids = st.session_state.get('cuboids', [])
-    available_algos = [
-        algo for algo in ['hdbscan', 'dbscan', 'birch', 'agglomerative', 'optics', 'frustum_filtered']
-        if algo in st.session_state.clustering_results
-    ]
 
-    if not available_algos and not detected_cuboids:
-        st.info("Run a clustering algorithm to see pipeline detection results.")
+    if not detected_cuboids:
+        st.info("No detection results available. Please run detection on the 'DETECTION RESULTS' tab first.")
         return
 
-    clustering_result = None
-    algo_name = None
-    if available_algos:
-        algo_labels = {
-            'hdbscan': 'HDBSCAN',
-            'dbscan': 'DBSCAN',
-            'birch': 'BIRCH',
-            'agglomerative': 'Agglomerative',
-            'optics': 'OPTICS',
-            'frustum_filtered': 'Frustum Filtered'
-        }
-        label_to_algo = {algo_labels[algo]: algo for algo in available_algos}
-        selected_label = st.selectbox("Clustering Result", list(label_to_algo.keys()))
-        algo_name = label_to_algo[selected_label]
-        clustering_result = st.session_state.clustering_results.get(algo_name)
-
-    labels = clustering_result.get('labels') if clustering_result else None
-    is_frustum_filtered = False
-    if clustering_result:
-        is_frustum_filtered = clustering_result.get('is_frustum_based', False) or algo_name == 'frustum_filtered'
-
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         st.metric("Ground Truth Objects", len(ground_truth_boxes))
     with col2:
-        if detected_cuboids:
-            detected_count = len(detected_cuboids)
-        elif labels is not None:
-            unique_labels = np.unique(labels)
-            detected_count = len(unique_labels) - (1 if -1 in unique_labels else 0)
-        else:
-            detected_count = 0
-        st.metric("Detected Clusters", detected_count)
-    with col3:
-        if is_frustum_filtered and clustering_result:
-            bbox_results = clustering_result.get('bbox_results', [])
-            n_successful = sum(1 for r in bbox_results if r['status'] == 'success')
-            st.metric("BBoxes with Clusters", n_successful)
-        elif labels is not None:
-            n_noise = np.sum(labels == -1) if -1 in labels else 0
-            st.metric("Noise Points", n_noise)
-        elif clustering_result:
-            st.metric("Method", "Frustum-based")
-        else:
-            st.metric("Method", "Cuboids only")
-
-    if not detected_cuboids:
-        st.info("No cuboids available for IoU matching yet.")
-        return
+        st.metric("Detected Objects", len(detected_cuboids))
 
     # 3D IoU Matching Statistics Section
     st.subheader("📊 3D IoU Matching Statistics")
     st.markdown("""
     **Matching Logic:** Each detected cuboid is matched to the ground truth box using `source_bbox_idx`
-    which corresponds to the frustum index. The 3D IoU measures volumetric overlap between
+    which corresponds to the mask index matched to the bounding box. The 3D IoU measures volumetric overlap between
     detected and ground truth cuboids.
     """)
 
