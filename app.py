@@ -304,6 +304,61 @@ def main():
     use_pose_estimation = True
     st.session_state.use_pose_estimation_checkbox = True
     
+    # Cuboid fitting parameters
+    st.sidebar.markdown("### Cuboid Fitting")
+    if 'cuboid_fitting' not in st.session_state.params:
+        st.session_state.params['cuboid_fitting'] = {
+            'w_distance': 1.0,
+            'w_geometric': 0.5,
+            'w_outlier': 2.0,
+            'step_center_search': 0.2,
+            'max_step_center': 10,
+            'd_theta': 0.05
+        }
+    
+    with st.sidebar.expander("Cuboid Fitting Parameters", expanded=False):
+        st.session_state.params['cuboid_fitting']['w_distance'] = st.slider(
+            "Weight: Distance to Faces",
+            min_value=0.0, max_value=5.0,
+            value=st.session_state.params['cuboid_fitting']['w_distance'],
+            step=0.1, key="cuboid_w_dist",
+            help="Weight for squared distance from points to visible cuboid faces")
+        
+        st.session_state.params['cuboid_fitting']['w_geometric'] = st.slider(
+            "Weight: Geometric Consistency",
+            min_value=0.0, max_value=5.0,
+            value=st.session_state.params['cuboid_fitting']['w_geometric'],
+            step=0.1, key="cuboid_w_geo",
+            help="Weight for geometric consistency (surface normal alignment)")
+        
+        st.session_state.params['cuboid_fitting']['w_outlier'] = st.slider(
+            "Weight: Outlier Penalty",
+            min_value=0.0, max_value=10.0,
+            value=st.session_state.params['cuboid_fitting']['w_outlier'],
+            step=0.1, key="cuboid_w_out",
+            help="Weight for penalty on points outside the cuboid")
+        
+        st.session_state.params['cuboid_fitting']['step_center_search'] = st.slider(
+            "Center Search Step Size",
+            min_value=0.05, max_value=1.0,
+            value=st.session_state.params['cuboid_fitting']['step_center_search'],
+            step=0.05, key="cuboid_step_center",
+            help="Step size for center search along the ray (meters)")
+        
+        st.session_state.params['cuboid_fitting']['max_step_center'] = st.slider(
+            "Max Center Search Steps",
+            min_value=1, max_value=20,
+            value=st.session_state.params['cuboid_fitting']['max_step_center'],
+            step=1, key="cuboid_max_steps",
+            help="Maximum number of steps for center search")
+        
+        st.session_state.params['cuboid_fitting']['d_theta'] = st.slider(
+            "Yaw Search Step (radians)",
+            min_value=0.01, max_value=0.2,
+            value=st.session_state.params['cuboid_fitting']['d_theta'],
+            step=0.01, key="cuboid_d_theta",
+            help="Angular step size for yaw search (smaller = more precise but slower)")
+    
     # Marigold-DC parameters
     with st.sidebar.expander("Marigold-DC Parameters", expanded=False):
         st.session_state.params['marigold_dc'] = st.session_state.params.get('marigold_dc', {

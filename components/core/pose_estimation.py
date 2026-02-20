@@ -6,7 +6,7 @@ from 3D point clouds. Supports PCA-based and L-shape fitting approaches.
 """
 
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # Import templates from constants (avoid circular import by checking if already imported)
 try:
@@ -25,6 +25,46 @@ except ImportError:
         'Unknown': {'length': 2.0, 'width': 1.5, 'height': 1.5},
     }
 
+# Import LLM service
+try:
+    from .llm_service import query_llm_for_dimensions
+except ImportError:
+    # Fallback if LLM service not available
+    def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
+        """Fallback when LLM service is not available"""
+        return 4.0, 1.8, 1.6
+
+
+def get_dimensions_from_class(class_name: Optional[str]) -> Tuple[float, float, float]:
+    """
+    Get typical physical dimensions for a semantic class.
+
+    The function first looks up `class_name` in `KITTI_CUBOID_TEMPLATES`. If it
+    is not present, it calls an LLM-backed service to get a reasonable guess
+    for (length, width, height) and returns that as a tuple.
+
+    Args:
+        class_name: Semantic class name (e.g. 'Car', 'Pedestrian'). If None,
+                    a generic default size is used.
+
+    Returns:
+        (length, width, height) in meters.
+    """
+    if class_name is None:
+        # Fully generic default dimensions
+        return 4.0, 1.8, 1.6
+
+    template = KITTI_CUBOID_TEMPLATES.get(class_name)
+    if template is not None:
+        return (
+            float(template.get('length', 4.0)),
+            float(template.get('width', 1.8)),
+            float(template.get('height', 1.6)),
+        )
+
+    # Fallback: ask the LLM for typical dimensions
+    length, width, height = query_llm_for_dimensions(class_name)
+    return float(length), float(width), float(height)
 
 def estimate_pose_pca(points: np.ndarray, category: Optional[str] = None) -> Dict:
     """
@@ -100,9 +140,11 @@ def estimate_pose_pca(points: np.ndarray, category: Optional[str] = None) -> Dic
     }
 
 
-def estimate_pose_l_shape(points: np.ndarray, d_theta: float = 0.01, 
+def estimate_pose_l_shape(points: np.ndarray,
+                          d_theta: float = 0.01,
                           ground_plane_model: Optional[np.ndarray] = None,
-                          category: Optional[str] = None) -> Dict:
+                          dimensions: Optional[Tuple[float, float, float]] = None
+                          ) -> Dict:
     """
     Finds the best yaw by minimizing the bounding box area (L-shape fitting).
     
@@ -114,9 +156,9 @@ def estimate_pose_l_shape(points: np.ndarray, d_theta: float = 0.01,
         points: np.ndarray (N, 3) - 3D points in LiDAR coordinates
         d_theta: float - Angular step size for search (radians). Default 0.01 (~0.57 degrees)
         ground_plane_model: Optional [a, b, c, d] plane equation from RANSAC.
-                          Used to compute ground z for height calculation.
-        category: Optional object category (e.g., 'Car', 'Pedestrian') to use template dimensions
-                  if estimated dimensions are unreliable.
+                            Used to compute ground z for height calculation.
+        dimensions: Optional (length, width, height) prior. If provided, this
+                    will be used when the raw L-shape estimate is unreliable.
     
     Returns:
         Dictionary containing:
@@ -207,17 +249,17 @@ def estimate_pose_l_shape(points: np.ndarray, d_theta: float = 0.01,
         # Use min z as ground level
         height = np.max(points[:, 2]) - np.min(points[:, 2])
     
-    # Use template dimensions if category is provided and estimated dimensions seem unreliable
+    # Use prior dimensions if provided and estimated dimensions seem unreliable
     # (e.g., if estimated dimensions are too small or too large)
-    if category is not None and category in KITTI_CUBOID_TEMPLATES:
-        template = KITTI_CUBOID_TEMPLATES[category]
-        # Use template if estimated dimensions are very small (likely unreliable)
+    if dimensions is not None:
+        prior_length, prior_width, prior_height = dimensions
+        # Use prior if estimated dimensions are very small (likely unreliable)
         if best_length < 0.5 or best_width < 0.3:
-            best_length = template['length']
-            best_width = template['width']
-        # Use template height if estimated height is very small
+            best_length = float(prior_length)
+            best_width = float(prior_width)
+        # Use prior height if estimated height is very small
         if height < 0.5:
-            height = template['height']
+            height = float(prior_height)
     
     return {
         'center': center_3d,
@@ -229,17 +271,16 @@ def estimate_pose_l_shape(points: np.ndarray, d_theta: float = 0.01,
     }
 
 
-def cuboid_from_pose(pose_result: Dict, category: str, 
-                     template_dims: Optional[Dict[str, float]] = None,
+def cuboid_from_pose(pose_result: Dict,
+                     dimensions: Tuple[float, float, float],
                      ground_z: Optional[float] = None) -> Dict:
     """
     Create a KITTI-format cuboid dictionary from pose estimation result.
     
     Args:
         pose_result: Dictionary from estimate_pose_pca or estimate_pose_l_shape
-        category: Object category (e.g., 'Car', 'Pedestrian')
-        template_dims: Optional dict with 'length', 'width', 'height' from templates.
-                      Only used for PCA method (L-shape returns its own dimensions).
+        dimensions: (length, width, height) tuple to use for the cuboid if the
+                    pose_result does not already contain dimensions (e.g. PCA).
         ground_z: Optional ground z value at cuboid center. If provided, uses this
                   for base_z calculation.
     
@@ -258,23 +299,14 @@ def cuboid_from_pose(pose_result: Dict, category: str,
     center = pose_result['center']
     yaw = pose_result['yaw']
     
-    # Prefer dimensions from pose_result (L-shape returns them), fallback to templates for PCA
-    # L-shape method returns accurate dimensions, so use them if available
+    # Prefer dimensions from pose_result (L-shape returns them); if not present,
+    # fall back to the explicit `dimensions` tuple (e.g. for PCA).
     if 'length' in pose_result and 'width' in pose_result and 'height' in pose_result:
-        # Use dimensions from pose estimation (L-shape method)
-        length = template_dims.get('length', 4.0)
-        width = template_dims.get('width', 1.8)
-        height = template_dims.get('height', 1.5)
-    elif template_dims is not None:
-        # Fallback to templates (for PCA method which doesn't return dimensions)
-        length = template_dims.get('length', 4.0)
-        width = template_dims.get('width', 1.8)
-        height = template_dims.get('height', 1.5)
+        length = float(pose_result['length'])
+        width = float(pose_result['width'])
+        height = float(pose_result['height'])
     else:
-        # Final fallback to defaults
-        length = 4.0
-        width = 1.8
-        height = 1.5
+        length, width, height = dimensions
     
     # Calculate base z (ground level)
     if ground_z is not None:
@@ -329,7 +361,7 @@ def cuboid_from_pose(pose_result: Dict, category: str,
         'length': length,
         'width': width,
         'height': height,
-        'category': category,
+        'category': pose_result.get('category', None),
         'corners': corners,
         'min_x': min_x,
         'max_x': max_x,
@@ -339,5 +371,189 @@ def cuboid_from_pose(pose_result: Dict, category: str,
         'max_z': max_z,
         'format': 'kitti',
         'method': pose_result.get('method', 'unknown')
+    }
+
+
+def fit_cuboid_to_points(points: np.ndarray,
+                         dimensions: Tuple[float, float, float],
+                         step_center_search: float,
+                         max_step_center: int = 10,
+                         d_theta: float = 0.05,
+                         normals: Optional[np.ndarray] = None,
+                         score_weights: Tuple[float, float, float] = (1.0, 0.5, 2.0)) -> Dict:
+    """
+    Cuboid fitting using center line-search and yaw search.
+
+    Search is performed along a ray starting at the mean point and going in the
+    direction of the mean (towards / away from the origin), and over yaw
+    angles. The best hypothesis minimizes a combination of:
+
+    - Squared distance from points to the three visible sides of the cuboid
+      (top and the two sides whose centers are closest to the origin).
+    - Geometric consistency: local surface normals should align with the
+      vector from the cuboid center to each point.
+    - Outlier penalty: fraction of points that fall outside the cuboid.
+    
+    Args:
+        points: np.ndarray (N, 3) - 3D points in LiDAR coordinates
+        dimensions: Tuple (length, width, height) in meters
+        step_center_search: Step size for center search along the ray
+        max_step_center: Maximum number of steps for center search
+        d_theta: Angular step size for yaw search (radians)
+        normals: Optional (N, 3) array of surface normals for geometric consistency
+        score_weights: Tuple (w_dist, w_geo, w_out) - weights for distance, 
+                      geometric consistency, and outlier penalty terms
+    
+    Returns:
+        Dictionary with 'center', 'yaw', 'length', 'width', 'height', 'score', 'method'
+    """
+    if points.size == 0:
+        raise ValueError("Cannot fit cuboid to empty point cloud")
+
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Expected points shape (N, 3), got {points.shape}")
+
+    if normals is not None and normals.shape != points.shape:
+        raise ValueError("normals must have shape (N, 3) if provided")
+
+    length, width, height = map(float, dimensions)
+    w_dist, w_geo, w_out = map(float, score_weights)
+
+    # Mean of the points
+    mu = np.mean(points, axis=0)
+
+    # Direction of the line-search ray: from origin towards the mean
+    ray_dir = mu.copy()
+    norm_ray = np.linalg.norm(ray_dir)
+    if norm_ray > 1e-6:
+        ray_dir /= norm_ray
+    else:
+        # Degenerate case: mean at origin, just use z-up
+        ray_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    def _score_for_hypothesis(center: np.ndarray, yaw: float, 
+                              dims: Tuple[float, float, float],
+                              weights: Tuple[float, float, float]) -> float:
+        # Extract dimensions
+        l, w_dim, h = dims
+        half_l = l / 2.0
+        half_w = w_dim / 2.0
+        half_h = h / 2.0
+        
+        # Rotation matrix around Z
+        cos_y = np.cos(yaw)
+        sin_y = np.sin(yaw)
+        R_z = np.array([
+            [cos_y, -sin_y, 0.0],
+            [sin_y,  cos_y, 0.0],
+            [0.0,    0.0,   1.0],
+        ])
+
+        # Local cuboid axes in world frame
+        u = R_z @ np.array([1.0, 0.0, 0.0])  # length axis
+        v = R_z @ np.array([0.0, 1.0, 0.0])  # width axis
+        w = np.array([0.0, 0.0, 1.0])        # height axis (z-up)
+
+        # Transform points relative to center
+        rel = points - center[None, :]
+
+        # Coordinates in cuboid local frame
+        x_c = rel @ u
+        y_c = rel @ v
+        z_c = rel @ w
+
+        # Outlier mask: outside if any coordinate exceeds half-extent
+        outside = (
+            (np.abs(x_c) > half_l) |
+            (np.abs(y_c) > half_w) |
+            (np.abs(z_c) > half_h)
+        )
+        outlier_frac = float(np.mean(outside))
+
+        # Plane centers for all 6 faces in world frame
+        center_front = center + u * half_l
+        center_back = center - u * half_l
+        center_right = center + v * half_w
+        center_left = center - v * half_w
+        center_top = center + w * half_h
+        center_bottom = center - w * half_h
+
+        # Distances of face centers to origin
+        face_centers = np.stack([
+            center_front, center_back,
+            center_right, center_left,
+            center_top, center_bottom,
+        ], axis=0)
+        dists_to_origin = np.linalg.norm(face_centers, axis=1)
+
+        # We want top plus the two lateral faces whose centers are closest to origin.
+        # Index mapping:
+        # 0: front (+u), 1: back (-u), 2: right (+v), 3: left (-v),
+        # 4: top (+w), 5: bottom (-w)
+        top_idx = 4
+        lateral_indices = np.array([0, 1, 2, 3])
+        lateral_dists = dists_to_origin[lateral_indices]
+        two_closest_idx = lateral_indices[np.argsort(lateral_dists)[:2]]
+
+        face_normals = [(np.array([0.0, 0.0, 1.0]), center_top)]  # top
+        for idx in two_closest_idx:
+            if idx == 0:
+                face_normals.append((u, center_front))
+            elif idx == 1:
+                face_normals.append((-u, center_back))
+            elif idx == 2:
+                face_normals.append((v, center_right))
+            elif idx == 3:
+                face_normals.append((-v, center_left))
+
+        # Distance to each visible face: take minimum squared distance per point
+        sq_dists = []
+        for n_vec, p0 in face_normals:
+            diff = points - p0[None, :]
+            d_plane = np.abs(diff @ n_vec)
+            sq_dists.append(d_plane ** 2)
+        sq_dists = np.stack(sq_dists, axis=1)  # (N, 3)
+        min_sq_dist = np.min(sq_dists, axis=1)
+        mean_min_sq_dist = float(np.mean(min_sq_dist))
+
+        # Geometric consistency term
+        geo_term = 0.0
+        if normals is not None:
+            vec_center_to_point = rel
+            norms_v = np.linalg.norm(vec_center_to_point, axis=1) + 1e-8
+            dir_center_to_point = vec_center_to_point / norms_v[:, None]
+            cos_angles = np.sum(normals * dir_center_to_point, axis=1)
+            geo_term = float(np.mean(1.0 - np.abs(cos_angles)))
+
+        w_d, w_g, w_o = weights
+        score = (
+            w_d * mean_min_sq_dist +
+            w_g * geo_term +
+            w_o * outlier_frac
+        )
+        return score
+    
+    best_score = float('inf')
+    best_center = None
+    best_yaw = 0.0
+
+    # Center and yaw search
+    for n in range(max_step_center + 1):
+        center = mu + step_center_search * n * ray_dir
+        for yaw in np.arange(0.0, np.pi, d_theta):
+            score = _score_for_hypothesis(center, yaw, (length, width, height), (w_dist, w_geo, w_out))
+            if score < best_score:
+                best_score = score
+                best_center = center.copy()
+                best_yaw = float(yaw)
+
+    return {
+        'center': best_center,
+        'yaw': best_yaw,
+        'length': length,
+        'width': width,
+        'height': height,
+        'score': best_score,
+        'method': 'cuboid_fit',
     }
 
