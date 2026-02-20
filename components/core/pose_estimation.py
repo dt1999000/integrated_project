@@ -141,6 +141,7 @@ def estimate_pose_pca(points: np.ndarray, category: Optional[str] = None) -> Dic
 
 
 def estimate_pose_l_shape(points: np.ndarray,
+                          category: Optional[str] = None,
                           d_theta: float = 0.01,
                           ground_plane_model: Optional[np.ndarray] = None,
                           dimensions: Optional[Tuple[float, float, float]] = None
@@ -154,6 +155,9 @@ def estimate_pose_l_shape(points: np.ndarray,
     
     Args:
         points: np.ndarray (N, 3) - 3D points in LiDAR coordinates
+        category: Optional object category (e.g., 'Car', 'Pedestrian'). If provided
+                  and `dimensions` is None, category-based priors will be used as
+                  a fallback when the raw L-shape estimate is unreliable.
         d_theta: float - Angular step size for search (radians). Default 0.01 (~0.57 degrees)
         ground_plane_model: Optional [a, b, c, d] plane equation from RANSAC.
                             Used to compute ground z for height calculation.
@@ -250,7 +254,11 @@ def estimate_pose_l_shape(points: np.ndarray,
         height = np.max(points[:, 2]) - np.min(points[:, 2])
     
     # Use prior dimensions if provided and estimated dimensions seem unreliable
-    # (e.g., if estimated dimensions are too small or too large)
+    # (e.g., if estimated dimensions are too small or too large). If explicit
+    # priors are not given but a category is, fall back to category-based priors.
+    if dimensions is None and category is not None:
+        dimensions = get_dimensions_from_class(category)
+
     if dimensions is not None:
         prior_length, prior_width, prior_height = dimensions
         # Use prior if estimated dimensions are very small (likely unreliable)
@@ -267,20 +275,26 @@ def estimate_pose_l_shape(points: np.ndarray,
         'method': 'l_shape',
         'length': best_length,
         'width': best_width,
-        'height': height
+        'height': height,
+        'category': category,
     }
 
 
 def cuboid_from_pose(pose_result: Dict,
-                     dimensions: Tuple[float, float, float],
+                     category: Optional[str] = None,
+                     template_dims: Optional[Dict[str, float]] = None,
                      ground_z: Optional[float] = None) -> Dict:
     """
     Create a KITTI-format cuboid dictionary from pose estimation result.
     
     Args:
-        pose_result: Dictionary from estimate_pose_pca or estimate_pose_l_shape
-        dimensions: (length, width, height) tuple to use for the cuboid if the
-                    pose_result does not already contain dimensions (e.g. PCA).
+        pose_result: Dictionary from estimate_pose_pca or estimate_pose_l_shape.
+                     May already contain 'length', 'width', and 'height'.
+        category: Optional object category (e.g., 'Car', 'Pedestrian'). Used for
+                  metadata and, if needed, to derive fallback dimensions.
+        template_dims: Optional dict with 'length', 'width', 'height' from
+                       category templates. Used when pose_result does not already
+                       contain dimensions (e.g., PCA-based pose).
         ground_z: Optional ground z value at cuboid center. If provided, uses this
                   for base_z calculation.
     
@@ -300,13 +314,22 @@ def cuboid_from_pose(pose_result: Dict,
     yaw = pose_result['yaw']
     
     # Prefer dimensions from pose_result (L-shape returns them); if not present,
-    # fall back to the explicit `dimensions` tuple (e.g. for PCA).
-    if 'length' in pose_result and 'width' in pose_result and 'height' in pose_result:
-        length = float(pose_result['length'])
-        width = float(pose_result['width'])
-        height = float(pose_result['height'])
+    # fall back to provided template dimensions or category-based priors.
+    length = pose_result.get('length')
+    width = pose_result.get('width')
+    height = pose_result.get('height')
+    
+    if length is None or width is None or height is None:
+        if template_dims is not None:
+            length = float(template_dims.get('length', 4.0))
+            width = float(template_dims.get('width', 1.8))
+            height = float(template_dims.get('height', 1.6))
+        else:
+            length, width, height = get_dimensions_from_class(category)
     else:
-        length, width, height = dimensions
+        length = float(length)
+        width = float(width)
+        height = float(height)
     
     # Calculate base z (ground level)
     if ground_z is not None:
@@ -361,7 +384,7 @@ def cuboid_from_pose(pose_result: Dict,
         'length': length,
         'width': width,
         'height': height,
-        'category': pose_result.get('category', None),
+        'category': category or pose_result.get('category', None),
         'corners': corners,
         'min_x': min_x,
         'max_x': max_x,
@@ -477,7 +500,8 @@ def fit_cuboid_to_points(points: np.ndarray,
         center_left = center - v * half_w
         center_top = center + w * half_h
         center_bottom = center - w * half_h
-
+        
+        print(f'center_front: {center_front}, center_back: {center_back}, center_right: {center_right}, center_left: {center_left}, center_top: {center_top}, center_bottom: {center_bottom}')
         # Distances of face centers to origin
         face_centers = np.stack([
             center_front, center_back,
@@ -531,6 +555,7 @@ def fit_cuboid_to_points(points: np.ndarray,
             w_g * geo_term +
             w_o * outlier_frac
         )
+        print(f'geo_term: {geo_term}, outlier_frac: {outlier_frac}, mean_min_sq_dist: {mean_min_sq_dist}')
         return score
     
     best_score = float('inf')
@@ -541,6 +566,7 @@ def fit_cuboid_to_points(points: np.ndarray,
     for n in range(max_step_center + 1):
         center = mu + step_center_search * n * ray_dir
         for yaw in np.arange(0.0, np.pi, d_theta):
+            print(f"Center: {center}, Yaw: {yaw}")
             score = _score_for_hypothesis(center, yaw, (length, width, height), (w_dist, w_geo, w_out))
             if score < best_score:
                 best_score = score

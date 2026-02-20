@@ -15,8 +15,7 @@ from components.utils.visualization_helper import (
 )
 from components.core.pointcloud_projection import Projection
 from components.core.sam_integration import assign_points_to_masks
-from components.core.pose_estimation import estimate_pose_l_shape, cuboid_from_pose
-from components.core.constants import KITTI_CUBOID_TEMPLATES
+from components.core.pose_estimation import fit_cuboid_to_points, get_dimensions_from_class
 from components.core.clustering_manager import ClusteringManager
 
 
@@ -225,32 +224,115 @@ def detection_result_page():
             if bbox_idx < len(ground_truth_boxes):
                 category = ground_truth_boxes[bbox_idx].get('category', 'Unknown')
         
-        # Estimate pose using L-shape fitting on the selected cluster
-        ground_plane_model = st.session_state.get('ground_plane_model')
-        pose_result = estimate_pose_l_shape(
-            best_cluster_points,
-            category=category,
-            ground_plane_model=ground_plane_model
+        # Get dimensions for this category (uses templates or LLM if unknown)
+        dimensions = get_dimensions_from_class(category)
+        
+        # Get cuboid fitting parameters from session state (set in app.py)
+        cuboid_params = st.session_state.params.get('cuboid_fitting', {
+            'w_distance': 1.0,
+            'w_geometric': 0.5,
+            'w_outlier': 2.0,
+            'step_center_search': 0.2,
+            'max_step_center': 10,
+            'd_theta': 0.05
+        })
+        
+        score_weights = (
+            cuboid_params['w_distance'],
+            cuboid_params['w_geometric'],
+            cuboid_params['w_outlier']
         )
         
-        # Get template dimensions for this category
-        template_dims = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
-        ground_z = st.session_state.get('ground_z')
-        
-        # Create cuboid from pose
-        cuboid = cuboid_from_pose(
-            pose_result,
-            category=category,
-            template_dims=template_dims,
-            ground_z=ground_z
-        )
-        
-        # Add metadata
-        cuboid['source_bbox_idx'] = mask_to_bbox_map.get(mask_idx, None)
-        cuboid['mask_idx'] = mask_idx
-        cuboid['n_points'] = len(best_cluster_points)
-        
-        detected_cuboids.append(cuboid)
+        # Fit cuboid using scoring-based method
+        try:
+            fit_result = fit_cuboid_to_points(
+                points=best_cluster_points,
+                dimensions=dimensions,
+                step_center_search=cuboid_params['step_center_search'],
+                max_step_center=cuboid_params['max_step_center'],
+                d_theta=cuboid_params['d_theta'],
+                normals=None,  # Can be extended later if normals are available
+                score_weights=score_weights
+            )
+            
+            # Convert fit_result to cuboid format expected by visualization
+            # fit_result contains: center, yaw, length, width, height, score, method
+            ground_z = st.session_state.get('ground_z')
+            if ground_z is None:
+                # Estimate ground z from points
+                ground_z = np.min(best_cluster_points[:, 2])
+            
+            # Calculate base z for cuboid
+            base_z = ground_z
+            center = fit_result['center']
+            yaw = fit_result['yaw']
+            length = fit_result['length']
+            width = fit_result['width']
+            height = fit_result['height']
+            
+            # Create cuboid corners (same format as cuboid_from_pose)
+            l_half = length / 2.0
+            w_half = width / 2.0
+            h_half = height / 2.0
+            
+            corners_local = np.array([
+                [-l_half, -w_half, -h_half],  # 0: bottom front-left
+                [ l_half, -w_half, -h_half],  # 1: bottom front-right
+                [ l_half,  w_half, -h_half],  # 2: bottom back-right
+                [-l_half,  w_half, -h_half],  # 3: bottom back-left
+                [-l_half, -w_half,  h_half],  # 4: top front-left
+                [ l_half, -w_half,  h_half],  # 5: top front-right
+                [ l_half,  w_half,  h_half],  # 6: top back-right
+                [-l_half,  w_half,  h_half],  # 7: top back-left
+            ])
+            
+            # Adjust z to use base_z
+            corners_local[:, 2] += (base_z + h_half) - center[2]
+            
+            # Rotation matrix around Z-axis
+            cos_yaw = np.cos(yaw)
+            sin_yaw = np.sin(yaw)
+            R_z = np.array([
+                [cos_yaw, -sin_yaw, 0],
+                [sin_yaw,  cos_yaw, 0],
+                [0,        0,       1]
+            ])
+            
+            # Rotate and translate
+            corners_rotated = (R_z @ corners_local.T).T
+            corners = corners_rotated + center
+            
+            # Calculate bounding box
+            cuboid = {
+                'center': center,
+                'yaw': yaw,
+                'length': length,
+                'width': width,
+                'height': height,
+                'category': category,
+                'corners': corners,
+                'min_x': float(np.min(corners[:, 0])),
+                'max_x': float(np.max(corners[:, 0])),
+                'min_y': float(np.min(corners[:, 1])),
+                'max_y': float(np.max(corners[:, 1])),
+                'min_z': float(np.min(corners[:, 2])),
+                'max_z': float(np.max(corners[:, 2])),
+                'format': 'kitti',
+                'method': fit_result.get('method', 'cuboid_fit'),
+                'score': fit_result.get('score', float('inf')),
+                'source_bbox_idx': mask_to_bbox_map.get(mask_idx, None),
+                'mask_idx': mask_idx,
+                'n_points': len(best_cluster_points),
+            }
+            
+            detected_cuboids.append(cuboid)
+            
+        except Exception as e:
+            st.warning(f"Failed to fit cuboid for mask {mask_idx} (category: {category}): {str(e)}")
+            print(f"Error fitting cuboid: {e}")
+            import traceback
+            print(traceback.format_exc())
+            continue
     
     # Store detected cuboids
     st.session_state.cuboids = detected_cuboids
@@ -282,6 +364,7 @@ def detection_result_page():
                 'Length': f"{cuboid['length']:.2f}",
                 'Width': f"{cuboid['width']:.2f}",
                 'Height': f"{cuboid['height']:.2f}",
+                'Score': f"{cuboid.get('score', 0.0):.3f}",
                 'Points': cuboid.get('n_points', 0),
             })
         df = pd.DataFrame(cuboid_data)
