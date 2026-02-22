@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 # Standard clustering algorithms from scikit-learn
@@ -482,5 +482,95 @@ class ClusteringManager:
         pose_cuboid['label'] = cluster_label
 
         return pose_cuboid
+
+
+def select_best_cluster_points(
+    mask_points: np.ndarray,
+    mask: np.ndarray,
+    projection,
+    image_shape: Tuple[int, int],
+    dbscan_eps: float = 0.5,
+    dbscan_min_samples: int = 5,
+) -> Optional[np.ndarray]:
+    """
+    Cluster mask points with DBSCAN and select the cluster closest to the mask center.
+    Returns the points of the selected cluster, or None if no valid cluster is found.
+    
+    Args:
+        mask_points: Nx3 array of 3D points assigned to a mask
+        mask: Binary mask (H, W) as numpy array
+        projection: Projection object with point_to_pixel method
+        image_shape: (height, width) tuple
+        dbscan_eps: DBSCAN eps parameter
+        dbscan_min_samples: DBSCAN min_samples parameter
+    
+    Returns:
+        Points of the best cluster, or None if no valid cluster found
+    """
+    if len(mask_points) < dbscan_min_samples:
+        return None
+
+    h, w = image_shape
+
+    # Find center of mask in image space
+    mask_coords = np.column_stack(np.where(mask > 0))
+    if len(mask_coords) == 0:
+        return None
+
+    center_y, center_x = mask_coords.mean(axis=0)
+
+    # Project all mask points to 2D
+    pixels, valid_mask = projection.point_to_pixel(mask_points)
+    valid_pixels = pixels[valid_mask]
+    valid_indices = np.where(valid_mask)[0]
+
+    if len(valid_pixels) == 0:
+        return None
+
+    # Compute distances from projected points to mask center
+    distances = np.sqrt(
+        (valid_pixels[:, 0] - center_x) ** 2 + (valid_pixels[:, 1] - center_y) ** 2
+    )
+
+    # Use 10% of closest points to approximate center region in 3D
+    n_sample = max(1, int(len(mask_points) * 0.1))
+    closest_indices = np.argsort(distances)[:n_sample]
+    sampled_point_indices = valid_indices[closest_indices]
+    center_points = mask_points[sampled_point_indices]
+
+    if len(center_points) == 0:
+        return None
+
+    center_centroid = np.mean(center_points, axis=0)
+
+    # Run DBSCAN on all mask points
+    clustering_manager = ClusteringManager(mask_points)
+    cluster_labels = clustering_manager.run_dbscan(
+        eps=dbscan_eps, min_samples=dbscan_min_samples
+    )
+
+    unique_labels = np.unique(cluster_labels)
+    unique_labels = unique_labels[unique_labels >= 0]  # remove noise (-1)
+    if len(unique_labels) == 0:
+        return None
+
+    best_cluster_id = -1
+    min_distance = float("inf")
+
+    for cluster_id in unique_labels:
+        cluster_points = mask_points[cluster_labels == cluster_id]
+        if len(cluster_points) < 5:
+            continue
+
+        cluster_centroid = np.mean(cluster_points, axis=0)
+        distance = np.linalg.norm(cluster_centroid - center_centroid)
+        if distance < min_distance:
+            min_distance = distance
+            best_cluster_id = cluster_id
+
+    if best_cluster_id == -1:
+        return None
+    
+    return mask_points[cluster_labels == best_cluster_id]
 
     

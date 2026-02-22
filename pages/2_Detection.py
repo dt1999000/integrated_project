@@ -15,7 +15,8 @@ from components.core.pointcloud_projection import PointCloud, Projection
 from components.core.depth_estimation import compute_sparse_depth_map
 from components.core.sam_integration import SAMIntegration, assign_points_to_masks
 from components.core.pose_estimation import fit_cuboid_to_points, get_dimensions_from_class
-from components.core.clustering_manager import ClusteringManager
+from components.core.clustering_manager import ClusteringManager, select_best_cluster_points
+from components.core.utils import get_bbox_from_mask, calculate_iou
 from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
     add_cuboids_to_figure,
@@ -28,118 +29,7 @@ from components.utils.visualization_helper import (
 # ============================================================================
 # Helper Functions
 # ============================================================================
-
-def _select_best_cluster_points(
-    mask_points: np.ndarray,
-    mask: np.ndarray,
-    projection: Projection,
-    image_shape: tuple,
-    dbscan_eps: float = 0.5,
-    dbscan_min_samples: int = 5,
-) -> Optional[np.ndarray]:
-    """
-    Cluster mask points with DBSCAN and select the cluster closest to the mask center.
-    Returns the points of the selected cluster, or None if no valid cluster is found.
-    """
-    if len(mask_points) < dbscan_min_samples:
-        return None
-
-    h, w = image_shape
-
-    # Find center of mask in image space
-    mask_coords = np.column_stack(np.where(mask > 0))
-    if len(mask_coords) == 0:
-        return None
-
-    center_y, center_x = mask_coords.mean(axis=0)
-
-    # Project all mask points to 2D
-    pixels, valid_mask = projection.point_to_pixel(mask_points)
-    valid_pixels = pixels[valid_mask]
-    valid_indices = np.where(valid_mask)[0]
-
-    if len(valid_pixels) == 0:
-        return None
-
-    # Compute distances from projected points to mask center
-    distances = np.sqrt(
-        (valid_pixels[:, 0] - center_x) ** 2 + (valid_pixels[:, 1] - center_y) ** 2
-    )
-
-    # Use 10% of closest points to approximate center region in 3D
-    n_sample = max(1, int(len(mask_points) * 0.1))
-    closest_indices = np.argsort(distances)[:n_sample]
-    sampled_point_indices = valid_indices[closest_indices]
-    center_points = mask_points[sampled_point_indices]
-
-    if len(center_points) == 0:
-        return None
-
-    center_centroid = np.mean(center_points, axis=0)
-
-    # Run DBSCAN on all mask points
-    clustering_manager = ClusteringManager(mask_points)
-    cluster_labels = clustering_manager.run_dbscan(
-        eps=dbscan_eps, min_samples=dbscan_min_samples
-    )
-
-    unique_labels = np.unique(cluster_labels)
-    unique_labels = unique_labels[unique_labels >= 0]  # remove noise (-1)
-    if len(unique_labels) == 0:
-        return None
-
-    best_cluster_id = -1
-    min_distance = float("inf")
-
-    for cluster_id in unique_labels:
-        cluster_points = mask_points[cluster_labels == cluster_id]
-        if len(cluster_points) < 5:
-            continue
-
-        cluster_centroid = np.mean(cluster_points, axis=0)
-        distance = np.linalg.norm(cluster_centroid - center_centroid)
-        if distance < min_distance:
-            min_distance = distance
-            best_cluster_id = cluster_id
-
-    if best_cluster_id == -1:
-        return None
-    
-    return mask_points[cluster_labels == best_cluster_id]
-
-
-def _get_bbox_from_mask(mask: np.ndarray) -> List[float]:
-    """Get bounding box from mask"""
-    coords = np.column_stack(np.where(mask > 0))
-    if len(coords) == 0:
-        return [0, 0, 0, 0]
-    y_min, x_min = coords.min(axis=0)
-    y_max, x_max = coords.max(axis=0)
-    return [int(x_min), int(y_min), int(x_max), int(y_max)]
-
-
-def _calculate_iou(bbox1: List[float], bbox2: List[float]) -> float:
-    """Calculate IoU between two bounding boxes"""
-    x1_1, y1_1, x2_1, y2_1 = bbox1
-    x1_2, y1_2, x2_2, y2_2 = bbox2
-    
-    x1_i = max(x1_1, x1_2)
-    y1_i = max(y1_1, y1_2)
-    x2_i = min(x2_1, x2_2)
-    y2_i = min(y2_1, y2_2)
-    
-    if x2_i <= x1_i or y2_i <= y1_i:
-        return 0.0
-    
-    intersection = (x2_i - x1_i) * (y2_i - y1_i)
-    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-    union = area1 + area2 - intersection
-    
-    if union == 0:
-        return 0.0
-    
-    return intersection / union
+# Note: _get_bbox_from_mask and _calculate_iou are now imported from components.core.utils
 
 
 # ============================================================================
@@ -170,7 +60,7 @@ def step_1_ground_plane_removal(
     
     # Create PointCloud object
     point_cloud_obj = PointCloud(point_cloud)
-    
+    print(f"Point cloud object created with {len(point_cloud_obj.original_point_cloud)} points")
     # Remove ground plane
     point_cloud_obj.remove_ground_plane_ransac(
         distance_threshold=distance_threshold,
@@ -178,7 +68,7 @@ def step_1_ground_plane_removal(
         num_iterations=num_iterations,
         filter_forward_only=filter_forward_only
     )
-    
+    print(f"Ground plane removed with {len(point_cloud_obj.point_cloud_plane_removed)} points remaining")
     # Get ground_z at origin
     ground_z = point_cloud_obj.get_ground_z(x=0.0, y=0.0)
     
@@ -251,19 +141,25 @@ def step_3_sam_segmentation(
     sample_meta_data: Dict,
     image: np.ndarray,
     sparse_points: np.ndarray,
-    sam_model_type: str = 'sam2_t'
+    class_names: List[str],
+    sam_model_type: str = 'sam2_t',
+    yolo_model_path: Optional[str] = None,
+    conf_threshold: float = 0.25
 ) -> Dict:
     """
-    Step 3: Generate SAM masks and assign original LiDAR points to masks.
+    Step 3: Generate SAM masks using open-vocabulary detection and assign original LiDAR points to masks.
     
     Args:
         sample_meta_data: Sample metadata
         image: HxWx3 RGB image
         sparse_points: Nx3 array of backprojected sparse depth points
+        class_names: List of class names to detect (e.g., ["car", "person", "bicycle"])
         sam_model_type: 'sam2_t' or 'sam3'
+        yolo_model_path: Optional path to YOLO-World model (only used for SAM2)
+        conf_threshold: Confidence threshold for YOLO detections (default: 0.25)
     
     Returns:
-        Dict with 'sam_masks', 'mask_assignments', 'mask_bboxes' (if SAM3)
+        Dict with 'sam_masks', 'mask_assignments', 'mask_bboxes', 'class_names', 'confidences'
     """
     start_time = time.time()
     
@@ -280,70 +176,64 @@ def step_3_sam_segmentation(
                 'time': time.time() - start_time
             }
     
+    # Check if model type changed, reinitialize if needed
+    if 'sam_initialized_model_type' not in st.session_state:
+        st.session_state.sam_initialized_model_type = sam_model_type
+    
+    if st.session_state.sam_initialized_model_type != sam_model_type:
+        try:
+            st.session_state.sam_integration = SAMIntegration(model_type=sam_model_type)
+            st.session_state.sam_initialized_model_type = sam_model_type
+        except Exception as e:
+            return {
+                'error': f"SAM reinitialization failed: {str(e)}",
+                'sam_masks': None,
+                'mask_assignments': None,
+                'mask_bboxes': [],
+                'class_names': [],
+                'confidences': [],
+                'time': time.time() - start_time
+            }
+    
     sam_integration = st.session_state.sam_integration
     h, w = image.shape[:2]
-    ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
     
-    sam_masks = []
-    mask_bboxes = []
+    # Use open-vocabulary detection pipeline
+    if not class_names:
+        return {
+            'error': "No class names provided",
+            'sam_masks': [],
+            'mask_assignments': None,
+            'mask_bboxes': [],
+            'class_names': [],
+            'confidences': [],
+            'time': time.time() - start_time
+        }
     
-    if sam_model_type.startswith('sam2'):
-        # SAM2: Generate masks from bounding boxes
-        for gt_box in ground_truth_boxes:
-            bbox_2d = gt_box.get('bbox_2d')
-            if bbox_2d is not None:
-                bbox_list = [
-                    bbox_2d['left'],
-                    bbox_2d['top'],
-                    bbox_2d['right'],
-                    bbox_2d['bottom'],
-                ]
-                mask = sam_integration.get_mask_from_bbox(image, bbox_list)
-                sam_masks.append(mask)
-    
-    elif sam_model_type == 'sam3':
-        # SAM3: Generate masks from class names
-        class_names = list(set([box.get('category', 'unknown') for box in ground_truth_boxes]))
-        class_names = [c for c in class_names if c != 'unknown' and c != 'DontCare']
+    try:
+        # Use the unified segment_by_class_names method
+        segment_results = sam_integration.segment_by_class_names(
+            image=image,
+            class_names=class_names,
+            yolo_model_path=yolo_model_path,
+            conf_threshold=conf_threshold
+        )
         
-        if class_names:
-            segment_results = sam_integration.segment_by_classes(image, class_names)
-            all_masks = segment_results['masks']
-            
-            # Match masks to bounding boxes
-            bboxes_list = []
-            for gt_box in ground_truth_boxes:
-                bbox_2d = gt_box.get('bbox_2d')
-                if bbox_2d is not None:
-                    bboxes_list.append([
-                        bbox_2d['left'],
-                        bbox_2d['top'],
-                        bbox_2d['right'],
-                        bbox_2d['bottom'],
-                    ])
-            
-            if bboxes_list:
-                matches = sam_integration.match_instances_to_bboxes(
-                    all_masks, bboxes_list, iou_threshold=0.3
-                )
-                
-                masks = [None] * len(bboxes_list)
-                for mask_idx, bbox_idx in matches.items():
-                    masks[bbox_idx] = all_masks[mask_idx]
-                
-                sam_masks = [m for m in masks if m is not None]
-                
-                # Extract minimal bounding boxes from masks (for SAM3)
-                for mask in sam_masks:
-                    if mask is not None:
-                        mask_bbox = _get_bbox_from_mask(mask)
-                        mask_bboxes.append(mask_bbox)
-            else:
-                sam_masks = all_masks
-                for mask in sam_masks:
-                    if mask is not None:
-                        mask_bbox = _get_bbox_from_mask(mask)
-                        mask_bboxes.append(mask_bbox)
+        sam_masks = segment_results['masks']
+        mask_bboxes = segment_results['bboxes']
+        detected_class_names = segment_results['class_names']
+        confidences = segment_results['confidences']
+        
+    except Exception as e:
+        return {
+            'error': f"Segmentation failed: {str(e)}",
+            'sam_masks': [],
+            'mask_assignments': None,
+            'mask_bboxes': [],
+            'class_names': [],
+            'confidences': [],
+            'time': time.time() - start_time
+        }
     
     # Assign original LiDAR points to masks based on sparse depth map and mask overlap
     mask_assignments = None
@@ -365,7 +255,9 @@ def step_3_sam_segmentation(
     return {
         'sam_masks': sam_masks,
         'mask_assignments': mask_assignments,
-        'mask_bboxes': mask_bboxes if sam_model_type == 'sam3' else None,
+        'mask_bboxes': mask_bboxes,
+        'class_names': detected_class_names,
+        'confidences': confidences,
         'n_masks': len(sam_masks),
         'time': elapsed_time
     }
@@ -431,7 +323,7 @@ def step_4_clustering(
         mask_cluster_labels[mask_idx] = cluster_labels
         
         # Select best cluster
-        best_cluster_points = _select_best_cluster_points(
+        best_cluster_points = select_best_cluster_points(
             mask_points=mask_points,
             mask=mask,
             projection=projection,
@@ -488,43 +380,40 @@ def step_5_detection_pose_estimation(
     """
     start_time = time.time()
     
-    ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
-    detected_cuboids = []
-    mask_to_bbox_map = {}
+    # Get detected class names from step 3 if available
+    detected_class_names = None
+    if 'step_3' in st.session_state.pipeline_state:
+        step_3_result = st.session_state.pipeline_state['step_3'].get('result', {})
+        detected_class_names = step_3_result.get('class_names', [])
     
-    # Match masks to ground truth boxes for category
-    if ground_truth_boxes:
-        for mask_idx, mask in enumerate(sam_masks):
-            if mask is None:
-                continue
-            mask_bbox = _get_bbox_from_mask(mask)
-            
-            best_iou = 0.0
-            best_bbox_idx = -1
-            for bbox_idx, gt_box in enumerate(ground_truth_boxes):
-                bbox_2d = gt_box.get('bbox_2d')
-                if bbox_2d is None:
-                    continue
-                gt_bbox = [bbox_2d['left'], bbox_2d['top'], bbox_2d['right'], bbox_2d['bottom']]
-                iou = _calculate_iou(mask_bbox, gt_bbox)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_bbox_idx = bbox_idx
-            
-            if best_iou > 0.3:
-                mask_to_bbox_map[mask_idx] = best_bbox_idx
+    detected_cuboids = []
     
     # Fit cuboid to each mask's best cluster
     for mask_idx, cluster_points in best_cluster_points.items():
         if len(cluster_points) < 5:
             continue
         
-        # Get category from ground truth
+        # Get category from detected class names (from open-vocab detection)
         category = 'Unknown'
-        if mask_idx in mask_to_bbox_map:
-            bbox_idx = mask_to_bbox_map[mask_idx]
-            if bbox_idx < len(ground_truth_boxes):
-                category = ground_truth_boxes[bbox_idx].get('category', 'Unknown')
+        if detected_class_names and mask_idx < len(detected_class_names):
+            category = detected_class_names[mask_idx]
+        else:
+            # Fallback to ground truth if available
+            ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
+            if ground_truth_boxes and mask_idx < len(sam_masks):
+                mask_bbox = get_bbox_from_mask(sam_masks[mask_idx])
+                best_iou = 0.0
+                best_category = 'Unknown'
+                for gt_box in ground_truth_boxes:
+                    bbox_2d = gt_box.get('bbox_2d')
+                    if bbox_2d is None:
+                        continue
+                    gt_bbox = [bbox_2d['left'], bbox_2d['top'], bbox_2d['right'], bbox_2d['bottom']]
+                    iou = calculate_iou(mask_bbox, gt_bbox)
+                    if iou > best_iou and iou > 0.3:
+                        best_iou = iou
+                        best_category = gt_box.get('category', 'Unknown')
+                category = best_category
         
         # Get dimensions for this category
         dimensions = get_dimensions_from_class(category)
@@ -605,7 +494,7 @@ def step_5_detection_pose_estimation(
                 'format': 'kitti',
                 'method': fit_result.get('method', 'cuboid_fit'),
                 'score': fit_result.get('score', float('inf')),
-                'source_bbox_idx': mask_to_bbox_map.get(mask_idx, None),
+                'source_bbox_idx': None,  # Not using ground truth matching anymore
                 'mask_idx': mask_idx,
                 'n_points': len(cluster_points),
             }
@@ -660,11 +549,18 @@ def run_full_pipeline(params: Dict) -> Dict:
     st.session_state.pipeline_state['step_2'] = results['step_2']
     
     # Step 3: SAM segmentation
+    class_names = params.get('class_names', [])
+    if not class_names:
+        class_names = ['car', 'person', 'bicycle']  # Default classes
+    
     step_3_result = step_3_sam_segmentation(
         sample_meta_data=st.session_state.sample['sample_meta_data'],
         image=st.session_state.sample['image'],
         sparse_points=step_2_result['colored_sparse_points'],
-        sam_model_type=params.get('sam_model_type', 'sam2_t')
+        class_names=class_names,
+        sam_model_type=params.get('sam_model_type', 'sam2_t'),
+        yolo_model_path=params.get('yolo_model_path', None),
+        conf_threshold=params.get('yolo_conf_threshold', 0.25)
     )
     results['step_3'] = {'completed': True, 'result': step_3_result}
     st.session_state.pipeline_state['step_3'] = results['step_3']
@@ -743,7 +639,10 @@ def main():
                 'max_step_center': 10,
                 'd_theta': 0.05
             },
-            'sam_model_type': 'sam2_t'
+            'sam_model_type': 'sam2_t',
+            'class_names': ['car', 'person', 'bicycle'],
+            'yolo_model_path': None,
+            'yolo_conf_threshold': 0.25
         }
     
     # Check if sample is loaded
@@ -770,7 +669,7 @@ def main():
             "Iterations", 100, 1000, 1000, 100
         )
         st.session_state.params['pipeline']['filter_forward_only'] = st.checkbox(
-            "Forward-Facing Only", True
+            "Forward-Facing Only", False
         )
     
     with st.sidebar.expander("Clustering (Step 4)", expanded=False):
@@ -806,8 +705,39 @@ def main():
         "SAM Model Type",
         options=['sam2_t', 'sam3'],
         index=0,
-        help="SAM2: Uses bounding boxes. SAM3: Uses text prompts."
+        help="SAM2: Uses YOLOWorld for open vocab bounding boxes and segment with SAM2. SAM3: Uses text prompts, full open vocab capability."
     )
+    
+    # Class names input
+    st.sidebar.markdown("### Open Vocabulary Detection")
+    class_names_input = st.sidebar.text_input(
+        "Class Names (comma-separated)",
+        value="car, person, bicycle, bus, truck",
+        help="Enter class names separated by commas (e.g., 'car, person, bicycle')"
+    )
+    
+    # Parse class names
+    if class_names_input:
+        class_names = [name.strip() for name in class_names_input.split(',') if name.strip()]
+        st.session_state.params['class_names'] = class_names
+    else:
+        st.session_state.params['class_names'] = []
+    
+    if not st.session_state.params['class_names']:
+        st.sidebar.warning("⚠️ Please enter at least one class name")
+    
+    # YOLO confidence threshold (only for SAM2)
+    if st.session_state.params['sam_model_type'].startswith('sam2'):
+        st.session_state.params['yolo_conf_threshold'] = st.sidebar.slider(
+            "YOLO Confidence Threshold",
+            0.0, 1.0, 0.25, 0.05,
+            help="Confidence threshold for YOLO-World detections (only used with SAM2)"
+        )
+        st.sidebar.info("💡 SAM2 uses YOLO-World for detection, then SAM2 for segmentation")
+    else:
+        st.sidebar.info("💡 SAM3 uses direct text prompts for open-vocabulary segmentation")
+    
+    st.sidebar.caption("ℹ️ Confidence scores are shown for reference only and not used in further processing")
     
     # Main controls
     col1, col2 = st.columns(2)
@@ -830,7 +760,85 @@ def main():
         with st.spinner("Running full pipeline..."):
             try:
                 results = run_full_pipeline(st.session_state.params)
+                
+                # Explore and display what the pipeline returns
                 st.success("✅ Pipeline completed successfully!")
+                
+                # Display pipeline results structure
+                with st.expander("🔍 Pipeline Results Structure", expanded=True):
+                    st.markdown("### Full Pipeline Return Value")
+                    
+                    # Show top-level structure
+                    st.markdown("#### Top-level keys:")
+                    st.write(list(results.keys()))
+                    
+                    # Show structure for each step
+                    for step_key in ['step_1', 'step_2', 'step_3', 'step_4', 'step_5']:
+                        if step_key in results:
+                            st.markdown(f"#### {step_key.upper()}:")
+                            step_data = results[step_key]
+                            
+                            # Show step metadata
+                            st.write(f"**Completed:** {step_data.get('completed', False)}")
+                            
+                            # Show result keys
+                            if 'result' in step_data and step_data['result'] is not None:
+                                result = step_data['result']
+                                st.write(f"**Result keys:** {list(result.keys())}")
+                                
+                                # Show summary for each step
+                                if step_key == 'step_1':
+                                    st.write(f"- Points remaining: {result.get('points_remaining', 'N/A')}")
+                                    st.write(f"- Ground Z: {result.get('ground_z', 'N/A')}")
+                                    st.write(f"- Time: {result.get('time', 'N/A'):.3f}s")
+                                elif step_key == 'step_2':
+                                    st.write(f"- N points: {result.get('n_points', 'N/A')}")
+                                    st.write(f"- Time: {result.get('time', 'N/A'):.3f}s")
+                                elif step_key == 'step_3':
+                                    st.write(f"- N masks: {result.get('n_masks', 'N/A')}")
+                                    st.write(f"- Time: {result.get('time', 'N/A'):.3f}s")
+                                    if result.get('error'):
+                                        st.error(f"- Error: {result['error']}")
+                                elif step_key == 'step_4':
+                                    st.write(f"- Clustering results: {len(result.get('clustering_results', []))} masks")
+                                    st.write(f"- Time: {result.get('time', 'N/A'):.3f}s")
+                                elif step_key == 'step_5':
+                                    st.write(f"- N detected: {result.get('n_detected', 'N/A')}")
+                                    st.write(f"- Time: {result.get('time', 'N/A'):.3f}s")
+                                
+                                # Show full result structure (simplified)
+                                st.json({
+                                    'keys': list(result.keys()),
+                                    'types': {k: str(type(v)) for k, v in result.items() if not isinstance(v, (np.ndarray, list, dict))},
+                                    'array_shapes': {k: v.shape if isinstance(v, np.ndarray) else None for k, v in result.items() if isinstance(v, np.ndarray)},
+                                    'list_lengths': {k: len(v) if isinstance(v, list) else None for k, v in result.items() if isinstance(v, list)},
+                                    'dict_keys': {k: list(v.keys()) if isinstance(v, dict) else None for k, v in result.items() if isinstance(v, dict)},
+                                })
+                    
+                    # Show full results JSON (collapsed)
+                    with st.expander("📋 Full Results JSON (for debugging)", expanded=False):
+                        # Convert numpy arrays and objects to serializable format
+                        def make_serializable(obj):
+                            if isinstance(obj, np.ndarray):
+                                return {
+                                    'type': 'numpy.ndarray',
+                                    'shape': obj.shape,
+                                    'dtype': str(obj.dtype),
+                                    'size': obj.size,
+                                    'sample': obj.flatten()[:10].tolist() if obj.size > 0 else []
+                                }
+                            elif isinstance(obj, dict):
+                                return {k: make_serializable(v) for k, v in obj.items()}
+                            elif isinstance(obj, list):
+                                return [make_serializable(item) for item in obj[:5]]  # Limit list size
+                            elif hasattr(obj, '__dict__'):
+                                return {'type': str(type(obj)), '__dict__': make_serializable(obj.__dict__)}
+                            else:
+                                return obj
+                        
+                        serializable_results = make_serializable(results)
+                        st.json(serializable_results)
+                
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ Pipeline failed: {str(e)}")
@@ -852,7 +860,7 @@ def main():
     # Step 1: Ground Plane Removal
     with st.container():
         step_1_state = st.session_state.pipeline_state['step_1']
-        col1, col2, col3 = st.columns([3, 1, 1])
+        col1, col2 = st.columns([3, 1])
         
         with col1:
             status_icon = "✅" if step_1_state['completed'] else "⏸️"
@@ -879,17 +887,39 @@ def main():
                         st.session_state.pipeline_state['step_1']['error'] = str(e)
                         st.error(f"Step 1 failed: {str(e)}")
         
-        with col3:
-            if step_1_state['completed']:
-                st.metric("Time", f"{step_1_state['time']:.2f}s")
-        
         if step_1_state['completed']:
             result = step_1_state['result']
             st.success(f"✅ Completed: {result['points_remaining']:,} points remaining")
             
-            with st.expander("View Step 1 Details", expanded=False):
+            with st.expander("View Step 1 Details", expanded=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Original Points", f"{len(point_cloud):,}")
                 st.metric("Points Remaining", f"{result['points_remaining']:,}")
+                with col2:
+                    reduction = (1 - result['points_remaining'] / len(point_cloud)) * 100
+                    st.metric("Reduction", f"{reduction:.1f}%")
                 st.metric("Ground Z", f"{result['ground_z']:.3f}m" if result['ground_z'] else "N/A")
+                
+                # 3D Visualization: Before and After
+                st.markdown("#### 3D Point Cloud Visualization")
+                point_cloud_obj = result['point_cloud_obj']
+                
+                # Show ground-removed point cloud
+                fig = create_3d_scatter_plot(
+                    points=point_cloud_obj,
+                    labels=None,
+                    mask_points=None,
+                    cuboids=None,
+                    rays=None,
+                    points_in_frustums=None,
+                    reconstructed_points=None,
+                    show_lidar=True,
+                    show_reconstructed=False,
+                    color_by_depth=False,
+                    title="Point Cloud After Ground Removal"
+                )
+                st.plotly_chart(fig, use_container_width=True)
         
         if step_1_state.get('error'):
             st.error(f"❌ Error: {step_1_state['error']}")
@@ -901,7 +931,7 @@ def main():
         step_2_state = st.session_state.pipeline_state['step_2']
         step_1_completed = st.session_state.pipeline_state['step_1']['completed']
         
-        col1, col2, col3 = st.columns([3, 1, 1])
+        col1, col2 = st.columns([3, 1])
         
         with col1:
             status_icon = "✅" if step_2_state['completed'] else "⏸️"
@@ -931,15 +961,12 @@ def main():
                         st.session_state.pipeline_state['step_2']['error'] = str(e)
                         st.error(f"Step 2 failed: {str(e)}")
         
-        with col3:
-            if step_2_state['completed']:
-                st.metric("Time", f"{step_2_state['time']:.2f}s")
-        
         if step_2_state['completed']:
             result = step_2_state['result']
             st.success(f"✅ Completed: {result['n_points']:,} points backprojected")
             
-            with st.expander("View Step 2 Details", expanded=False):
+            with st.expander("View Step 2 Details", expanded=True):
+                # 2D Visualizations
                 col1, col2 = st.columns(2)
                 with col1:
                     st.image(image, caption="Original Image", use_container_width=True)
@@ -953,6 +980,51 @@ def main():
                     plt.colorbar(im, ax=ax, label="Depth (m)")
                     st.pyplot(fig)
                     plt.close()
+                
+                # 3D Visualization: Colored sparse points
+                st.markdown("#### 3D Colored Sparse Points")
+                if len(result['colored_sparse_points']) > 0:
+                    # Create visualization with colored points
+                    fig = go.Figure()
+                    
+                    # Add colored points
+                    colored_points = result['colored_sparse_points']
+                    colors = result['colored_sparse_colors']
+                    
+                    # Sample points if too many for performance
+                    max_points = 10000
+                    if len(colored_points) > max_points:
+                        indices = np.random.choice(len(colored_points), max_points, replace=False)
+                        colored_points = colored_points[indices]
+                        colors = colors[indices]
+                    
+                    # Colors are already in 0-255 format
+                    fig.add_trace(go.Scatter3d(
+                        x=colored_points[:, 0],
+                        y=colored_points[:, 1],
+                        z=colored_points[:, 2],
+                        mode='markers',
+                        marker=dict(
+                            size=2,
+                            color=[f'rgb({int(r)},{int(g)},{int(b)})' for r, g, b in colors],
+                            opacity=0.8
+                        ),
+                        name='Colored Sparse Points'
+                    ))
+                    
+                    fig.update_layout(
+                        title="3D Colored Sparse Points (Backprojected from Image)",
+                        scene=dict(
+                            xaxis_title="X (m)",
+                            yaxis_title="Y (m)",
+                            zaxis_title="Z (m)",
+                            aspectmode='data'
+                        ),
+                        height=600
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("No colored sparse points to visualize")
         
         if step_2_state.get('error'):
             st.error(f"❌ Error: {step_2_state['error']}")
@@ -964,7 +1036,7 @@ def main():
         step_3_state = st.session_state.pipeline_state['step_3']
         step_2_completed = st.session_state.pipeline_state['step_2']['completed']
         
-        col1, col2, col3 = st.columns([3, 1, 1])
+        col1, col2 = st.columns([3, 1])
         
         with col1:
             status_icon = "✅" if step_3_state['completed'] else "⏸️"
@@ -978,11 +1050,15 @@ def main():
                 with st.spinner("Running Step 3..."):
                     try:
                         step_2_result = st.session_state.pipeline_state['step_2']['result']
+                        class_names = st.session_state.params.get('class_names', ['car', 'person', 'bicycle'])
                         result = step_3_sam_segmentation(
                             sample_meta_data=sample_meta_data,
                             image=image,
                             sparse_points=step_2_result['colored_sparse_points'],
-                            sam_model_type=st.session_state.params['sam_model_type']
+                            class_names=class_names,
+                            sam_model_type=st.session_state.params['sam_model_type'],
+                            yolo_model_path=st.session_state.params.get('yolo_model_path', None),
+                            conf_threshold=st.session_state.params.get('yolo_conf_threshold', 0.25)
                         )
                         st.session_state.pipeline_state['step_3'] = {
                             'completed': True,
@@ -995,19 +1071,129 @@ def main():
                         st.session_state.pipeline_state['step_3']['error'] = str(e)
                         st.error(f"Step 3 failed: {str(e)}")
         
-        with col3:
-            if step_3_state['completed']:
-                st.metric("Time", f"{step_3_state['time']:.2f}s")
-        
         if step_3_state['completed'] and not step_3_state.get('error'):
             result = step_3_state['result']
-            st.success(f"✅ Completed: {result['n_masks']} masks generated")
+            detected_classes = result.get('class_names', [])
+            unique_classes = list(set(detected_classes)) if detected_classes else []
+            n_masks = result.get('n_masks', len(result.get('sam_masks', [])))
+            st.success(f"✅ Completed: {n_masks} masks generated ({len(unique_classes)} unique classes: {', '.join(unique_classes)})")
             
-            with st.expander("View Step 3 Details", expanded=False):
+            with st.expander("View Step 3 Details", expanded=True):
                 sam_masks = result['sam_masks']
+                mask_bboxes = result.get('mask_bboxes', [])
+                detected_class_names = result.get('class_names', [])
+                confidences = result.get('confidences', [])
                 colors = generate_distinct_colors(len(sam_masks))
+                
+                # 2D Visualization: Masks overlay with bounding boxes and labels
+                st.markdown("#### 2D Mask Visualization")
                 img_with_masks = overlay_masks_on_image(image, sam_masks, colors, alpha=0.5)
-                st.image(img_with_masks, caption="Image with SAM Masks", use_container_width=True)
+                
+                # Draw bounding boxes and labels with confidence scores
+                import matplotlib.patches as patches
+                fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+                ax.imshow(img_with_masks)
+                ax.axis('off')
+                
+                for i, (bbox, class_name, confidence) in enumerate(zip(mask_bboxes, detected_class_names, confidences)):
+                    if bbox and len(bbox) == 4:
+                        x1, y1, x2, y2 = bbox
+                        rect = patches.Rectangle(
+                            (x1, y1), x2 - x1, y2 - y1,
+                            linewidth=2, edgecolor=colors[i], facecolor='none'
+                        )
+                        ax.add_patch(rect)
+                        # Add label with confidence
+                        label = f"{class_name}: {confidence:.2f}" if confidence is not None else class_name
+                        ax.text(x1, y1 - 5, label, color=colors[i], fontsize=10, 
+                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
+                
+                ax.set_title("Detected Objects with Masks, Bounding Boxes, and Confidence Scores")
+                st.pyplot(fig)
+                plt.close()
+                
+                # Summary table of detected objects
+                if detected_class_names:
+                    st.markdown("#### Detected Objects Summary")
+                    detection_data = []
+                    for i, (class_name, confidence, bbox) in enumerate(zip(detected_class_names, confidences, mask_bboxes)):
+                        detection_data.append({
+                            'ID': i + 1,
+                            'Class': class_name,
+                            'Confidence': f"{confidence:.3f}" if confidence is not None else "N/A",
+                            'BBox': f"[{bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f}]" if bbox and len(bbox) == 4 else "N/A"
+                        })
+                    df_detections = pd.DataFrame(detection_data)
+                    st.dataframe(df_detections, use_container_width=True)
+                
+                # 3D Visualization: Points assigned to masks
+                st.markdown("#### 3D Point Assignment Visualization")
+                if result['mask_assignments'] is not None and len(result['mask_assignments']) > 0:
+                    step_2_result = st.session_state.pipeline_state['step_2']['result']
+                    sparse_points = step_2_result['colored_sparse_points']
+                    mask_assignments = result['mask_assignments']
+                    
+                    # Create visualization showing points colored by mask assignment
+                    fig = go.Figure()
+                    
+                    # Add points for each mask
+                    for mask_idx in range(len(sam_masks)):
+                        mask_points = sparse_points[mask_assignments == mask_idx]
+                        if len(mask_points) > 0:
+                            # Sample if too many points
+                            max_points = 5000
+                            if len(mask_points) > max_points:
+                                indices = np.random.choice(len(mask_points), max_points, replace=False)
+                                mask_points = mask_points[indices]
+                            
+                            color = colors[mask_idx]
+                            fig.add_trace(go.Scatter3d(
+                                x=mask_points[:, 0],
+                                y=mask_points[:, 1],
+                                z=mask_points[:, 2],
+                                mode='markers',
+                                marker=dict(
+                                    size=2,
+                                    color=f'rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})',
+                                    opacity=0.7
+                                ),
+                                name=f'Mask {mask_idx + 1}'
+                            ))
+                    
+                    # Add unassigned points (if any)
+                    unassigned_points = sparse_points[mask_assignments == -1]
+                    if len(unassigned_points) > 0:
+                        max_points = 2000
+                        if len(unassigned_points) > max_points:
+                            indices = np.random.choice(len(unassigned_points), max_points, replace=False)
+                            unassigned_points = unassigned_points[indices]
+                        
+                        fig.add_trace(go.Scatter3d(
+                            x=unassigned_points[:, 0],
+                            y=unassigned_points[:, 1],
+                            z=unassigned_points[:, 2],
+                            mode='markers',
+                            marker=dict(
+                                size=1,
+                                color='gray',
+                                opacity=0.3
+                            ),
+                            name='Unassigned'
+                        ))
+                    
+                    fig.update_layout(
+                        title="3D Points Colored by Mask Assignment",
+                        scene=dict(
+                            xaxis_title="X (m)",
+                            yaxis_title="Y (m)",
+                            zaxis_title="Z (m)",
+                            aspectmode='data'
+                        ),
+                        height=600
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("No mask assignments to visualize")
         
         if step_3_state.get('error'):
             st.error(f"❌ Error: {step_3_state['error']}")
@@ -1019,7 +1205,7 @@ def main():
         step_4_state = st.session_state.pipeline_state['step_4']
         step_3_completed = st.session_state.pipeline_state['step_3']['completed'] and not st.session_state.pipeline_state['step_3'].get('error')
         
-        col1, col2, col3 = st.columns([3, 1, 1])
+        col1, col2 = st.columns([3, 1])
         
         with col1:
             status_icon = "✅" if step_4_state['completed'] else "⏸️"
@@ -1052,19 +1238,128 @@ def main():
                         st.session_state.pipeline_state['step_4']['error'] = str(e)
                         st.error(f"Step 4 failed: {str(e)}")
         
-        with col3:
-            if step_4_state['completed']:
-                st.metric("Time", f"{step_4_state['time']:.2f}s")
-        
         if step_4_state['completed']:
             result = step_4_state['result']
             total_clusters = sum(r['Clusters Found'] for r in result['clustering_results'])
             st.success(f"✅ Completed: {total_clusters} clusters found across {len(result['clustering_results'])} masks")
             
-            with st.expander("View Step 4 Details", expanded=False):
+            with st.expander("View Step 4 Details", expanded=True):
                 if result['clustering_results']:
+                    # Statistics table
+                    st.markdown("#### Clustering Statistics")
                     df = pd.DataFrame(result['clustering_results'])
                     st.dataframe(df, use_container_width=True)
+                    
+                    # 3D Visualization: Clusters
+                    st.markdown("#### 3D Cluster Visualization")
+                    step_2_result = st.session_state.pipeline_state['step_2']['result']
+                    sparse_points = step_2_result['colored_sparse_points']
+                    step_3_result = st.session_state.pipeline_state['step_3']['result']
+                    mask_assignments = step_3_result['mask_assignments']
+                    mask_cluster_labels = result['mask_cluster_labels']
+                    
+                    # Create visualization showing clusters
+                    fig = go.Figure()
+                    
+                    # Generate colors for clusters
+                    max_clusters = 0
+                    for mask_idx, cluster_labels in mask_cluster_labels.items():
+                        unique_labels = np.unique(cluster_labels)
+                        unique_labels = unique_labels[unique_labels >= 0]
+                        max_clusters = max(max_clusters, len(unique_labels))
+                    
+                    cluster_colors = generate_distinct_colors(max_clusters * len(mask_cluster_labels))
+                    color_idx = 0
+                    
+                    # Add points for each cluster
+                    for mask_idx, cluster_labels in mask_cluster_labels.items():
+                        mask_points = sparse_points[mask_assignments == mask_idx]
+                        if len(mask_points) == 0:
+                            continue
+                        
+                        unique_labels = np.unique(cluster_labels)
+                        unique_labels = unique_labels[unique_labels >= 0]
+                        
+                        for cluster_id in unique_labels:
+                            cluster_points = mask_points[cluster_labels == cluster_id]
+                            if len(cluster_points) > 0:
+                                # Sample if too many points
+                                max_points = 3000
+                                if len(cluster_points) > max_points:
+                                    indices = np.random.choice(len(cluster_points), max_points, replace=False)
+                                    cluster_points = cluster_points[indices]
+                                
+                                color = cluster_colors[color_idx % len(cluster_colors)]
+                                fig.add_trace(go.Scatter3d(
+                                    x=cluster_points[:, 0],
+                                    y=cluster_points[:, 1],
+                                    z=cluster_points[:, 2],
+                                    mode='markers',
+                                    marker=dict(
+                                        size=2,
+                                        color=f'rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})',
+                                        opacity=0.7
+                                    ),
+                                    name=f'Mask {mask_idx + 1}, Cluster {cluster_id}'
+                                ))
+                                color_idx += 1
+                        
+                        # Add noise points for this mask
+                        noise_points = mask_points[cluster_labels == -1]
+                        if len(noise_points) > 0:
+                            max_points = 1000
+                            if len(noise_points) > max_points:
+                                indices = np.random.choice(len(noise_points), max_points, replace=False)
+                                noise_points = noise_points[indices]
+                            
+                            fig.add_trace(go.Scatter3d(
+                                x=noise_points[:, 0],
+                                y=noise_points[:, 1],
+                                z=noise_points[:, 2],
+                                mode='markers',
+                                marker=dict(
+                                    size=1,
+                                    color='gray',
+                                    opacity=0.3
+                                ),
+                                name=f'Mask {mask_idx + 1}, Noise',
+                                showlegend=False
+                            ))
+                    
+                    # Highlight best clusters
+                    best_cluster_points = result['best_cluster_points']
+                    for mask_idx, best_points in best_cluster_points.items():
+                        if len(best_points) > 0:
+                            max_points = 2000
+                            if len(best_points) > max_points:
+                                indices = np.random.choice(len(best_points), max_points, replace=False)
+                                best_points = best_points[indices]
+                            
+                            fig.add_trace(go.Scatter3d(
+                                x=best_points[:, 0],
+                                y=best_points[:, 1],
+                                z=best_points[:, 2],
+                                mode='markers',
+                                marker=dict(
+                                    size=3,
+                                    color='red',
+                                    opacity=0.9,
+                                    line=dict(width=1, color='darkred')
+                                ),
+                                name=f'Best Cluster (Mask {mask_idx + 1})'
+                            ))
+                    
+                    fig.update_layout(
+                        title="3D Clusters (Colored by Cluster ID, Red = Best Clusters)",
+                        scene=dict(
+                            xaxis_title="X (m)",
+                            yaxis_title="Y (m)",
+                            zaxis_title="Z (m)",
+                            aspectmode='data'
+                        ),
+                        height=600
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
         
         if step_4_state.get('error'):
             st.error(f"❌ Error: {step_4_state['error']}")
@@ -1076,7 +1371,7 @@ def main():
         step_5_state = st.session_state.pipeline_state['step_5']
         step_4_completed = st.session_state.pipeline_state['step_4']['completed']
         
-        col1, col2, col3 = st.columns([3, 1, 1])
+        col1, col2 = st.columns([3, 1])
         
         with col1:
             status_icon = "✅" if step_5_state['completed'] else "⏸️"
@@ -1107,20 +1402,60 @@ def main():
                         }
                         # Store detected cuboids in session state for evaluation
                         st.session_state.cuboids = result['detected_cuboids']
+                        
+                        # Save comprehensive results in export-ready format
+                        dataset_type = sample_meta_data.get('dataset_type', 'unknown').lower()
+                        export_results = {
+                            'detected_cuboids': result['detected_cuboids'],
+                            'metadata': {
+                                'dataset_type': dataset_type,
+                                'sample_index': sample_meta_data.get('sample_index', 'unknown'),
+                                'image_path': sample_meta_data.get('image_path', 'unknown'),
+                                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'n_detections': result['n_detected'],
+                                'pipeline_params': st.session_state.params.copy() if 'params' in st.session_state else {}
+                            }
+                        }
+                        
+                        # Add ground truth cuboids if available (for KITTI dataset)
+                        if dataset_type == 'kitti':
+                            ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
+                            if ground_truth_boxes:
+                                # Convert ground truth boxes to cuboid format for export/visualization
+                                ground_truth_cuboids = []
+                                for gt_box in ground_truth_boxes:
+                                    # Ground truth boxes from KITTI already have corners and other fields
+                                    # Ensure they're in the right format for export
+                                    gt_cuboid = {
+                                        'category': gt_box.get('category', 'Unknown'),
+                                        'corners': gt_box.get('corners'),
+                                        'bbox_2d': gt_box.get('bbox_2d'),
+                                        'min_x': gt_box.get('min_x'),
+                                        'max_x': gt_box.get('max_x'),
+                                        'min_y': gt_box.get('min_y'),
+                                        'max_y': gt_box.get('max_y'),
+                                        'min_z': gt_box.get('min_z'),
+                                        'max_z': gt_box.get('max_z'),
+                                        'format': 'kitti_gt'
+                                    }
+                                    ground_truth_cuboids.append(gt_cuboid)
+                                
+                                export_results['ground_truth_cuboids'] = ground_truth_cuboids
+                                export_results['metadata']['n_ground_truth'] = len(ground_truth_cuboids)
+                        
+                        # Store export-ready results
+                        st.session_state.export_results = export_results
+                        
                         st.rerun()
                     except Exception as e:
                         st.session_state.pipeline_state['step_5']['error'] = str(e)
                         st.error(f"Step 5 failed: {str(e)}")
         
-        with col3:
-            if step_5_state['completed']:
-                st.metric("Time", f"{step_5_state['time']:.2f}s")
-        
         if step_5_state['completed']:
             result = step_5_state['result']
             st.success(f"✅ Completed: {result['n_detected']} cuboids detected")
             
-            with st.expander("View Step 5 Details", expanded=False):
+            with st.expander("View Step 5 Details", expanded=True):
                 if result['detected_cuboids']:
                     cuboid_data = []
                     for i, cuboid in enumerate(result['detected_cuboids']):

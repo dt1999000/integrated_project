@@ -107,11 +107,27 @@ def main():
     """)
     
     # Check if detection results are available
-    if 'cuboids' not in st.session_state or not st.session_state.cuboids:
-        st.info("👈 Please run the detection pipeline on **2_Detection** page first.")
-        return
-    
-    detected_cuboids = st.session_state.cuboids
+    if 'export_results' not in st.session_state or not st.session_state.export_results:
+        # Fallback to old format
+        if 'cuboids' not in st.session_state or not st.session_state.cuboids:
+            st.info("👈 Please run the detection pipeline on **2_Detection** page first.")
+            return
+        # Create export_results from old format for backward compatibility
+        detected_cuboids = st.session_state.cuboids
+        export_results = {
+            'detected_cuboids': detected_cuboids,
+            'metadata': {
+                'dataset_type': 'unknown',
+                'sample_index': 'unknown',
+                'image_path': 'unknown',
+                'timestamp': datetime.now().isoformat(),
+                'n_detections': len(detected_cuboids)
+            }
+        }
+        st.session_state.export_results = export_results
+    else:
+        export_results = st.session_state.export_results
+        detected_cuboids = export_results['detected_cuboids']
     
     st.subheader("📦 Detection Results Summary")
     st.metric("Number of Detections", len(detected_cuboids))
@@ -143,26 +159,17 @@ def main():
         help="Choose the export format"
     )
     
-    # Get metadata
-    metadata = {}
-    if 'sample' in st.session_state:
-        sample_meta_data = st.session_state.sample['sample_meta_data']
-        metadata = {
-            'dataset_type': sample_meta_data.get('dataset_type', 'unknown'),
-            'sample_index': sample_meta_data.get('sample_index', 'unknown'),
-            'image_path': sample_meta_data.get('image_path', 'unknown')
-        }
-    
-    if 'pipeline_state' in st.session_state:
-        metadata['pipeline_params'] = st.session_state.params
+    # Get metadata from export_results (already includes all necessary info)
+    metadata = export_results.get('metadata', {})
     
     # Export button
     if st.button("💾 Export Results", type="primary"):
         if export_format == 'JSON (Custom)':
             # Create JSON file
-            json_str = json.dumps({
+            # Include ground truth cuboids if available
+            export_data = {
                 'metadata': metadata,
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': metadata.get('timestamp', datetime.now().isoformat()),
                 'n_detections': len(detected_cuboids),
                 'detections': [
                     {
@@ -189,7 +196,29 @@ def main():
                     }
                     for c in detected_cuboids
                 ]
-            }, indent=2)
+            }
+            
+            # Add ground truth cuboids if available
+            if 'ground_truth_cuboids' in export_results:
+                export_data['ground_truth_cuboids'] = [
+                    {
+                        'category': gt.get('category', 'Unknown'),
+                        'corners': gt['corners'].tolist() if isinstance(gt.get('corners'), np.ndarray) else gt.get('corners'),
+                        'bbox_2d': gt.get('bbox_2d'),
+                        'bounds': {
+                            'min_x': float(gt.get('min_x', 0)),
+                            'max_x': float(gt.get('max_x', 0)),
+                            'min_y': float(gt.get('min_y', 0)),
+                            'max_y': float(gt.get('max_y', 0)),
+                            'min_z': float(gt.get('min_z', 0)),
+                            'max_z': float(gt.get('max_z', 0))
+                        }
+                    }
+                    for gt in export_results['ground_truth_cuboids']
+                ]
+                export_data['n_ground_truth'] = len(export_data['ground_truth_cuboids'])
+            
+            json_str = json.dumps(export_data, indent=2)
             
             st.download_button(
                 label="📥 Download JSON",

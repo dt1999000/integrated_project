@@ -555,7 +555,6 @@ def fit_cuboid_to_points(points: np.ndarray,
             w_g * geo_term +
             w_o * outlier_frac
         )
-        print(f'geo_term: {geo_term}, outlier_frac: {outlier_frac}, mean_min_sq_dist: {mean_min_sq_dist}')
         return score
     
     best_score = float('inf')
@@ -566,7 +565,6 @@ def fit_cuboid_to_points(points: np.ndarray,
     for n in range(max_step_center + 1):
         center = mu + step_center_search * n * ray_dir
         for yaw in np.arange(0.0, np.pi, d_theta):
-            print(f"Center: {center}, Yaw: {yaw}")
             score = _score_for_hypothesis(center, yaw, (length, width, height), (w_dist, w_geo, w_out))
             if score < best_score:
                 best_score = score

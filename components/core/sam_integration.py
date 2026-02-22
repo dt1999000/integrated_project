@@ -10,6 +10,7 @@ import torch
 import cv2
 import os
 
+from .utils import get_bbox_from_mask
 try:
     from ultralytics import ASSETS, SAM, YOLO, FastSAM
     ULTRALYTICS_AVAILABLE = True
@@ -51,6 +52,7 @@ class SAMIntegration:
         self.predictor = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.current_image = None
+        self._yolo_integration = None  # Lazy initialization for SAM2 pipeline
         
         if not ULTRALYTICS_AVAILABLE:
             raise ImportError("Ultralytics not available. Install with: pip install ultralytics")
@@ -290,6 +292,7 @@ class SAMIntegration:
                 - "masks": List of segmentation masks (one per instance)
                 - "labels": List of class labels for each mask
                 - "instances": List of instance IDs
+                - "scores": List of confidence scores for each mask (if available)
                 
         Raises:
             RuntimeError: If model is not SAM3
@@ -308,14 +311,22 @@ class SAMIntegration:
         # Query with text prompts
         results = self.predictor(text=class_names)
         
-        # Extract masks and labels
+        # Extract masks, labels, and scores
         masks = []
         labels = []
         instance_ids = []
+        scores = []
         
         if results and len(results) > 0:
             for i, result in enumerate(results):
                 if result.masks is not None and len(result.masks) > 0:
+                    # Check if result has scores attribute
+                    result_scores = None
+                    if hasattr(result, 'scores') and result.scores is not None:
+                        result_scores = result.scores.cpu().numpy() if hasattr(result.scores, 'cpu') else result.scores
+                    elif hasattr(result, 'score') and result.score is not None:
+                        result_scores = result.score.cpu().numpy() if hasattr(result.score, 'cpu') else result.score
+                    
                     for j, mask in enumerate(result.masks):
                         mask_np = mask.cpu().numpy()
                         # Validate mask dimensions
@@ -338,11 +349,31 @@ class SAMIntegration:
                         masks.append(mask_np)
                         labels.append(class_names[i] if i < len(class_names) else "unknown")
                         instance_ids.append(len(masks) - 1)
+                        
+                        # Extract confidence score if available
+                        if result_scores is not None:
+                            if isinstance(result_scores, np.ndarray):
+                                if result_scores.ndim == 0:
+                                    # Single score for all masks
+                                    score = float(result_scores)
+                                elif len(result_scores) > j:
+                                    # Score per mask
+                                    score = float(result_scores[j])
+                                else:
+                                    # Fallback to first score or 1.0
+                                    score = float(result_scores[0]) if len(result_scores) > 0 else 1.0
+                            else:
+                                score = float(result_scores)
+                        else:
+                            # No score available, use None (will be handled in calling function)
+                            score = None
+                        scores.append(score)
         
         return {
             "masks": masks,
             "labels": labels,
-            "instances": instance_ids
+            "instances": instance_ids,
+            "scores": scores
         }
     
     def match_instances_to_bboxes(self, masks: List[np.ndarray], bboxes: List[List[float]], 
@@ -401,17 +432,8 @@ class SAMIntegration:
         Returns:
             Bounding box as [x1, y1, x2, y2]
         """
-        # Find all non-zero pixels
-        coords = np.column_stack(np.where(mask > 0))
         
-        if len(coords) == 0:
-            return [0, 0, 0, 0]
-        
-        # Get min and max coordinates
-        y_min, x_min = coords.min(axis=0)
-        y_max, x_max = coords.max(axis=0)
-        
-        return [int(x_min), int(y_min), int(x_max), int(y_max)]
+        return get_bbox_from_mask(mask)
     
     def segment_everything(self, image: np.ndarray) -> List[np.ndarray]:
         """
@@ -543,29 +565,148 @@ class SAMIntegration:
         Returns:
             IoU value between 0 and 1
         """
-        x1_1, y1_1, x2_1, y2_1 = bbox1
-        x1_2, y1_2, x2_2, y2_2 = bbox2
+        from .utils import calculate_iou
+        return calculate_iou(bbox1, bbox2)
+    
+    def segment_by_class_names(self, image: np.ndarray, class_names: List[str],
+                               yolo_model_path: Optional[str] = None,
+                               conf_threshold: float = 0.25) -> Dict:
+        """
+        Unified pipeline for segmentation by class names.
+        For SAM3: Directly segments using class names.
+        For SAM2: Uses YOLO-World to get bounding boxes, then segments with SAM2.
         
-        # Calculate intersection
-        x1_i = max(x1_1, x1_2)
-        y1_i = max(y1_1, y1_2)
-        x2_i = min(x2_1, x2_2)
-        y2_i = min(y2_1, y2_2)
+        Args:
+            image: Input image as numpy array (H, W, 3) in RGB format
+            class_names: List of class names to segment (e.g., ["car", "person", "bicycle"])
+            yolo_model_path: Optional path to YOLO-World model (only used for SAM2)
+            conf_threshold: Confidence threshold for YOLO detections (default: 0.25)
         
-        if x2_i <= x1_i or y2_i <= y1_i:
-            return 0.0
+        Returns:
+            Dictionary with:
+                - 'masks': List of segmentation masks (H, W) as numpy arrays
+                - 'bboxes': List of bounding boxes [x1, y1, x2, y2] for each mask
+                - 'class_names': List of class names for each mask
+                - 'confidences': List of confidence scores for each mask
+        """
+        if self.model_type == "sam3":
+            return self._segment_by_class_names_sam3(image, class_names)
+        elif self.model_type.startswith("sam2"):
+            return self._segment_by_class_names_sam2(image, class_names, yolo_model_path, conf_threshold)
+        else:
+            raise RuntimeError(f"segment_by_class_names not supported for model type: {self.model_type}")
+    
+    def _segment_by_class_names_sam3(self, image: np.ndarray, class_names: List[str]) -> Dict:
+        """
+        SAM3 pipeline: Directly segment using class names, then draw boxes around masks.
         
-        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        Args:
+            image: Input image as numpy array (H, W, 3)
+            class_names: List of class names to segment
         
-        # Calculate union
-        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-        union = area1 + area2 - intersection
+        Returns:
+            Dictionary with masks, bboxes, class_names, and confidences
+        """
+        # Use existing segment_by_classes method
+        segment_results = self.segment_by_classes(image, class_names)
         
-        if union == 0:
-            return 0.0
+        masks = segment_results['masks']
+        labels = segment_results['labels']
+        scores = segment_results.get('scores', [])
         
-        return intersection / union
+        # Draw bounding boxes around masks
+        bboxes = []
+        for mask in masks:
+            bbox = get_bbox_from_mask(mask)
+            bboxes.append(bbox)
+        
+        # Use SAM3 confidence scores if available, otherwise fallback to mask area
+        confidences = []
+        for i, mask in enumerate(masks):
+            if i < len(scores) and scores[i] is not None:
+                # Use SAM3's confidence score
+                confidence = float(scores[i])
+            else:
+                # Fallback: Use mask area as a proxy for confidence (normalized)
+                mask_area = np.sum(mask > 0)
+                h, w = image.shape[:2]
+                normalized_area = mask_area / (h * w)
+                # Simple confidence based on mask size (larger masks = higher confidence)
+                confidence = min(1.0, normalized_area * 10.0)  # Scale factor can be adjusted
+            
+            confidences.append(confidence)
+        
+        return {
+            'masks': masks,
+            'bboxes': bboxes,
+            'class_names': labels,
+            'confidences': confidences
+        }
+    
+    def _segment_by_class_names_sam2(self, image: np.ndarray, class_names: List[str],
+                                     yolo_model_path: Optional[str] = None,
+                                     conf_threshold: float = 0.25) -> Dict:
+        """
+        SAM2 pipeline: Use YOLO-World to get bounding boxes, then segment with SAM2.
+        
+        Args:
+            image: Input image as numpy array (H, W, 3)
+            class_names: List of class names to detect and segment
+            yolo_model_path: Optional path to YOLO-World model
+            conf_threshold: Confidence threshold for YOLO detections
+        
+        Returns:
+            Dictionary with masks, bboxes, class_names, and confidences
+        """
+        # Initialize YOLO if not already done
+        if not hasattr(self, '_yolo_integration') or self._yolo_integration is None:
+            if yolo_model_path is None:
+                yolo_model_path = "yolov8s-world.pt"
+            try:
+                self._yolo_integration = YOLOIntegration(yolo_model_path)
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize YOLO integration: {str(e)}")
+        
+        # Step 1: Detect objects with YOLO-World
+        yolo_detections = self._yolo_integration.detect_with_classes(
+            image, class_names, conf_threshold=conf_threshold
+        )
+        
+        if len(yolo_detections) == 0:
+            return {
+                'masks': [],
+                'bboxes': [],
+                'class_names': [],
+                'confidences': []
+            }
+        
+        # Step 2: Segment each detection with SAM2
+        masks = []
+        bboxes = []
+        class_names_list = []
+        confidences = []
+        
+        for detection in yolo_detections:
+            bbox = detection['bbox']
+            class_name = detection['class_name']
+            confidence = detection['confidence']
+            
+            # Get mask from SAM2 using bounding box
+            mask = self.get_mask_from_bbox(image, bbox)
+            
+            # Only add if mask is valid (not empty)
+            if np.sum(mask > 0) > 0:
+                masks.append(mask)
+                bboxes.append(bbox)
+                class_names_list.append(class_name)
+                confidences.append(confidence)
+        
+        return {
+            'masks': masks,
+            'bboxes': bboxes,
+            'class_names': class_names_list,
+            'confidences': confidences
+        }
 
 
 def assign_points_to_masks(
@@ -618,3 +759,95 @@ def assign_points_to_masks(
                         mask_assignments[point_idx] = mask_idx
 
     return mask_assignments
+
+class YOLOIntegration:
+    """
+    YOLO Integration Module for 3D Object Detection Pipeline
+    This module provides unified class for integrating YOLO models.
+    Supports YOLO-World models for open-vocabulary object detection.
+    """
+    def __init__(self, model_path: str = "yolov8s-world.pt"):
+        """
+        Initialize YOLO integration manager.
+        
+        Args:
+            model_path: Path to YOLO-World model file (default: "yolov8s-world.pt")
+        """
+        if not ULTRALYTICS_AVAILABLE:
+            raise ImportError("Ultralytics not available. Install with: pip install ultralytics")
+        
+        # Get absolute path to model
+        if not os.path.isabs(model_path):
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            models_dir = os.path.join(project_root, "models")
+            model_path = os.path.join(models_dir, model_path)
+            model_path = os.path.abspath(model_path)
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"YOLO model not found at {model_path}")
+        
+        self.model_path = model_path
+        self.model = None
+        self._load_model()
+    
+    def _load_model(self):
+        """Load the YOLO model."""
+        self.model = YOLO(self.model_path)
+        print(f"Loaded YOLO model from {self.model_path}")
+    
+    def detect_with_classes(self, image: np.ndarray, class_names: List[str], 
+                           conf_threshold: float = 0.25) -> List[Dict]:
+        """
+        Detect objects in image using YOLO-World with specified class names.
+        
+        Args:
+            image: Input image as numpy array (H, W, 3) in RGB format
+            class_names: List of class names to detect (e.g., ["car", "person", "bicycle"])
+            conf_threshold: Confidence threshold for detections (default: 0.25)
+        
+        Returns:
+            List of detection dictionaries, each with:
+                - 'bbox': [x1, y1, x2, y2] bounding box coordinates
+                - 'class_name': Detected class name
+                - 'confidence': Detection confidence score
+                - 'class_id': Class index in class_names list
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+        
+        # Set classes for YOLO-World
+        self.model.set_classes(class_names)
+        
+        # Run inference
+        results = self.model(image, conf=conf_threshold, verbose=False)
+        
+        detections = []
+        if results and len(results) > 0:
+            result = results[0]
+            
+            if result.boxes is not None:
+                boxes = result.boxes
+                num_detections = len(boxes)
+                
+                for i in range(num_detections):
+                    # Get bounding box (xyxy format)
+                    bbox = boxes.xyxy[i].cpu().numpy().tolist()  # [x1, y1, x2, y2]
+                    
+                    # Get confidence
+                    confidence = float(boxes.conf[i].cpu().numpy())
+                    
+                    # Get class ID and name
+                    class_id = int(boxes.cls[i].cpu().numpy())
+                    if class_id < len(class_names):
+                        class_name = class_names[class_id]
+                    else:
+                        class_name = "unknown"
+                    
+                    detections.append({
+                        'bbox': [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+                        'class_name': class_name,
+                        'confidence': confidence,
+                        'class_id': class_id
+                    })
+        
+        return detections

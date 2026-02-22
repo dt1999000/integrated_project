@@ -42,7 +42,15 @@ def main():
     sample = st.session_state.sample
     sample_meta_data = sample['sample_meta_data']
     detected_cuboids = st.session_state.cuboids
-    ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
+    
+    # Get ground truth from export_results if available (preferred), otherwise from sample_meta_data
+    ground_truth_boxes = []
+    if 'export_results' in st.session_state and 'ground_truth_cuboids' in st.session_state.export_results:
+        # Use ground truth cuboids from export_results (already in cuboid format)
+        ground_truth_boxes = st.session_state.export_results['ground_truth_cuboids']
+    else:
+        # Fallback to sample_meta_data
+        ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
     
     if not ground_truth_boxes:
         st.warning("⚠️ No ground truth boxes available for this sample.")
@@ -146,4 +154,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 

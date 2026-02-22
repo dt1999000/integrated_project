@@ -100,3 +100,61 @@ def load_dataset_sample(sample_index: int = 0, distance_threshold: float = 0.3,
 
     return sample_data, point_cloud
 
+
+def get_bbox_from_mask(mask: np.ndarray) -> list:
+    """
+    Get bounding box coordinates from a binary mask.
+    
+    Args:
+        mask: Binary mask as numpy array (H, W)
+    
+    Returns:
+        Bounding box as [x1, y1, x2, y2]
+    """
+    # Find all non-zero pixels
+    coords = np.column_stack(np.where(mask > 0))
+    
+    if len(coords) == 0:
+        return [0, 0, 0, 0]
+    
+    # Get min and max coordinates
+    y_min, x_min = coords.min(axis=0)
+    y_max, x_max = coords.max(axis=0)
+    
+    return [int(x_min), int(y_min), int(x_max), int(y_max)]
+
+
+def calculate_iou(bbox1: list, bbox2: list) -> float:
+    """
+    Calculate Intersection over Union (IoU) between two bounding boxes.
+    
+    Args:
+        bbox1: First bounding box [x1, y1, x2, y2]
+        bbox2: Second bounding box [x1, y1, x2, y2]
+    
+    Returns:
+        IoU value between 0 and 1
+    """
+    x1_1, y1_1, x2_1, y2_1 = bbox1
+    x1_2, y1_2, x2_2, y2_2 = bbox2
+    
+    # Calculate intersection
+    x1_i = max(x1_1, x1_2)
+    y1_i = max(y1_1, y1_2)
+    x2_i = min(x2_1, x2_2)
+    y2_i = min(y2_1, y2_2)
+    
+    if x2_i <= x1_i or y2_i <= y1_i:
+        return 0.0
+    
+    intersection = (x2_i - x1_i) * (y2_i - y1_i)
+    
+    # Calculate union
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union = area1 + area2 - intersection
+    
+    if union == 0:
+        return 0.0
+    
+    return intersection / union

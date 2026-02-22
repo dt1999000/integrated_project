@@ -64,16 +64,19 @@ def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
     Returns:
         (length, width, height) tuple in meters
     """
+    # Get class-specific default dimensions
+    default_dims = _get_default_dimensions(class_name)
+    
     if not HF_AVAILABLE:
-        # Fallback to default dimensions
-        print(f"LLM not available, using default dimensions for {class_name}")
-        return 4.0, 1.8, 1.6
+        # Fallback to class-specific default dimensions
+        print(f"LLM not available, using default dimensions for {class_name}: {default_dims}")
+        return default_dims
     
     model, tokenizer = _get_llm_model()
     if model is None or tokenizer is None:
-        # Fallback to default dimensions
-        print(f"LLM model not loaded, using default dimensions for {class_name}")
-        return 4.0, 1.8, 1.6
+        # Fallback to class-specific default dimensions
+        print(f"LLM model not loaded, using default dimensions for {class_name}: {default_dims}")
+        return default_dims
     
     try:
         # Create a prompt asking for dimensions
@@ -111,7 +114,37 @@ def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
     except Exception as e:
         print(f"Error querying LLM for {class_name}: {e}")
         print("Falling back to default dimensions")
-        return 4.0, 1.8, 1.6
+        return _get_default_dimensions(class_name)
+
+
+def _get_default_dimensions(class_name: str) -> Tuple[float, float, float]:
+    """
+    Get default dimensions for a class name based on heuristics.
+    
+    Args:
+        class_name: Semantic class name
+    
+    Returns:
+        (length, width, height) tuple in meters
+    """
+    # Default fallback dimensions based on class name (heuristic)
+    defaults = {
+        'car': (4.0, 1.8, 1.6),
+        'truck': (8.0, 2.5, 3.0),
+        'bus': (12.0, 2.5, 3.5),
+        'pedestrian': (0.5, 0.5, 1.7),
+        'person': (0.5, 0.5, 1.7),  # Same as pedestrian
+        'people': (0.5, 0.5, 1.7),
+        'cyclist': (1.8, 0.7, 1.7),
+        'bicycle': (1.8, 0.7, 1.2),
+        'motorcycle': (2.0, 0.8, 1.3),
+        'van': (4.76, 2.22, 2.27),
+        'tram': (15.59, 3.66, 3.73),
+    }
+    
+    class_lower = class_name.lower()
+    default_dims = defaults.get(class_lower, (4.0, 1.8, 1.6))  # Generic default
+    return default_dims
 
 
 def _parse_dimensions_from_text(text: str, class_name: str) -> Tuple[float, float, float]:
@@ -120,19 +153,8 @@ def _parse_dimensions_from_text(text: str, class_name: str) -> Tuple[float, floa
     
     Tries multiple patterns to extract length, width, height values.
     """
-    # Default fallback dimensions based on class name (heuristic)
-    defaults = {
-        'car': (4.0, 1.8, 1.6),
-        'truck': (8.0, 2.5, 3.0),
-        'bus': (12.0, 2.5, 3.5),
-        'pedestrian': (0.5, 0.5, 1.7),
-        'cyclist': (1.8, 0.7, 1.7),
-        'bicycle': (1.8, 0.7, 1.2),
-        'motorcycle': (2.0, 0.8, 1.3),
-    }
-    
-    class_lower = class_name.lower()
-    default_dims = defaults.get(class_lower, (4.0, 1.8, 1.6))
+    # Get class-specific default dimensions
+    default_dims = _get_default_dimensions(class_name)
     
     # Pattern 1: "length=X.X width=Y.Y height=Z.Z"
     pattern1 = r'length[=:\s]+([\d.]+)\s*(?:m|meters?)?[,\s]+width[=:\s]+([\d.]+)\s*(?:m|meters?)?[,\s]+height[=:\s]+([\d.]+)\s*(?:m|meters?)?'
@@ -170,4 +192,6 @@ def _parse_dimensions_from_text(text: str, class_name: str) -> Tuple[float, floa
     # If no pattern matches, return defaults based on class name
     print(f"Could not parse dimensions from LLM text, using defaults for {class_name}")
     return default_dims
+
+
 

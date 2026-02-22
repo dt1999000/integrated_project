@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 import numpy as np
 import cv2
+from scipy.spatial.transform import Rotation as R
 
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -326,17 +327,62 @@ def _load_sim_sample(
             print(f"Error: Could not load image or point cloud")
             return None, None, None
         
-        # Get calibration data
-        calibration = link.get('calibration', {})
-        camera_intrinsic = calibration.get('camera_intrinsic')
-        camera_to_lidar_transform = calibration.get('camera_to_lidar_transform')
+        # Get calibration data from rgb and lidar samples
+        rgb_calib = rgb_sample.get('calibration', {})
+        lidar_calib = lidar_sample.get('calibration', {})
+        
+        # Extract camera intrinsic (handle typo in LinkedDataHandler: "camera_intrinisc")
+        camera_intrinsic = None
+        if 'camera_intrinisc' in rgb_calib:  # Typo version
+            camera_intrinsic = np.array(rgb_calib['camera_intrinisc'])
+        elif 'camera_intrinsic' in rgb_calib:  # Correct version
+            camera_intrinsic = np.array(rgb_calib['camera_intrinsic'])
+        
+        # Compute camera_to_lidar_transform from rotation and translation
+        camera_to_lidar_transform = None
+        if rgb_calib and lidar_calib:
+            try:
+                # Camera rotation and translation (quaternion [x,y,z,w] and translation)
+                q_cam = rgb_calib.get('rotation', [0, 0, 0, 1])  # [x, y, z, w]
+                t_cam = np.array(rgb_calib.get('translation', [0, 0, 0]))
+                
+                # LiDAR rotation and translation
+                q_lidar = lidar_calib.get('rotation', [0, 0, 0, 1])  # [x, y, z, w]
+                t_lidar = np.array(lidar_calib.get('translation', [0, 0, 0]))
+                
+                # Convert quaternions to rotation matrices
+                R_cam2world = R.from_quat(q_cam).as_matrix()  # Camera to world
+                R_lidar2world = R.from_quat(q_lidar).as_matrix()  # LiDAR to world
+                
+                # Build transformation matrices (4x4)
+                T_cam2world = np.eye(4)
+                T_cam2world[:3, :3] = R_cam2world
+                T_cam2world[:3, 3] = t_cam
+                
+                T_lidar2world = np.eye(4)
+                T_lidar2world[:3, :3] = R_lidar2world
+                T_lidar2world[:3, 3] = t_lidar
+                
+                # Camera to LiDAR: T_cam2lidar = T_lidar2world^-1 @ T_cam2world
+                T_world2lidar = np.linalg.inv(T_lidar2world)
+                camera_to_lidar_transform = T_world2lidar @ T_cam2world
+                
+            except Exception as e:
+                print(f"Warning: Could not compute camera_to_lidar_transform: {e}")
+                camera_to_lidar_transform = None
+        
+        # Validate that we have required calibration data
+        if camera_intrinsic is None:
+            print(f"Warning: Camera intrinsic not found in calibration data")
+        if camera_to_lidar_transform is None:
+            print(f"Warning: Camera to LiDAR transform could not be computed")
         
         # Create normalized sample_meta_data
         sample_meta_data = {
-            'image_path': image_path,
-            'point_cloud_path': point_cloud_path,
+            'image_path': str(image_path) if image_path else None,
+            'point_cloud_path': str(point_cloud_path) if point_cloud_path else None,
             'camera_intrinsic': camera_intrinsic,
-            'camera_extrinsic': np.eye(4),  # Default if not available
+            'camera_extrinsic': np.eye(4),
             'camera_to_lidar_transform': camera_to_lidar_transform,
             'ground_truth_boxes': link.get('samples', {}).get('lidar', {}).get('annotations', []),
             'sample_index': link_token,

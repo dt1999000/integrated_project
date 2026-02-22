@@ -12,6 +12,8 @@ import imagehash
 
 from components.dataset_loaders.utils import detect_dataset_type, load_dataset_sample
 from components.dataset_loaders.dataset_loader import LinkedDataHandler
+from components.utils.visualization_helper import create_3d_scatter_plot
+from components.core.pointcloud_projection import PointCloud
 
 # Import image quality functions from 1_Extraction.py
 def variance_of_laplacian(img_gray):
@@ -399,6 +401,81 @@ def main():
                 st.caption(f"X range: [{point_cloud[:, 0].min():.2f}, {point_cloud[:, 0].max():.2f}]")
                 st.caption(f"Y range: [{point_cloud[:, 1].min():.2f}, {point_cloud[:, 1].max():.2f}]")
                 st.caption(f"Z range: [{point_cloud[:, 2].min():.2f}, {point_cloud[:, 2].max():.2f}]")
+        
+        # Point cloud visualization with ground removal
+        st.markdown("---")
+        st.subheader("📊 Point Cloud Visualization")
+        
+        # Ground removal parameters
+        with st.expander("⚙️ Ground Removal Parameters", expanded=False):
+            distance_threshold = st.slider(
+                "Distance Threshold", 0.1, 1.0, 0.3, 0.01,
+                help="RANSAC distance threshold for ground plane removal"
+            )
+            ransac_n = st.slider(
+                "RANSAC N", 3, 10, 3, 1,
+                help="Number of points to sample for plane fitting"
+            )
+            num_iterations = st.slider(
+                "Iterations", 100, 1000, 1000, 100,
+                help="Number of RANSAC iterations"
+            )
+            filter_forward_only = st.checkbox(
+                "Forward-Facing Only", True,
+                help="Keep only forward-facing points (x > 0)"
+            )
+        
+        if len(point_cloud) > 0:
+            try:
+                # Apply ground removal
+                with st.spinner("Removing ground plane..."):
+                    point_cloud_obj = PointCloud(point_cloud)
+                    point_cloud_obj.remove_ground_plane_ransac(
+                        distance_threshold=distance_threshold,
+                        ransac_n=ransac_n,
+                        num_iterations=num_iterations,
+                        filter_forward_only=filter_forward_only
+                    )
+                    
+                    # Get ground-removed points
+                    point_cloud_ground_removed = point_cloud_obj.point_cloud_plane_removed
+                    
+                    # Display statistics
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Original Points", f"{len(point_cloud):,}")
+                    with col2:
+                        st.metric("After Ground Removal", f"{len(point_cloud_ground_removed):,}")
+                    with col3:
+                        reduction_pct = (1 - len(point_cloud_ground_removed) / len(point_cloud)) * 100
+                        st.metric("Reduction", f"{reduction_pct:.1f}%")
+                    
+                    if len(point_cloud_ground_removed) > 0:
+                        # Visualize ground-removed point cloud
+                        fig = create_3d_scatter_plot(
+                            points=point_cloud_ground_removed,
+                            labels=None,
+                            mask_points=None,
+                            cuboids=None,
+                            rays=None,
+                            points_in_frustums=None,
+                            reconstructed_points=None,
+                            show_lidar=True,
+                            show_reconstructed=False,
+                            color_by_depth=False,
+                            title="Point Cloud (After Ground Removal)"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.success(f"✅ Point cloud visualized successfully! {len(point_cloud_ground_removed):,} points remaining after ground removal.")
+                    else:
+                        st.warning("⚠️ Point cloud is empty after ground removal. Try adjusting the parameters.")
+                        
+            except Exception as e:
+                st.error(f"❌ Error processing point cloud: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
+        else:
+            st.warning("⚠️ Point cloud is empty")
         
         # Sample metadata
         with st.expander("Sample Metadata", expanded=False):
