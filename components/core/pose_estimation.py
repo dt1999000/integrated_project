@@ -24,48 +24,6 @@ except ImportError:
         'Person_sitting': {'length': 0.72, 'width': 0.80, 'height': 1.29},
         'Unknown': {'length': 2.0, 'width': 1.5, 'height': 1.5},
     }
-
-# Import LLM service
-try:
-    from .llm_service import query_llm_for_dimensions
-except ImportError:
-    # Fallback if LLM service not available
-    def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
-        """Fallback when LLM service is not available"""
-        return 4.0, 1.8, 1.6
-
-
-def get_dimensions_from_class(class_name: Optional[str]) -> Tuple[float, float, float]:
-    """
-    Get typical physical dimensions for a semantic class.
-
-    The function first looks up `class_name` in `KITTI_CUBOID_TEMPLATES`. If it
-    is not present, it calls an LLM-backed service to get a reasonable guess
-    for (length, width, height) and returns that as a tuple.
-
-    Args:
-        class_name: Semantic class name (e.g. 'Car', 'Pedestrian'). If None,
-                    a generic default size is used.
-
-    Returns:
-        (length, width, height) in meters.
-    """
-    if class_name is None:
-        # Fully generic default dimensions
-        return 4.0, 1.8, 1.6
-
-    template = KITTI_CUBOID_TEMPLATES.get(class_name)
-    if template is not None:
-        return (
-            float(template.get('length', 4.0)),
-            float(template.get('width', 1.8)),
-            float(template.get('height', 1.6)),
-        )
-
-    # Fallback: ask the LLM for typical dimensions
-    length, width, height = query_llm_for_dimensions(class_name)
-    return float(length), float(width), float(height)
-
 def estimate_pose_pca(points: np.ndarray, category: Optional[str] = None) -> Dict:
     """
     Estimates x, y, z, and yaw using Principal Component Analysis.
@@ -155,14 +113,12 @@ def estimate_pose_l_shape(points: np.ndarray,
     
     Args:
         points: np.ndarray (N, 3) - 3D points in LiDAR coordinates
-        category: Optional object category (e.g., 'Car', 'Pedestrian'). If provided
-                  and `dimensions` is None, category-based priors will be used as
-                  a fallback when the raw L-shape estimate is unreliable.
+        category: Optional object category (e.g., 'Car', 'Pedestrian'). Used for metadata.
         d_theta: float - Angular step size for search (radians). Default 0.01 (~0.57 degrees)
         ground_plane_model: Optional [a, b, c, d] plane equation from RANSAC.
                             Used to compute ground z for height calculation.
-        dimensions: Optional (length, width, height) prior. If provided, this
-                    will be used when the raw L-shape estimate is unreliable.
+        dimensions: Optional (length, width, height) prior. If provided, used when the
+                    raw L-shape estimate is unreliable (e.g. too small). Pass from caller.
     
     Returns:
         Dictionary containing:
@@ -253,12 +209,8 @@ def estimate_pose_l_shape(points: np.ndarray,
         # Use min z as ground level
         height = np.max(points[:, 2]) - np.min(points[:, 2])
     
-    # Use prior dimensions if provided and estimated dimensions seem unreliable
-    # (e.g., if estimated dimensions are too small or too large). If explicit
-    # priors are not given but a category is, fall back to category-based priors.
-    if dimensions is None and category is not None:
-        dimensions = get_dimensions_from_class(category)
-
+    # Use prior dimensions if provided and estimated dimensions seem unreliable.
+    # Caller must pass dimensions when category-based priors are needed.
     if dimensions is not None:
         prior_length, prior_width, prior_height = dimensions
         # Use prior if estimated dimensions are very small (likely unreliable)
@@ -283,6 +235,7 @@ def estimate_pose_l_shape(points: np.ndarray,
 def cuboid_from_pose(pose_result: Dict,
                      category: Optional[str] = None,
                      template_dims: Optional[Dict[str, float]] = None,
+                     dimensions: Optional[Tuple[float, float, float]] = None,
                      ground_z: Optional[float] = None) -> Dict:
     """
     Create a KITTI-format cuboid dictionary from pose estimation result.
@@ -295,6 +248,8 @@ def cuboid_from_pose(pose_result: Dict,
         template_dims: Optional dict with 'length', 'width', 'height' from
                        category templates. Used when pose_result does not already
                        contain dimensions (e.g., PCA-based pose).
+        dimensions: Optional (length, width, height) tuple. Used when pose_result
+                    does not contain dimensions and template_dims is not provided.
         ground_z: Optional ground z value at cuboid center. If provided, uses this
                   for base_z calculation.
     
@@ -324,8 +279,14 @@ def cuboid_from_pose(pose_result: Dict,
             length = float(template_dims.get('length', 4.0))
             width = float(template_dims.get('width', 1.8))
             height = float(template_dims.get('height', 1.6))
+        elif dimensions is not None:
+            length, width, height = float(dimensions[0]), float(dimensions[1]), float(dimensions[2])
         else:
-            length, width, height = get_dimensions_from_class(category)
+            # Fallback to KITTI template for category (no LLM)
+            t = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
+            length = float(t['length'])
+            width = float(t['width'])
+            height = float(t['height'])
     else:
         length = float(length)
         width = float(width)
@@ -501,7 +462,6 @@ def fit_cuboid_to_points(points: np.ndarray,
         center_top = center + w * half_h
         center_bottom = center - w * half_h
         
-        print(f'center_front: {center_front}, center_back: {center_back}, center_right: {center_right}, center_left: {center_left}, center_top: {center_top}, center_bottom: {center_bottom}')
         # Distances of face centers to origin
         face_centers = np.stack([
             center_front, center_back,

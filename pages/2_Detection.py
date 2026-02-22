@@ -14,7 +14,7 @@ from typing import List, Dict, Optional, Tuple
 from components.core.pointcloud_projection import PointCloud, Projection
 from components.core.depth_estimation import compute_sparse_depth_map
 from components.core.sam_integration import SAMIntegration, assign_points_to_masks
-from components.core.pose_estimation import fit_cuboid_to_points, get_dimensions_from_class
+from components.core.pose_estimation import fit_cuboid_to_points
 from components.core.clustering_manager import ClusteringManager, select_best_cluster_points
 from components.core.utils import get_bbox_from_mask, calculate_iou
 from components.utils.visualization_helper import (
@@ -415,8 +415,13 @@ def step_5_detection_pose_estimation(
                         best_category = gt_box.get('category', 'Unknown')
                 category = best_category
         
-        # Get dimensions for this category
-        dimensions = get_dimensions_from_class(category)
+        # Get dimensions for this category from session_state (pre-computed when class names change)
+        dimensions_by_class = st.session_state.params.get('dimensions_by_class', {})
+        dimensions = dimensions_by_class.get(category)
+        if dimensions is None:
+            from components.core.constants import KITTI_CUBOID_TEMPLATES
+            t = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
+            dimensions = (float(t['length']), float(t['width']), float(t['height']))
         
         # Get cuboid fitting parameters
         score_weights = (
@@ -716,9 +721,51 @@ def main():
         help="Enter class names separated by commas (e.g., 'car, person, bicycle')"
     )
     
+    # LLM Settings
+    with st.sidebar.expander("LLM Settings", expanded=False):
+        from components.core.llm_service import set_llm_temperature, get_llm_temperature
+        
+        # Initialize temperature in session state if not present
+        if 'llm_temperature' not in st.session_state:
+            st.session_state.llm_temperature = get_llm_temperature()
+        
+        # Temperature slider
+        st.session_state.llm_temperature = st.slider(
+            "LLM Temperature",
+            0.0, 2.0, st.session_state.llm_temperature, 0.1,
+            help="Temperature for LLM generation. Lower values (0.0-0.5) = more deterministic, Higher values (1.0-2.0) = more creative/random. Default: 0.3"
+        )
+        
+        # Update LLM service temperature
+        set_llm_temperature(st.session_state.llm_temperature)
+        
+        st.sidebar.caption("💡 LLM is used when semantic similarity doesn't find a match (similarity < 0.75)")
+
     # Parse class names
     if class_names_input:
         class_names = [name.strip() for name in class_names_input.split(',') if name.strip()]
+        
+        # Check if class names have changed
+        previous_class_names = st.session_state.get('previous_class_names', [])
+        if set(class_names) != set(previous_class_names):
+            # Pre-compute dimensions for new class names and store in session_state
+            from components.core.llm_service import query_llm_for_dimensions
+            
+            with st.sidebar.spinner("Pre-computing dimensions for class names..."):
+                dims_by_class = {}
+                for class_name in class_names:
+                    length, width, height = query_llm_for_dimensions(class_name)
+                    dims_by_class[class_name] = (length, width, height)
+                
+                st.session_state.params['dimensions_by_class'] = dims_by_class
+                # template_dims format for frustum_manager / evaluation
+                st.session_state.params['template_dims'] = {
+                    k: {'length': v[0], 'width': v[1], 'height': v[2]}
+                    for k, v in dims_by_class.items()
+                }
+            
+            st.session_state.previous_class_names = class_names.copy()
+        
         st.session_state.params['class_names'] = class_names
     else:
         st.session_state.params['class_names'] = []

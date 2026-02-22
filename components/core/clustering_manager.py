@@ -459,6 +459,15 @@ class ClusteringManager:
                 center_y = np.mean(cluster_points[:, 1])
                 ground_z = -(a * center_x + b * center_y + d) / c
 
+        # Build dimensions tuple for L-shape when template_dims is provided (caller passes from session_state)
+        dimensions_tuple = None
+        if template_dims is not None:
+            dimensions_tuple = (
+                float(template_dims.get('length', 4.0)),
+                float(template_dims.get('width', 1.8)),
+                float(template_dims.get('height', 1.6)),
+            )
+
         # Estimate pose
         if pose_estimation_method == 'pca':
             pose_result = estimate_pose_pca(cluster_points)
@@ -466,9 +475,14 @@ class ClusteringManager:
             if template_dims is None:
                 template_dims = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
         elif pose_estimation_method == 'l_shape':
-            pose_result = estimate_pose_l_shape(cluster_points, ground_plane_model=ground_plane_model)
-            # L-shape returns dimensions, so don't use templates
-            template_dims = None
+            pose_result = estimate_pose_l_shape(
+                cluster_points,
+                category=category,
+                ground_plane_model=ground_plane_model,
+                dimensions=dimensions_tuple,
+            )
+            # L-shape returns dimensions; pass template_dims to cuboid_from_pose for consistency
+            template_dims = template_dims  # keep for cuboid_from_pose if needed
         else:
             raise ValueError(f"Unknown pose estimation method: {pose_estimation_method}")
 
@@ -477,6 +491,7 @@ class ClusteringManager:
             pose_result,
             category=category,
             template_dims=template_dims,
+            dimensions=dimensions_tuple,
             ground_z=ground_z
         )
         pose_cuboid['label'] = cluster_label
