@@ -406,39 +406,14 @@ def main():
         st.markdown("---")
         st.subheader("📊 Point Cloud Visualization")
         
-        # Ground removal parameters
-        with st.expander("⚙️ Ground Removal Parameters", expanded=False):
-            distance_threshold = st.slider(
-                "Distance Threshold", 0.1, 1.0, 0.3, 0.01,
-                help="RANSAC distance threshold for ground plane removal"
-            )
-            ransac_n = st.slider(
-                "RANSAC N", 3, 10, 3, 1,
-                help="Number of points to sample for plane fitting"
-            )
-            num_iterations = st.slider(
-                "Iterations", 100, 1000, 1000, 100,
-                help="Number of RANSAC iterations"
-            )
-            filter_forward_only = st.checkbox(
-                "Forward-Facing Only", True,
-                help="Keep only forward-facing points (x > 0)"
-            )
-        
         if len(point_cloud) > 0:
             try:
                 # Apply ground removal
                 with st.spinner("Removing ground plane..."):
                     point_cloud_obj = PointCloud(point_cloud)
-                    point_cloud_obj.remove_ground_plane_ransac(
-                        distance_threshold=distance_threshold,
-                        ransac_n=ransac_n,
-                        num_iterations=num_iterations,
-                        filter_forward_only=filter_forward_only
-                    )
                     
                     # Get ground-removed points
-                    point_cloud_ground_removed = point_cloud_obj.point_cloud_plane_removed
+                    point_cloud_ground_removed = point_cloud_obj.original_point_cloud
                     
                     # Display statistics
                     col1, col2, col3 = st.columns(3)

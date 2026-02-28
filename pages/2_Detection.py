@@ -439,7 +439,8 @@ def step_5_detection_pose_estimation(
                 max_step_center=cuboid_params['max_step_center'],
                 d_theta=cuboid_params['d_theta'],
                 normals=None,
-                score_weights=score_weights
+                score_weights=score_weights,
+                ground_z=ground_z
             )
             
             # Convert fit_result to cuboid format
@@ -807,7 +808,44 @@ def main():
         with st.spinner("Running full pipeline..."):
             try:
                 results = run_full_pipeline(st.session_state.params)
-                
+                # Update session state so Export and Evaluation pages see the latest results
+                step_5_result = results['step_5']['result']
+                st.session_state.cuboids = step_5_result['detected_cuboids']
+                sample_meta_data = st.session_state.sample['sample_meta_data']
+                dataset_type = sample_meta_data.get('dataset_type', 'unknown').lower()
+                export_results = {
+                    'detected_cuboids': step_5_result['detected_cuboids'],
+                    'metadata': {
+                        'dataset_type': dataset_type,
+                        'sample_index': sample_meta_data.get('sample_index', 'unknown'),
+                        'image_path': sample_meta_data.get('image_path', 'unknown'),
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'n_detections': step_5_result['n_detected'],
+                        'pipeline_params': st.session_state.params.copy() if 'params' in st.session_state else {}
+                    }
+                }
+                if dataset_type == 'kitti':
+                    ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
+                    if ground_truth_boxes:
+                        ground_truth_cuboids = []
+                        for gt_box in ground_truth_boxes:
+                            gt_cuboid = {
+                                'category': gt_box.get('category', 'Unknown'),
+                                'corners': gt_box.get('corners'),
+                                'bbox_2d': gt_box.get('bbox_2d'),
+                                'min_x': gt_box.get('min_x'),
+                                'max_x': gt_box.get('max_x'),
+                                'min_y': gt_box.get('min_y'),
+                                'max_y': gt_box.get('max_y'),
+                                'min_z': gt_box.get('min_z'),
+                                'max_z': gt_box.get('max_z'),
+                                'format': 'kitti_gt'
+                            }
+                            ground_truth_cuboids.append(gt_cuboid)
+                        export_results['ground_truth_cuboids'] = ground_truth_cuboids
+                        export_results['metadata']['n_ground_truth'] = len(ground_truth_cuboids)
+                st.session_state.export_results = export_results
+
                 # Explore and display what the pipeline returns
                 st.success("✅ Pipeline completed successfully!")
                 
@@ -931,7 +969,13 @@ def main():
                         }
                         st.rerun()
                     except Exception as e:
-                        st.session_state.pipeline_state['step_1']['error'] = str(e)
+                        prev = st.session_state.pipeline_state['step_1']
+                        st.session_state.pipeline_state['step_1'] = {
+                            'completed': prev.get('completed', False),
+                            'result': prev.get('result'),
+                            'time': prev.get('time'),
+                            'error': str(e)
+                        }
                         st.error(f"Step 1 failed: {str(e)}")
         
         if step_1_state['completed']:
@@ -1005,7 +1049,13 @@ def main():
                         }
                         st.rerun()
                     except Exception as e:
-                        st.session_state.pipeline_state['step_2']['error'] = str(e)
+                        prev = st.session_state.pipeline_state['step_2']
+                        st.session_state.pipeline_state['step_2'] = {
+                            'completed': prev.get('completed', False),
+                            'result': prev.get('result'),
+                            'time': prev.get('time'),
+                            'error': str(e)
+                        }
                         st.error(f"Step 2 failed: {str(e)}")
         
         if step_2_state['completed']:
@@ -1115,7 +1165,13 @@ def main():
                         }
                         st.rerun()
                     except Exception as e:
-                        st.session_state.pipeline_state['step_3']['error'] = str(e)
+                        prev = st.session_state.pipeline_state['step_3']
+                        st.session_state.pipeline_state['step_3'] = {
+                            'completed': prev.get('completed', False),
+                            'result': prev.get('result'),
+                            'time': prev.get('time'),
+                            'error': str(e)
+                        }
                         st.error(f"Step 3 failed: {str(e)}")
         
         if step_3_state['completed'] and not step_3_state.get('error'):
@@ -1282,7 +1338,13 @@ def main():
                         }
                         st.rerun()
                     except Exception as e:
-                        st.session_state.pipeline_state['step_4']['error'] = str(e)
+                        prev = st.session_state.pipeline_state['step_4']
+                        st.session_state.pipeline_state['step_4'] = {
+                            'completed': prev.get('completed', False),
+                            'result': prev.get('result'),
+                            'time': prev.get('time'),
+                            'error': str(e)
+                        }
                         st.error(f"Step 4 failed: {str(e)}")
         
         if step_4_state['completed']:
@@ -1416,7 +1478,10 @@ def main():
     # Step 5: Detection & Pose Estimation
     with st.container():
         step_5_state = st.session_state.pipeline_state['step_5']
-        step_4_completed = st.session_state.pipeline_state['step_4']['completed']
+        step_4_completed = (
+            st.session_state.pipeline_state['step_4']['completed']
+            and not st.session_state.pipeline_state['step_4'].get('error')
+        )
         
         col1, col2 = st.columns([3, 1])
         
@@ -1495,7 +1560,13 @@ def main():
                         
                         st.rerun()
                     except Exception as e:
-                        st.session_state.pipeline_state['step_5']['error'] = str(e)
+                        prev = st.session_state.pipeline_state['step_5']
+                        st.session_state.pipeline_state['step_5'] = {
+                            'completed': prev.get('completed', False),
+                            'result': prev.get('result'),
+                            'time': prev.get('time'),
+                            'error': str(e)
+                        }
                         st.error(f"Step 5 failed: {str(e)}")
         
         if step_5_state['completed']:

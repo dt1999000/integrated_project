@@ -768,9 +768,16 @@ class PointCloud:
 
     def remove_ground_plane_ransac(self, distance_threshold: float = 0.3,
                                    ransac_n: int = 3, num_iterations: int = 1000,
-                                   remove_ego_car: bool = True, filter_forward_only: bool = True) -> np.ndarray:
+                                   remove_ego_car: bool = False, filter_forward_only: bool = False,
+                                   ground_z_range: Optional[Tuple[float, float]] = (-3.0, 3.0),
+                                   ground_z_percentile: float = 0.35,
+                                   ground_fit_max_xy_distance: Optional[float] = 15.0) -> np.ndarray:
         """
         Remove ground plane from point cloud using RANSAC.
+
+        RANSAC is run on a subset of points that are likely ground to avoid
+        fitting walls/ceiling in indoor scenes (where they can have more points).
+        The plane normal is required to be roughly horizontal and pointing up.
 
         Args:
             distance_threshold: Maximum distance from plane to be considered inlier
@@ -778,29 +785,65 @@ class PointCloud:
             num_iterations: Number of RANSAC iterations
             remove_ego_car: Whether to remove points near the ego vehicle
             filter_forward_only: Whether to keep only forward-facing points (x > 0)
+            ground_z_range: (z_min, z_max) - hard clip on z for candidates. Typical: (-3, 3) m.
+            ground_z_percentile: Use only points with z in [0, this percentile] of the cloud
+                                (e.g. 0.35 = lowest 35%%). Favors floor over walls in indoor.
+            ground_fit_max_xy_distance: If set, only points within this horizontal distance
+                                       from origin are used to fit the plane (avoids far walls).
 
         Returns:
             Filtered point cloud with ground plane removed
         """
+        pts = self.original_point_cloud
+        z_min_range, z_max_range = ground_z_range
+        # 1) Restrict to z band
+        ground_candidate_mask = (pts[:, 2] >= z_min_range) & (pts[:, 2] <= z_max_range)
+        # 2) Further restrict to lowest percentile of z (floor, not walls/ceiling)
+        z_lo_pct, z_hi_pct = np.percentile(pts[:, 2], [0, ground_z_percentile * 100])
+        low_z_mask = (pts[:, 2] >= z_lo_pct) & (pts[:, 2] <= z_hi_pct)
+        ground_candidate_mask = ground_candidate_mask & low_z_mask
+        # 3) Optional: only points near the sensor (avoids far walls in same z band)
+        if ground_fit_max_xy_distance is not None and ground_fit_max_xy_distance > 0:
+            xy_dist = np.linalg.norm(pts[:, :2], axis=1)
+            ground_candidate_mask = ground_candidate_mask & (xy_dist <= ground_fit_max_xy_distance)
+        if np.sum(ground_candidate_mask) < ransac_n * 10:
+            # Fallback: relax to lower half of z range, no xy cap
+            z_lo, z_hi = np.percentile(pts[:, 2], [0, 50])
+            ground_candidate_mask = (pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)
+        ground_candidates = pts[ground_candidate_mask]
 
-        # Create Open3D point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(self.original_point_cloud)
+        # Create Open3D point cloud from ground-candidate points only
+        pcd_fit = o3d.geometry.PointCloud()
+        pcd_fit.points = o3d.utility.Vector3dVector(ground_candidates)
 
-        # Segment plane using RANSAC
-        plane_model, inliers = pcd.segment_plane(
+        plane_model, inliers_fit = pcd_fit.segment_plane(
             distance_threshold=distance_threshold,
             ransac_n=ransac_n,
             num_iterations=num_iterations
         )
+        a, b, c, d = plane_model
+        n_norm = np.sqrt(a * a + b * b + c * c) + 1e-9
+        # Require roughly horizontal (|n_z| dominant)
+        if abs(c) / n_norm < 0.7:
+            z_median = float(np.median(ground_candidates[:, 2]))
+            plane_model = np.array([0.0, 0.0, 1.0, -z_median], dtype=np.float64)
+            a, b, c, d = plane_model
+            n_norm = 1.0
+        else:
+            # Prefer normal pointing up (floor = ground below); flip if ceiling
+            if c < 0:
+                plane_model = np.array([-a, -b, -c, -d], dtype=np.float64)
+                a, b, c, d = plane_model
 
-        # Extract non-ground points (outliers)
-        outlier_cloud = pcd.select_by_index(inliers, invert=True)
+        # Apply plane to full point cloud: compute distances and mark inliers
+        n_pts = len(pts)
+        dists = np.abs(pts[:, 0] * a + pts[:, 1] * b + pts[:, 2] * c + d) / n_norm
+        inliers_full = np.where(dists <= distance_threshold)[0]
+        outlier_mask = np.ones(n_pts, dtype=bool)
+        outlier_mask[inliers_full] = False
+        filtered_points = pts[outlier_mask]
 
-        # Convert back to numpy array
-        filtered_points = np.asarray(outlier_cloud.points)
-
-        n_ground_points = len(inliers)
+        n_ground_points = len(inliers_full)
         n_remaining_points = len(filtered_points)
 
         if remove_ego_car:
@@ -816,9 +859,10 @@ class PointCloud:
         self.ground_removed = True
         self.point_cloud_plane_removed = filtered_points
         self.ground_plane_model = plane_model
-        self.ground_inliers = self.original_point_cloud[inliers]
+        self.ground_inliers = self.original_point_cloud[inliers_full]
 
-    def get_ground_z(self, x: float = 0.0, y: float = 0.0) -> Optional[float]:
+    def get_ground_z(self, x: float = 0.0, y: float = 0.0,
+                     z_range: Optional[Tuple[float, float]] = (-10.0, 10.0)) -> Optional[float]:
         """
         Compute the ground z value at a given (x, y) location using the ground plane model.
 
@@ -828,9 +872,11 @@ class PointCloud:
         Args:
             x: X coordinate (forward direction)
             y: Y coordinate (lateral direction)
+            z_range: (z_min, z_max) - if computed z is outside this range, return None.
+                      Prevents invalid values (e.g. -80m) from bad plane fits.
 
         Returns:
-            Ground z value at (x, y), or None if ground plane not computed
+            Ground z value at (x, y), or None if ground plane not computed or z out of range
         """
         if not self.ground_removed or self.ground_plane_model is None:
             return None
@@ -841,7 +887,12 @@ class PointCloud:
             return None
 
         z = -(a * x + b * y + d) / c
-        return float(z)
+        z = float(z)
+        if z_range is not None:
+            z_lo, z_hi = z_range
+            if z < z_lo or z > z_hi:
+                return None
+        return z
 
     def add_projected_points(self, projected_points: np.ndarray):
         """

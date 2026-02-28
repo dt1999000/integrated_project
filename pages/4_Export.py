@@ -1,6 +1,6 @@
 """
 Export Page
-Export detection results to JSON format.
+Export detection results and dataset annotations (CVAT format).
 """
 import streamlit as st
 import json
@@ -8,89 +8,9 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict
 
-
-def export_to_kitti_format(cuboids: List[Dict], output_path: str):
-    """
-    Export cuboids to KITTI format.
-    
-    KITTI format: type truncated occluded alpha bbox2d(4) dim(3) loc(3) rotation_y
-    """
-    lines = []
-    for cuboid in cuboids:
-        category = cuboid.get('category', 'Unknown')
-        center = cuboid['center']
-        yaw = cuboid['yaw']
-        length = cuboid['length']
-        width = cuboid['width']
-        height = cuboid['height']
-        
-        # Convert to KITTI format
-        # Note: This is a simplified export - full KITTI format requires more fields
-        line = f"{category} 0.00 0 0.00 "
-        
-        # 2D bbox (if available)
-        if 'bbox_2d' in cuboid:
-            bbox = cuboid['bbox_2d']
-            line += f"{bbox['left']:.2f} {bbox['top']:.2f} {bbox['right']:.2f} {bbox['bottom']:.2f} "
-        else:
-            line += "0.00 0.00 0.00 0.00 "
-        
-        # Dimensions (height, width, length in KITTI)
-        line += f"{height:.2f} {width:.2f} {length:.2f} "
-        
-        # Location (x, y, z in camera coordinates - simplified)
-        line += f"{center[0]:.2f} {center[1]:.2f} {center[2]:.2f} "
-        
-        # Rotation y
-        line += f"{yaw:.2f}"
-        
-        lines.append(line)
-    
-    with open(output_path, 'w') as f:
-        f.write('\n'.join(lines))
-
-
-def export_to_json_format(cuboids: List[Dict], output_path: str, metadata: Dict = None):
-    """
-    Export cuboids to custom JSON format with metadata.
-    """
-    export_data = {
-        'metadata': metadata or {},
-        'timestamp': datetime.now().isoformat(),
-        'n_detections': len(cuboids),
-        'detections': []
-    }
-    
-    for cuboid in cuboids:
-        detection = {
-            'category': cuboid.get('category', 'Unknown'),
-            'center': cuboid['center'].tolist() if isinstance(cuboid['center'], np.ndarray) else cuboid['center'],
-            'yaw': float(cuboid['yaw']),
-            'dimensions': {
-                'length': float(cuboid['length']),
-                'width': float(cuboid['width']),
-                'height': float(cuboid['height'])
-            },
-            'corners': cuboid['corners'].tolist() if isinstance(cuboid['corners'], np.ndarray) else cuboid['corners'],
-            'bounds': {
-                'min_x': float(cuboid['min_x']),
-                'max_x': float(cuboid['max_x']),
-                'min_y': float(cuboid['min_y']),
-                'max_y': float(cuboid['max_y']),
-                'min_z': float(cuboid['min_z']),
-                'max_z': float(cuboid['max_z'])
-            },
-            'score': float(cuboid.get('score', 0.0)),
-            'method': cuboid.get('method', 'unknown'),
-            'n_points': int(cuboid.get('n_points', 0))
-        }
-        
-        export_data['detections'].append(detection)
-    
-    with open(output_path, 'w') as f:
-        json.dump(export_data, f, indent=2)
+from components.dataset_loaders.dataset_loader import LinkedDataHandler
 
 
 def main():
@@ -153,6 +73,15 @@ def main():
     # Export options
     st.subheader("📤 Export Options")
     
+    # Output directory (similar to dataset path in Dataset Extraction)
+    st.markdown("**Output directory**")
+    output_dir = st.text_input(
+        "Export output directory",
+        value="",
+        key="export_output_dir",
+        help="Optional. Directory to save the annotation file directly (e.g. ./exports or C:/data/exports). Leave empty to use download only."
+    )
+    
     export_format = st.selectbox(
         "Export Format",
         options=['JSON (Custom)', 'KITTI Format', 'COCO Format'],
@@ -164,6 +93,8 @@ def main():
     
     # Export button
     if st.button("💾 Export Results", type="primary"):
+        sample_id = metadata.get('sample_index', 'unknown')
+        
         if export_format == 'JSON (Custom)':
             # Create JSON file
             # Include ground truth cuboids if available
@@ -219,11 +150,24 @@ def main():
                 export_data['n_ground_truth'] = len(export_data['ground_truth_cuboids'])
             
             json_str = json.dumps(export_data, indent=2)
+            file_name = f"detections_{sample_id}.json"
+            
+            # Write to output directory if specified
+            if output_dir and output_dir.strip():
+                out_path = Path(output_dir.strip())
+                try:
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    out_file = out_path / file_name
+                    with open(out_file, 'w') as f:
+                        f.write(json_str)
+                    st.success(f"✅ Saved to **{out_file}**")
+                except Exception as e:
+                    st.error(f"Could not write to output directory: {e}")
             
             st.download_button(
                 label="📥 Download JSON",
                 data=json_str,
-                file_name=f"detections_{metadata.get('sample_index', 'unknown')}.json",
+                file_name=file_name,
                 mime="application/json"
             )
         
@@ -243,15 +187,66 @@ def main():
                 lines.append(line)
             
             kitti_str = '\n'.join(lines)
+            file_name = f"detections_{sample_id}.txt"
+            
+            # Write to output directory if specified
+            if output_dir and output_dir.strip():
+                out_path = Path(output_dir.strip())
+                try:
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    out_file = out_path / file_name
+                    with open(out_file, 'w') as f:
+                        f.write(kitti_str)
+                    st.success(f"✅ Saved to **{out_file}**")
+                except Exception as e:
+                    st.error(f"Could not write to output directory: {e}")
+            
             st.download_button(
                 label="📥 Download KITTI Format",
                 data=kitti_str,
-                file_name=f"detections_{metadata.get('sample_index', 'unknown')}.txt",
+                file_name=file_name,
                 mime="text/plain"
             )
         
         elif export_format == 'COCO Format':
             st.info("COCO format export coming soon...")
+
+    # Export dataset annotations (CVAT) using LinkedDataHandler
+    st.subheader("📤 Export dataset annotations (CVAT)")
+    st.markdown("Export all subsets to CVAT-style JSON files (uses `LinkedDataHandler.exportAnnotations`). Requires a dataset root that contains `dataset.json` (sim/custom format).")
+    cvat_root = st.text_input(
+        "Dataset root path (CVAT export)",
+        value=st.session_state.get("dataset_path", ""),
+        key="export_cvat_dataset_path",
+        help="Path to dataset root containing dataset.json (e.g. folder with subset folders and dataset.json)"
+    )
+    key_frame_steps = st.number_input(
+        "Keyframe every N frames",
+        min_value=1,
+        value=10,
+        key="export_cvat_keyframe_steps",
+        help="keyFrameSteps passed to exportAnnotations"
+    )
+    if st.button("💾 Export annotations to CVAT JSON", key="export_cvat_btn"):
+        if not cvat_root or not cvat_root.strip():
+            st.warning("Please enter a dataset root path.")
+        else:
+            root = Path(cvat_root.strip())
+            if not root.exists():
+                st.error(f"Path does not exist: {root}")
+            elif not (root / "dataset.json").exists():
+                st.error(f"dataset.json not found in {root}. Use a dataset root that has dataset.json (sim/custom format).")
+            else:
+                try:
+                    handler = LinkedDataHandler(root_dir=str(root), load_dataset=True)
+                    handler.exportAnnotations(keyFrameSteps=int(key_frame_steps))
+                    subsets = handler.list_subsets()
+                    files = [f"{s}_cvat.json" for s in subsets]
+                    st.success(f"✅ Exported {len(files)} file(s) to {root}: {', '.join(files)}")
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 
 if __name__ == "__main__":

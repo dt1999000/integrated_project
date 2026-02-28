@@ -364,16 +364,21 @@ def fit_cuboid_to_points(points: np.ndarray,
                          max_step_center: int = 10,
                          d_theta: float = 0.05,
                          normals: Optional[np.ndarray] = None,
-                         score_weights: Tuple[float, float, float] = (1.0, 0.5, 2.0)) -> Dict:
+                         score_weights: Tuple[float, float, float] = (1.0, 0.5, 2.0),
+                         ground_z: Optional[float] = None) -> Dict:
     """
     Cuboid fitting using center line-search and yaw search.
 
     Search is performed along a ray starting at the mean point and going in the
     direction of the mean (towards / away from the origin), and over yaw
-    angles. The best hypothesis minimizes a combination of:
+    angles.     If ground_z is provided, fitting uses bird's eye view (BEV): points are
+    projected to the xy-plane and the cuboid bottom is fixed at ground_z
+    (center z = ground_z + height/2). Only the two rectangle edges closest to
+    the LiDAR origin are used for the distance term. The best hypothesis
+    minimizes:
 
-    - Squared distance from points to the three visible sides of the cuboid
-      (top and the two sides whose centers are closest to the origin).
+    - Squared distance from 2D points to the two closest edges of the
+      rectangle (BEV), plus outlier fraction.
     - Geometric consistency: local surface normals should align with the
       vector from the cuboid center to each point.
     - Outlier penalty: fraction of points that fall outside the cuboid.
@@ -387,6 +392,7 @@ def fit_cuboid_to_points(points: np.ndarray,
         normals: Optional (N, 3) array of surface normals for geometric consistency
         score_weights: Tuple (w_dist, w_geo, w_out) - weights for distance, 
                       geometric consistency, and outlier penalty terms
+        ground_z: If provided, cuboid bottom is fixed at this z (center z = ground_z + height/2).
     
     Returns:
         Dictionary with 'center', 'yaw', 'length', 'width', 'height', 'score', 'method'
@@ -402,18 +408,68 @@ def fit_cuboid_to_points(points: np.ndarray,
 
     length, width, height = map(float, dimensions)
     w_dist, w_geo, w_out = map(float, score_weights)
+    half_h = height / 2.0
 
     # Mean of the points
     mu = np.mean(points, axis=0)
 
-    # Direction of the line-search ray: from origin towards the mean
-    ray_dir = mu.copy()
-    norm_ray = np.linalg.norm(ray_dir)
-    if norm_ray > 1e-6:
-        ray_dir /= norm_ray
+    use_bev = ground_z is not None
+    if use_bev:
+        # Bird's eye view: work in 2D (xy only); center z fixed at ground_z + half_h
+        points_xy = points[:, :2]
+        mu_xy = np.mean(points_xy, axis=0)
+        ray_dir_xy = mu_xy.copy()
+        norm_xy = np.linalg.norm(ray_dir_xy)
+        if norm_xy > 1e-6:
+            ray_dir_xy /= norm_xy
+        else:
+            ray_dir_xy = np.array([1.0, 0.0], dtype=float)
     else:
-        # Degenerate case: mean at origin, just use z-up
-        ray_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+        # Full 3D: ray from origin towards mean
+        ray_dir = mu.copy()
+        norm_ray = np.linalg.norm(ray_dir)
+        if norm_ray > 1e-6:
+            ray_dir /= norm_ray
+        else:
+            ray_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    def _score_bev(center_xy: np.ndarray, yaw: float) -> float:
+        """Score for bird's eye view: 2D rectangle, two edges closest to LiDAR origin."""
+        half_l = length / 2.0
+        half_w = width / 2.0
+        cos_y = np.cos(yaw)
+        sin_y = np.sin(yaw)
+        u_xy = np.array([cos_y, sin_y])
+        v_xy = np.array([-sin_y, cos_y])
+        rel_xy = points_xy - center_xy[None, :]
+        x_c = rel_xy @ u_xy
+        y_c = rel_xy @ v_xy
+        outside = (np.abs(x_c) > half_l) | (np.abs(y_c) > half_w)
+        outlier_frac = float(np.mean(outside))
+        # Face centers (2D) for the four edges
+        center_front = center_xy + u_xy * half_l
+        center_back = center_xy - u_xy * half_l
+        center_right = center_xy + v_xy * half_w
+        center_left = center_xy - v_xy * half_w
+        lateral_centers = np.stack([center_front, center_back, center_right, center_left], axis=0)
+        dists_to_origin = np.linalg.norm(lateral_centers, axis=1)
+        two_closest_idx = np.argsort(dists_to_origin)[:2]
+        sq_dists = []
+        for idx in two_closest_idx:
+            if idx == 0:
+                n_vec, p0 = u_xy, center_front
+            elif idx == 1:
+                n_vec, p0 = -u_xy, center_back
+            elif idx == 2:
+                n_vec, p0 = v_xy, center_right
+            else:
+                n_vec, p0 = -v_xy, center_left
+            diff = points_xy - p0[None, :]
+            d_plane = np.abs(diff @ n_vec)
+            sq_dists.append(d_plane ** 2)
+        sq_dists = np.stack(sq_dists, axis=1)
+        mean_min_sq_dist = float(np.mean(np.min(sq_dists, axis=1)))
+        return w_dist * mean_min_sq_dist + w_out * outlier_frac
 
     def _score_for_hypothesis(center: np.ndarray, yaw: float, 
                               dims: Tuple[float, float, float],
@@ -422,7 +478,7 @@ def fit_cuboid_to_points(points: np.ndarray,
         l, w_dim, h = dims
         half_l = l / 2.0
         half_w = w_dim / 2.0
-        half_h = h / 2.0
+        half_h_inner = h / 2.0
         
         # Rotation matrix around Z
         cos_y = np.cos(yaw)
@@ -450,36 +506,26 @@ def fit_cuboid_to_points(points: np.ndarray,
         outside = (
             (np.abs(x_c) > half_l) |
             (np.abs(y_c) > half_w) |
-            (np.abs(z_c) > half_h)
+            (np.abs(z_c) > half_h_inner)
         )
         outlier_frac = float(np.mean(outside))
 
-        # Plane centers for all 6 faces in world frame
+        # Plane centers for the four lateral faces in world frame (no top/bottom for scoring)
         center_front = center + u * half_l
         center_back = center - u * half_l
         center_right = center + v * half_w
         center_left = center - v * half_w
-        center_top = center + w * half_h
-        center_bottom = center - w * half_h
         
-        # Distances of face centers to origin
-        face_centers = np.stack([
+        # Distances of lateral face centers to origin (only lateral faces used)
+        lateral_centers = np.stack([
             center_front, center_back,
             center_right, center_left,
-            center_top, center_bottom,
         ], axis=0)
-        dists_to_origin = np.linalg.norm(face_centers, axis=1)
+        dists_to_origin = np.linalg.norm(lateral_centers, axis=1)
+        # Two lateral faces whose centers are closest to origin
+        two_closest_idx = np.argsort(dists_to_origin)[:2]
 
-        # We want top plus the two lateral faces whose centers are closest to origin.
-        # Index mapping:
-        # 0: front (+u), 1: back (-u), 2: right (+v), 3: left (-v),
-        # 4: top (+w), 5: bottom (-w)
-        top_idx = 4
-        lateral_indices = np.array([0, 1, 2, 3])
-        lateral_dists = dists_to_origin[lateral_indices]
-        two_closest_idx = lateral_indices[np.argsort(lateral_dists)[:2]]
-
-        face_normals = [(np.array([0.0, 0.0, 1.0]), center_top)]  # top
+        face_normals = []
         for idx in two_closest_idx:
             if idx == 0:
                 face_normals.append((u, center_front))
@@ -490,13 +536,13 @@ def fit_cuboid_to_points(points: np.ndarray,
             elif idx == 3:
                 face_normals.append((-v, center_left))
 
-        # Distance to each visible face: take minimum squared distance per point
+        # Distance to visible lateral faces only (no top, no z-direction)
         sq_dists = []
         for n_vec, p0 in face_normals:
             diff = points - p0[None, :]
             d_plane = np.abs(diff @ n_vec)
             sq_dists.append(d_plane ** 2)
-        sq_dists = np.stack(sq_dists, axis=1)  # (N, 3)
+        sq_dists = np.stack(sq_dists, axis=1)  # (N, 2)
         min_sq_dist = np.min(sq_dists, axis=1)
         mean_min_sq_dist = float(np.mean(min_sq_dist))
 
@@ -521,15 +567,27 @@ def fit_cuboid_to_points(points: np.ndarray,
     best_center = None
     best_yaw = 0.0
 
-    # Center and yaw search
-    for n in range(max_step_center + 1):
-        center = mu + step_center_search * n * ray_dir
-        for yaw in np.arange(0.0, np.pi, d_theta):
-            score = _score_for_hypothesis(center, yaw, (length, width, height), (w_dist, w_geo, w_out))
-            if score < best_score:
-                best_score = score
-                best_center = center.copy()
-                best_yaw = float(yaw)
+    if use_bev:
+        # Center and yaw search in 2D; z fixed at ground_z + half_h
+        for n in range(max_step_center + 1):
+            center_xy = mu_xy + step_center_search * n * ray_dir_xy
+            center = np.array([center_xy[0], center_xy[1], ground_z + half_h], dtype=float)
+            for yaw in np.arange(0.0, np.pi, d_theta):
+                score = _score_bev(center_xy, yaw)
+                if score < best_score:
+                    best_score = score
+                    best_center = center.copy()
+                    best_yaw = float(yaw)
+    else:
+        # Center and yaw search in 3D
+        for n in range(max_step_center + 1):
+            center = mu + step_center_search * n * ray_dir
+            for yaw in np.arange(0.0, np.pi, d_theta):
+                score = _score_for_hypothesis(center, yaw, (length, width, height), (w_dist, w_geo, w_out))
+                if score < best_score:
+                    best_score = score
+                    best_center = center.copy()
+                    best_yaw = float(yaw)
 
     return {
         'center': best_center,
