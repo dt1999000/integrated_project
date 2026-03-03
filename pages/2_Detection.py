@@ -2,14 +2,17 @@
 3D Object Detection Pipeline
 Unified detection pipeline with step-by-step execution and full pipeline mode.
 """
-import streamlit as st
-import numpy as np
-import cv2
-import pandas as pd
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
+import os
 import time
 from typing import List, Dict, Optional, Tuple
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import open3d as o3d
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
 from components.core.pointcloud_projection import PointCloud, Projection
 from components.core.depth_estimation import compute_sparse_depth_map
@@ -17,6 +20,7 @@ from components.core.sam_integration import SAMIntegration, assign_points_to_mas
 from components.core.pose_estimation import fit_cuboid_to_points
 from components.core.clustering_manager import ClusteringManager, select_best_cluster_points
 from components.core.utils import get_bbox_from_mask, calculate_iou
+from components.dataset_loaders.utils import load_dataset_sample
 from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
     add_cuboids_to_figure,
@@ -32,6 +36,53 @@ from components.utils.visualization_helper import (
 # Note: _get_bbox_from_mask and _calculate_iou are now imported from components.core.utils
 
 
+def save_sample_to_hard_drive_after_processing(
+    image: Optional[np.ndarray],
+    point_cloud: Optional[np.ndarray],
+    sample_meta_data: Dict,
+) -> None:
+    """
+    Save processed sample (image + LiDAR) to disk under the output_root_dir specified
+    on the Dataset Extraction page. Creates 'images' and 'lidar' subfolders and writes:
+    - image as PNG
+    - point cloud as PCD (XYZ)
+    """
+    output_root = st.session_state.get("output_root_dir", "")
+    if not output_root:
+        return
+
+    root_path = Path(output_root).expanduser()
+    images_dir = root_path / "images"
+    lidar_dir = root_path / "lidar"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    lidar_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset_type = (sample_meta_data or {}).get("dataset_type", "unknown")
+    sample_index = (sample_meta_data or {}).get("sample_index", "unknown")
+
+    base_name = f"{dataset_type}_{sample_index}"
+
+    # Save image
+    if image is not None:
+        img_path = images_dir / f"{base_name}.png"
+        try:
+            # Ensure RGB → BGR for OpenCV writing
+            img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(img_path), img_bgr)
+        except Exception:
+            pass
+
+    # Save point cloud as PCD (XYZ)
+    if point_cloud is not None and len(point_cloud) > 0:
+        pcd_path = lidar_dir / f"{base_name}.pcd"
+        try:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(point_cloud[:, :3])
+            o3d.io.write_point_cloud(str(pcd_path), pcd, write_ascii=True)
+        except Exception:
+            pass
+
+
 # ============================================================================
 # Pipeline Step Functions
 # ============================================================================
@@ -41,7 +92,7 @@ def step_1_ground_plane_removal(
     distance_threshold: float = 0.3,
     ransac_n: int = 3,
     num_iterations: int = 1000,
-    filter_forward_only: bool = True
+    filter_forward_only: bool = False
 ) -> Dict:
     """
     Step 1: Remove ground plane from point cloud using RANSAC.
@@ -597,6 +648,84 @@ def run_full_pipeline(params: Dict) -> Dict:
 
 
 # ============================================================================
+# Batch processing: run pipeline for one sample and return export_results
+# ============================================================================
+
+def _run_pipeline_for_batch_sample(
+    dataset_path: str,
+    dataset_type: str,
+    sample_index,
+) -> Optional[Dict]:
+    """Load one sample, run full pipeline, return export_results for Export page."""
+    meta, image, point_cloud = load_dataset_sample(
+        dataset_path=dataset_path,
+        sample_index=sample_index,
+        dataset_type=dataset_type,
+        filter_forward_only=False,
+    )
+    if meta is None or image is None or point_cloud is None:
+        return None
+    st.session_state.sample = {
+        "sample_meta_data": meta,
+        "image": image,
+        "point_cloud": point_cloud,
+    }
+    st.session_state.pipeline_state = {
+        "step_1": {"completed": False, "result": None, "time": None, "error": None},
+        "step_2": {"completed": False, "result": None, "time": None, "error": None},
+        "step_3": {"completed": False, "result": None, "time": None, "error": None},
+        "step_4": {"completed": False, "result": None, "time": None, "error": None},
+        "step_5": {"completed": False, "result": None, "time": None, "error": None},
+    }
+    try:
+        results = run_full_pipeline(st.session_state.params)
+    except Exception:
+        return None
+    step_5_result = results["step_5"]["result"]
+    dataset_type_lower = meta.get("dataset_type", "unknown").lower()
+    export_results = {
+        "detected_cuboids": step_5_result["detected_cuboids"],
+        "metadata": {
+            "dataset_type": dataset_type_lower,
+            "sample_index": meta.get("sample_index", "unknown"),
+            "image_path": meta.get("image_path", "unknown"),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "n_detections": step_5_result["n_detected"],
+            "pipeline_params": st.session_state.params.copy() if "params" in st.session_state else {},
+        },
+    }
+    if dataset_type_lower == "kitti":
+        ground_truth_boxes = meta.get("ground_truth_boxes", [])
+        if ground_truth_boxes:
+            ground_truth_cuboids = []
+            for gt_box in ground_truth_boxes:
+                gt_cuboid = {
+                    "category": gt_box.get("category", "Unknown"),
+                    "corners": gt_box.get("corners"),
+                    "bbox_2d": gt_box.get("bbox_2d"),
+                    "min_x": gt_box.get("min_x"),
+                    "max_x": gt_box.get("max_x"),
+                    "min_y": gt_box.get("min_y"),
+                    "max_y": gt_box.get("max_y"),
+                    "min_z": gt_box.get("min_z"),
+                    "max_z": gt_box.get("max_z"),
+                    "format": "kitti_gt",
+                }
+                ground_truth_cuboids.append(gt_cuboid)
+            export_results["ground_truth_cuboids"] = ground_truth_cuboids
+            export_results["metadata"]["n_ground_truth"] = len(ground_truth_cuboids)
+
+    # Save each processed batch sample (image + LiDAR) to disk
+    save_sample_to_hard_drive_after_processing(
+        image=image,
+        point_cloud=point_cloud,
+        sample_meta_data=meta,
+    )
+
+    return export_results
+
+
+# ============================================================================
 # Main Page Function
 # ============================================================================
 
@@ -631,7 +760,7 @@ def main():
                 'distance_threshold': 0.3,
                 'ransac_n': 3,
                 'num_iterations': 1000,
-                'filter_forward_only': True
+                'filter_forward_only': False
             },
             'clustering': {
                 'dbscan_eps': 0.5,
@@ -650,6 +779,35 @@ def main():
             'yolo_model_path': None,
             'yolo_conf_threshold': 0.25
         }
+    
+    # Batch mode: process entire batch only (no per-sample image view)
+    batch_samples = st.session_state.get("batch_samples", [])
+    process_all_samples = st.session_state.get("process_all_samples", False)
+    if batch_samples and process_all_samples:
+        st.subheader("📚 Batch Processing")
+        total = len(batch_samples)
+        st.info(f"Batch loaded: **{total}** samples. Process the entire batch to run detection on all samples.")
+        if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
+            results_list = []
+            progress = st.progress(0.0)
+            for i, sample_desc in enumerate(batch_samples):
+                progress.progress((i + 1) / total)
+                export_res = _run_pipeline_for_batch_sample(
+                    dataset_path=sample_desc["dataset_path"],
+                    dataset_type=sample_desc.get("dataset_type", "kitti"),
+                    sample_index=sample_desc["sample_index"],
+                )
+                if export_res is not None:
+                    results_list.append(export_res)
+            st.session_state.batch_export_results = {"samples": results_list}
+            st.session_state.process_all_samples = False
+            st.success(f"✅ Processed **{len(results_list)}** / {total} samples. Go to **4_Export** to save (e.g. XML).")
+            st.rerun()
+        if st.session_state.get("batch_export_results"):
+            br = st.session_state.batch_export_results
+            n = len(br.get("samples", []))
+            st.success(f"Last batch: **{n}** samples ready for export on **4_Export**.")
+        return
     
     # Check if sample is loaded
     if 'sample' not in st.session_state or st.session_state.sample is None:
@@ -845,6 +1003,15 @@ def main():
                         export_results['ground_truth_cuboids'] = ground_truth_cuboids
                         export_results['metadata']['n_ground_truth'] = len(ground_truth_cuboids)
                 st.session_state.export_results = export_results
+
+                # Save processed sample (single-sample mode) to disk
+                current_image = st.session_state.sample.get("image")
+                current_pc = st.session_state.sample.get("point_cloud")
+                save_sample_to_hard_drive_after_processing(
+                    image=current_image,
+                    point_cloud=current_pc,
+                    sample_meta_data=sample_meta_data,
+                )
 
                 # Explore and display what the pipeline returns
                 st.success("✅ Pipeline completed successfully!")

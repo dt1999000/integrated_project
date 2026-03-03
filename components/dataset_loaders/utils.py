@@ -38,6 +38,15 @@ def detect_dataset_type(dataset_path: str) -> Optional[str]:
     if not dataset_path.exists():
         return None
     
+    # If a file is passed (e.g. rosbag file), don't try to walk it as a directory.
+    # This avoids NotADirectoryError when the user points directly to a bag file.
+    if dataset_path.is_file():
+        # Optional: detect rosbag-like extensions for future use
+        suffixes = "".join(dataset_path.suffixes).lower()
+        if any(ext in suffixes for ext in [".bag", ".db3", ".mcap", ".mcap.zstd"]):
+            return "rosbag"
+        return None
+    
     # Check for LinkedDataHandler/sim format (dataset.json in root)
     dataset_json = dataset_path / "dataset.json"
     if dataset_json.exists():
@@ -56,7 +65,7 @@ def detect_dataset_type(dataset_path: str) -> Optional[str]:
         if has_image_2 and has_velodyne and has_calib:
             return "kitti"
     
-    # Check for nuScenes structure
+    # Check for nuScenes structure (only if dataset_path is a directory)
     has_samples = (dataset_path / "samples").exists()
     has_sweeps = (dataset_path / "sweeps").exists()
     has_v1 = any(d.name.startswith("v1.0-") for d in dataset_path.iterdir() if d.is_dir())

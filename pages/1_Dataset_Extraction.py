@@ -7,38 +7,16 @@ import numpy as np
 import cv2
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
-from PIL import Image
-import imagehash
 
 from components.dataset_loaders.utils import detect_dataset_type, load_dataset_sample
 from components.dataset_loaders.dataset_loader import LinkedDataHandler
 from components.utils.visualization_helper import create_3d_scatter_plot
 from components.core.pointcloud_projection import PointCloud
-
-# Import image quality functions from 1_Extraction.py
-def variance_of_laplacian(img_gray):
-    """Calculate blur metric using Laplacian variance."""
-    lap = cv2.Laplacian(img_gray, cv2.CV_64F)
-    return float(lap.var())
-
-def contrast_score(img_gray):
-    """Calculate normalized RMS contrast."""
-    return float(np.std(img_gray)) / 255.0
-
-def brightness(img_gray):
-    """Calculate average brightness."""
-    return float(img_gray.mean())
-
-def hamming(a, b):
-    """Calculate Hamming distance between two perceptual hashes."""
-    return int(a - b)
-
-def calculate_motion_score(frame1_gray, frame2_gray):
-    """Calculate motion score between consecutive frames."""
-    if frame1_gray is None or frame2_gray is None:
-        return 0
-    diff = cv2.absdiff(frame1_gray, frame2_gray)
-    return np.mean(diff)
+from components.core.filter import (
+    filter_kitti_images,
+    filter_nuscenes_images,
+    filter_sim_images,
+)
 
 
 def main():
@@ -68,12 +46,25 @@ def main():
         value="",
         help="Enter the root directory path of your dataset"
     )
+
+    # Output directory for saving processed samples (images + LiDAR)
+    if "output_root_dir" not in st.session_state:
+        st.session_state.output_root_dir = ""
+    st.subheader("Output Directory")
+    st.session_state.output_root_dir = st.text_input(
+        "Output folder for saved samples",
+        value=st.session_state.output_root_dir,
+        help="Root folder where processed samples will be saved. "
+             "Subfolders 'images' and 'lidar' will be created automatically."
+    )
     
     # Auto-detect dataset type
     dataset_type = None
     if dataset_path:
         dataset_path_obj = Path(dataset_path)
         if dataset_path_obj.exists():
+            # Persist dataset root so other pages (e.g. 4_Export) can reuse it
+            st.session_state.dataset_path = dataset_path
             dataset_type = detect_dataset_type(dataset_path)
             if dataset_type:
                 st.success(f"✅ Detected dataset type: **{dataset_type.upper()}**")
@@ -133,12 +124,183 @@ def main():
                                     st.rerun()
                                 else:
                                     st.error("❌ Failed to load sample")
+
+                        # KITTI: random batch filtering + send to detection
+                        if 'kitti_filter_params' not in st.session_state:
+                            st.session_state.kitti_filter_params = {
+                                'blur_gate': 120,
+                                'hash_thresh': 6,
+                                'motion_thresh': 5,
+                                'min_contrast': 0.10,
+                                'min_bright': 30,
+                                'max_bright': 235,
+                                'enable_blur': True,
+                                'enable_dedup': True,
+                                'enable_motion': False,
+                                'enable_brightness': True,
+                                'enable_contrast': True
+                            }
+                        if 'kitti_filtered_batch' not in st.session_state:
+                            st.session_state.kitti_filtered_batch = None
+
+                        st.markdown("---")
+                        st.subheader("🖼️ Image Filtering (KITTI Dataset)")
+                        st.markdown("""
+                        Sample a random batch of KITTI images, filter them by quality, and send the filtered batch to the detection page.
+                        """)
+
+                        # Filter configuration
+                        with st.expander("⚙️ Filter Settings (KITTI)", expanded=False):
+                            col1, col2 = st.columns(2)
+
+                            with col1:
+                                st.session_state.kitti_filter_params['enable_blur'] = st.checkbox(
+                                    "Enable Blur Filter",
+                                    value=st.session_state.kitti_filter_params['enable_blur'],
+                                    help="Remove blurry images using Laplacian variance",
+                                    key="kitti_enable_blur"
+                                )
+                                if st.session_state.kitti_filter_params['enable_blur']:
+                                    st.session_state.kitti_filter_params['blur_gate'] = st.slider(
+                                        "Blur Gate (Laplacian Variance)",
+                                        0, 500,
+                                        st.session_state.kitti_filter_params['blur_gate'],
+                                        help="Minimum Laplacian variance (higher = sharper)",
+                                        key="kitti_blur_gate"
+                                    )
+
+                                st.session_state.kitti_filter_params['enable_dedup'] = st.checkbox(
+                                    "Enable Deduplication",
+                                    value=st.session_state.kitti_filter_params['enable_dedup'],
+                                    help="Remove visually similar images",
+                                    key="kitti_enable_dedup"
+                                )
+                                if st.session_state.kitti_filter_params['enable_dedup']:
+                                    st.session_state.kitti_filter_params['hash_thresh'] = st.slider(
+                                        "Deduplication Threshold (Hamming)",
+                                        0, 16,
+                                        st.session_state.kitti_filter_params['hash_thresh'],
+                                        help="Maximum Hamming distance for duplicates",
+                                        key="kitti_hash_thresh"
+                                    )
+
+                                st.session_state.kitti_filter_params['enable_motion'] = st.checkbox(
+                                    "Enable Motion Filter",
+                                    value=st.session_state.kitti_filter_params['enable_motion'],
+                                    help="Skip static frames (sequential indices)",
+                                    key="kitti_enable_motion"
+                                )
+                                if st.session_state.kitti_filter_params['enable_motion']:
+                                    st.session_state.kitti_filter_params['motion_thresh'] = st.slider(
+                                        "Motion Threshold",
+                                        0, 20,
+                                        st.session_state.kitti_filter_params['motion_thresh'],
+                                        help="Minimum motion score between frames",
+                                        key="kitti_motion_thresh"
+                                    )
+
+                            with col2:
+                                st.session_state.kitti_filter_params['enable_brightness'] = st.checkbox(
+                                    "Enable Brightness Filter",
+                                    value=st.session_state.kitti_filter_params['enable_brightness'],
+                                    help="Remove over/under-exposed images",
+                                    key="kitti_enable_brightness"
+                                )
+                                if st.session_state.kitti_filter_params['enable_brightness']:
+                                    st.session_state.kitti_filter_params['min_bright'] = st.slider(
+                                        "Min Brightness",
+                                        0, 255,
+                                        st.session_state.kitti_filter_params['min_bright'],
+                                        key="kitti_min_bright"
+                                    )
+                                    st.session_state.kitti_filter_params['max_bright'] = st.slider(
+                                        "Max Brightness",
+                                        0, 255,
+                                        st.session_state.kitti_filter_params['max_bright'],
+                                        key="kitti_max_bright"
+                                    )
+
+                                st.session_state.kitti_filter_params['enable_contrast'] = st.checkbox(
+                                    "Enable Contrast Filter",
+                                    value=st.session_state.kitti_filter_params['enable_contrast'],
+                                    help="Remove low-contrast images",
+                                    key="kitti_enable_contrast"
+                                )
+                                if st.session_state.kitti_filter_params['enable_contrast']:
+                                    st.session_state.kitti_filter_params['min_contrast'] = st.slider(
+                                        "Min Contrast",
+                                        0.0, 0.5,
+                                        st.session_state.kitti_filter_params['min_contrast'],
+                                        step=0.01,
+                                        key="kitti_min_contrast"
+                                    )
+
+                        # Random batch parameters
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            kitti_batch_size = st.number_input(
+                                "Batch size (random KITTI samples)",
+                                min_value=1,
+                                max_value=num_samples,
+                                value=min(64, num_samples),
+                                step=1,
+                                key="kitti_batch_size"
+                            )
+                        with col_b:
+                            kitti_seed = st.number_input(
+                                "Random seed",
+                                min_value=0,
+                                max_value=1_000_000,
+                                value=42,
+                                step=1,
+                                key="kitti_batch_seed"
+                            )
+
+                        # Filter random batch button
+                        if st.button("🔍 Filter Random Batch (KITTI)", type="primary", key="filter_kitti_batch"):
+                            with st.spinner("Sampling and filtering KITTI images..."):
+                                rng = np.random.default_rng(int(kitti_seed))
+                                all_indices = np.arange(num_samples)
+                                if kitti_batch_size < num_samples:
+                                    sampled_indices = rng.choice(all_indices, size=int(kitti_batch_size), replace=False)
+                                else:
+                                    sampled_indices = all_indices
+
+                                filtered_batch = filter_kitti_images(
+                                    dataset_path=dataset_path,
+                                    indices=sorted(int(i) for i in sampled_indices),
+                                    filter_params=st.session_state.kitti_filter_params
+                                )
+                                st.session_state.kitti_filtered_batch = filtered_batch
+                            st.success(f"✅ Filtered {len(st.session_state.kitti_filtered_batch)} samples from {num_samples} total images")
+                            st.rerun()
+
+                        # Display filtered batch summary and allow sending to detection
+                        if st.session_state.kitti_filtered_batch:
+                            filtered_batch = st.session_state.kitti_filtered_batch
+                            st.markdown("---")
+                            st.subheader("📋 Filtered Sample Batch (KITTI)")
+                            st.info(f"Found {len(filtered_batch)} KITTI samples that passed all filters")
+
+                            if st.button("📚 Load all filtered samples for detection", key="load_all_kitti_for_detection"):
+                                batch_samples = []
+                                for item in filtered_batch:
+                                    batch_samples.append({
+                                        "dataset_type": "kitti",
+                                        "dataset_path": dataset_path,
+                                        "sample_index": item["sample_index"],
+                                        "image_path": item.get("image_path", ""),
+                                    })
+                                st.session_state.batch_samples = batch_samples
+                                st.session_state.process_all_samples = True
+                                st.success(f"✅ Prepared {len(batch_samples)} KITTI samples. Go to **2_Detection** and click **Process entire batch**.")
+                                st.rerun()
             except Exception as e:
                 st.error(f"Error: {str(e)}")
         
         elif dataset_type == "nuscenes":
             # nuScenes: Use sample tokens
-            st.info("nuScenes dataset loading - Enter sample token")
+            st.info("nuScenes dataset loading - Enter sample token or use batch filtering below.")
             sample_token = st.text_input(
                 "Sample Token",
                 value="",
@@ -166,6 +328,194 @@ def main():
                             st.error("❌ Failed to load sample")
                 else:
                     st.warning("Please enter a sample token")
+
+            # nuScenes: random batch filtering + send to detection
+            from components.dataset_loaders.nuscenes_dataset_loader import NuScenesDatasetLoader  # local import to avoid heavy dependency if unused
+
+            if 'nuscenes_filter_params' not in st.session_state:
+                st.session_state.nuscenes_filter_params = {
+                    'blur_gate': 120,
+                    'hash_thresh': 6,
+                    'motion_thresh': 5,
+                    'min_contrast': 0.10,
+                    'min_bright': 30,
+                    'max_bright': 235,
+                    'enable_blur': True,
+                    'enable_dedup': True,
+                    'enable_motion': False,
+                    'enable_brightness': True,
+                    'enable_contrast': True
+                }
+            if 'nuscenes_filtered_batch' not in st.session_state:
+                st.session_state.nuscenes_filtered_batch = None
+
+            st.markdown("---")
+            st.subheader("🖼️ Image Filtering (nuScenes Dataset)")
+            st.markdown("""
+            Sample a random batch of nuScenes images (CAM_FRONT), filter them by quality, and send the filtered batch to the detection page.
+            """)
+
+            # Filter configuration
+            with st.expander("⚙️ Filter Settings (nuScenes)", expanded=False):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.session_state.nuscenes_filter_params['enable_blur'] = st.checkbox(
+                        "Enable Blur Filter",
+                        value=st.session_state.nuscenes_filter_params['enable_blur'],
+                        help="Remove blurry images using Laplacian variance",
+                        key="nuscenes_enable_blur"
+                    )
+                    if st.session_state.nuscenes_filter_params['enable_blur']:
+                        st.session_state.nuscenes_filter_params['blur_gate'] = st.slider(
+                            "Blur Gate (Laplacian Variance)",
+                            0, 500,
+                            st.session_state.nuscenes_filter_params['blur_gate'],
+                            help="Minimum Laplacian variance (higher = sharper)",
+                            key="nuscenes_blur_gate"
+                        )
+
+                    st.session_state.nuscenes_filter_params['enable_dedup'] = st.checkbox(
+                        "Enable Deduplication",
+                        value=st.session_state.nuscenes_filter_params['enable_dedup'],
+                        help="Remove visually similar images",
+                        key="nuscenes_enable_dedup"
+                    )
+                    if st.session_state.nuscenes_filter_params['enable_dedup']:
+                        st.session_state.nuscenes_filter_params['hash_thresh'] = st.slider(
+                            "Deduplication Threshold (Hamming)",
+                            0, 16,
+                            st.session_state.nuscenes_filter_params['hash_thresh'],
+                            help="Maximum Hamming distance for duplicates",
+                            key="nuscenes_hash_thresh"
+                        )
+
+                    st.session_state.nuscenes_filter_params['enable_motion'] = st.checkbox(
+                        "Enable Motion Filter",
+                        value=st.session_state.nuscenes_filter_params['enable_motion'],
+                        help="Skip static frames (sequential samples)",
+                        key="nuscenes_enable_motion"
+                    )
+                    if st.session_state.nuscenes_filter_params['enable_motion']:
+                        st.session_state.nuscenes_filter_params['motion_thresh'] = st.slider(
+                            "Motion Threshold",
+                            0, 20,
+                            st.session_state.nuscenes_filter_params['motion_thresh'],
+                            help="Minimum motion score between frames",
+                            key="nuscenes_motion_thresh"
+                        )
+
+                with col2:
+                    st.session_state.nuscenes_filter_params['enable_brightness'] = st.checkbox(
+                        "Enable Brightness Filter",
+                        value=st.session_state.nuscenes_filter_params['enable_brightness'],
+                        help="Remove over/under-exposed images",
+                        key="nuscenes_enable_brightness"
+                    )
+                    if st.session_state.nuscenes_filter_params['enable_brightness']:
+                        st.session_state.nuscenes_filter_params['min_bright'] = st.slider(
+                            "Min Brightness",
+                            0, 255,
+                            st.session_state.nuscenes_filter_params['min_bright'],
+                            key="nuscenes_min_bright"
+                        )
+                        st.session_state.nuscenes_filter_params['max_bright'] = st.slider(
+                            "Max Brightness",
+                            0, 255,
+                            st.session_state.nuscenes_filter_params['max_bright'],
+                            key="nuscenes_max_bright"
+                        )
+
+                    st.session_state.nuscenes_filter_params['enable_contrast'] = st.checkbox(
+                        "Enable Contrast Filter",
+                        value=st.session_state.nuscenes_filter_params['enable_contrast'],
+                        help="Remove low-contrast images",
+                        key="nuscenes_enable_contrast"
+                    )
+                    if st.session_state.nuscenes_filter_params['enable_contrast']:
+                        st.session_state.nuscenes_filter_params['min_contrast'] = st.slider(
+                            "Min Contrast",
+                            0.0, 0.5,
+                            st.session_state.nuscenes_filter_params['min_contrast'],
+                            step=0.01,
+                            key="nuscenes_min_contrast"
+                        )
+
+            # Random batch parameters
+            col_n1, col_n2 = st.columns(2)
+            with col_n1:
+                nuscenes_batch_size = st.number_input(
+                    "Batch size (random nuScenes samples)",
+                    min_value=1,
+                    value=64,
+                    step=1,
+                    key="nuscenes_batch_size"
+                )
+            with col_n2:
+                nuscenes_seed = st.number_input(
+                    "Random seed (nuScenes)",
+                    min_value=0,
+                    max_value=1_000_000,
+                    value=42,
+                    step=1,
+                    key="nuscenes_batch_seed"
+                )
+
+            # Filter random batch button
+            if st.button("🔍 Filter Random Batch (nuScenes)", type="primary", key="filter_nuscenes_batch"):
+                try:
+                    # Determine nuScenes version from directory structure
+                    version = None
+                    for d in Path(dataset_path).iterdir():
+                        if d.is_dir() and d.name.startswith("v1.0-"):
+                            version = d.name
+                            break
+                    if version is None:
+                        st.error("❌ Could not determine nuScenes version (expected a 'v1.0-*' directory).")
+                    else:
+                        with st.spinner("Sampling and filtering nuScenes images..."):
+                            loader = NuScenesDatasetLoader(dataroot=str(dataset_path), version=version, verbose=False)
+                            loader.load_dataset()
+                            camera_samples = loader.get_camera_samples(camera_channel="CAM_FRONT")
+                            total_samples = len(camera_samples)
+                            if total_samples == 0:
+                                st.error("❌ No nuScenes camera samples found (CAM_FRONT).")
+                            else:
+                                bs = min(int(nuscenes_batch_size), total_samples)
+                                rng = np.random.default_rng(int(nuscenes_seed))
+                                indices = rng.choice(np.arange(total_samples), size=bs, replace=False)
+                                selected = [camera_samples[int(i)] for i in indices]
+
+                                filtered_batch = filter_nuscenes_images(
+                                    samples=selected,
+                                    filter_params=st.session_state.nuscenes_filter_params
+                                )
+                                st.session_state.nuscenes_filtered_batch = filtered_batch
+                                st.success(f"✅ Filtered {len(filtered_batch)} samples from {total_samples} total nuScenes samples")
+                                st.rerun()
+                except Exception as e:
+                    st.error(f"Error during nuScenes batch filtering: {str(e)}")
+
+            # Display filtered batch summary and allow sending to detection
+            if st.session_state.nuscenes_filtered_batch:
+                filtered_batch = st.session_state.nuscenes_filtered_batch
+                st.markdown("---")
+                st.subheader("📋 Filtered Sample Batch (nuScenes)")
+                st.info(f"Found {len(filtered_batch)} nuScenes samples that passed all filters")
+
+                if st.button("📚 Load all filtered samples for detection", key="load_all_nuscenes_for_detection"):
+                    batch_samples = []
+                    for item in filtered_batch:
+                        batch_samples.append({
+                            "dataset_type": "nuscenes",
+                            "dataset_path": dataset_path,
+                            "sample_index": item["sample_token"],
+                            "image_path": item.get("image_path", ""),
+                        })
+                    st.session_state.batch_samples = batch_samples
+                    st.session_state.process_all_samples = True
+                    st.success(f"✅ Prepared {len(batch_samples)} nuScenes samples. Go to **2_Detection** and click **Process entire batch**.")
+                    st.rerun()
         
         elif dataset_type == "sim":
             # sim/LinkedDataHandler: Filter images and create batch selection
@@ -289,9 +639,12 @@ def main():
                         if st.button("🔍 Filter Images", type="primary", key="filter_sim_images"):
                             with st.spinner("Filtering images from dataset..."):
                                 print(f"dataset_path: {dataset_path}")
-                                filtered_batch = _filter_sim_images(
-                                    handler, selected_subset, links, dataset_path,
-                                    st.session_state.sim_filter_params
+                                filtered_batch = filter_sim_images(
+                                    handler=handler,
+                                    subset_name=selected_subset,
+                                    links=links,
+                                    dataset_path=dataset_path,
+                                    filter_params=st.session_state.sim_filter_params,
                                 )
                                 st.session_state.sim_filtered_batch = filtered_batch
                                 st.success(f"✅ Filtered {len(filtered_batch)} samples from {len(links)} total links")
@@ -367,6 +720,20 @@ def main():
                                             st.rerun()
                                         else:
                                             st.error("❌ Failed to load selected sample")
+                                # Load entire batch for detection (process all on 2_Detection)
+                                if st.button("📚 Load all filtered samples for detection", key="load_all_sim_for_detection"):
+                                    batch_samples = []
+                                    for item in filtered_batch:
+                                        batch_samples.append({
+                                            "dataset_type": "sim",
+                                            "dataset_path": dataset_path,
+                                            "sample_index": item["link_token"],
+                                            "image_path": item.get("image_path", ""),
+                                        })
+                                    st.session_state.batch_samples = batch_samples
+                                    st.session_state.process_all_samples = True
+                                    st.success(f"✅ Prepared {len(batch_samples)} samples. Go to **2_Detection** and click **Process entire batch**.")
+                                    st.rerun()
                             else:
                                 st.warning("⚠️ No samples passed the filters. Try adjusting filter settings.")
                         else:
@@ -459,133 +826,19 @@ def main():
         st.success("✅ Sample is ready! Navigate to **2_Detection.py** to run the detection pipeline.")
 
 
-def _filter_sim_images(
-    handler: LinkedDataHandler,
-    subset_name: str,
-    links: List[Dict],
-    dataset_path: str,
-    filter_params: Dict
-) -> List[Dict]:
-    """
-    Filter images from sim dataset using quality metrics.
-    
-    Args:
-        handler: LinkedDataHandler instance
-        subset_name: Name of the subset
-        links: List of link dictionaries
-        dataset_path: Root dataset path
-        filter_params: Dictionary with filter parameters
-    
-    Returns:
-        List of filtered sample dictionaries with image, link_token, and metrics
-    """
-    filtered_samples = []
-    seen_hashes = []
-    prev_frame_gray = None
-    
-    root_path = Path(dataset_path)
-    subset_path = root_path / subset_name
-    # Process each link
-    for link_idx, link in enumerate(links):
-        try:
-            rgb_sample = link.get('samples', {}).get('rgb', {})
-            if not rgb_sample or 'filename' not in rgb_sample:
-                continue
-            
-            # Get filename and normalize it (handle absolute paths)
-            filename = rgb_sample['filename']
-            
-            # Normalize filename: remove leading slashes and handle absolute paths
-            # Filename format might be: /rgb/filename.jpg or C:\rgb\filename.jpg
-            # We want: rgb/filename.jpg (relative to samples folder)
-            filename = filename.lstrip('/').lstrip('\\')
-            
-            # If it's an absolute Windows path (starts with drive letter), extract relative part
-            if len(filename) > 1 and filename[1] == ':':
-                # Windows absolute path like C:\rgb\file.jpg
-                # Extract everything after the first backslash after the drive
-                parts = filename.split('\\', 2)
-                if len(parts) > 2:
-                    filename = parts[2]  # Take everything after C:\rgb\
-                else:
-                    # Just drive and filename, take filename
-                    filename = parts[-1]
-            
-            # Construct image path: dataset_path / subset_name / samples / filename
-            image_path = subset_path / "samples" / filename
-            if not image_path.exists():
-                continue
-            
-            image_bgr = cv2.imread(str(image_path))
-            if image_bgr is None:
-                continue
-            
-            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-            image_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-            
-            # Calculate metrics
-            blur_score = variance_of_laplacian(image_gray)
-            contrast_val = contrast_score(image_gray)
-            brightness_val = brightness(image_gray)
-            
-            # Apply filters
-            passed = True
-            
-            # Blur filter
-            if filter_params['enable_blur']:
-                if blur_score < filter_params['blur_gate']:
-                    passed = False
-            
-            # Motion filter (if enabled and we have previous frame)
-            if filter_params['enable_motion'] and prev_frame_gray is not None:
-                motion_score = calculate_motion_score(prev_frame_gray, image_gray)
-                if motion_score < filter_params['motion_thresh']:
-                    passed = False
-            
-            # Deduplication
-            if filter_params['enable_dedup'] and passed:
-                try:
-                    ph = imagehash.dhash(Image.fromarray(image_gray))
-                    if any(hamming(ph, old) <= filter_params['hash_thresh'] for old in seen_hashes):
-                        passed = False
-                    else:
-                        seen_hashes.append(ph)
-                except Exception:
-                    pass  # Skip hash errors
-            
-            # Brightness filter
-            if filter_params['enable_brightness'] and passed:
-                if not (filter_params['min_bright'] <= brightness_val <= filter_params['max_bright']):
-                    passed = False
-            
-            # Contrast filter
-            if filter_params['enable_contrast'] and passed:
-                if contrast_val < filter_params['min_contrast']:
-                    passed = False
-            
-            # If passed all filters, add to batch
-            if passed:
-                filtered_samples.append({
-                    'link_token': link['token'],
-                    'link': link,
-                    'image': image_rgb,
-                    'image_path': str(image_path),
-                    'metrics': {
-                        'blur': blur_score,
-                        'contrast': contrast_val,
-                        'brightness': brightness_val
-                    }
-                })
-            
-            # Update previous frame for motion detection
-            if filter_params['enable_motion']:
-                prev_frame_gray = image_gray
-            
-        except Exception as e:
-            # Skip links that fail to process
-            continue
-    
-    return filtered_samples
+def _filter_kitti_images(*args, **kwargs):
+    """Backward-compat wrapper (deprecated). Use components.core.filter.filter_kitti_images instead."""
+    return filter_kitti_images(*args, **kwargs)
+
+
+def _filter_nuscenes_images(*args, **kwargs):
+    """Backward-compat wrapper (deprecated). Use components.core.filter.filter_nuscenes_images instead."""
+    return filter_nuscenes_images(*args, **kwargs)
+
+
+def _filter_sim_images(*args, **kwargs):
+    """Backward-compat wrapper (deprecated). Use components.core.filter.filter_sim_images instead."""
+    return filter_sim_images(*args, **kwargs)
 
 
 if __name__ == "__main__":
