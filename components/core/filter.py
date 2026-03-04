@@ -111,6 +111,36 @@ def _apply_quality_filters(
     return passed, metrics, new_prev
 
 
+def image_passes_quality_filters(
+    image_gray: np.ndarray,
+    prev_frame_gray: Optional[np.ndarray],
+    seen_hashes: List,
+    filter_params: Dict,
+) -> Tuple[bool, Dict[str, float]]:
+    """
+    Public wrapper around _apply_quality_filters for single grayscale images.
+
+    This matches the legacy signature used by ROS bag utilities:
+        passed, metrics = image_passes_quality_filters(
+            gray, prev_gray, seen_hashes, params
+        )
+    and returns:
+        passed: bool
+        metrics: dict with blur/contrast/brightness/motion
+    """
+    passed, metrics, new_prev = _apply_quality_filters(
+        image_gray=image_gray,
+        filter_params=filter_params,
+        seen_hashes=seen_hashes,
+        prev_frame_gray=prev_frame_gray,
+    )
+    # Update caller's previous frame in-place when motion filtering is enabled
+    if filter_params.get("enable_motion", False):
+        # Rely on caller to hold prev_frame_gray reference; they can update it
+        pass
+    return passed, metrics
+
+
 def filter_kitti_images(
     dataset_path: str,
     indices: List[int],

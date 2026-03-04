@@ -4,6 +4,7 @@ Unified detection pipeline with step-by-step execution and full pipeline mode.
 """
 import os
 import time
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 import cv2
@@ -47,6 +48,11 @@ def save_sample_to_hard_drive_after_processing(
     - image as PNG
     - point cloud as PCD (XYZ)
     """
+    # If a batch of raw samples (e.g., extracted from a ROS bag) has already been
+    # saved, skip saving again here to avoid duplicate disk writes.
+    if st.session_state.get("batch_samples_saved", False):
+        return
+
     output_root = st.session_state.get("output_root_dir", "")
     if not output_root:
         return

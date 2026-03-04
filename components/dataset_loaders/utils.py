@@ -41,9 +41,11 @@ def detect_dataset_type(dataset_path: str) -> Optional[str]:
     # If a file is passed (e.g. rosbag file), don't try to walk it as a directory.
     # This avoids NotADirectoryError when the user points directly to a bag file.
     if dataset_path.is_file():
-        # Optional: detect rosbag-like extensions for future use
+        # Detect rosbag-like files (ROS1 .bag, ROS2 .db3, MCAP .mcap).
+        # Compressed variants like *.mcap.zstd are not treated as rosbag here
+        # unless explicitly supported by the rosbag reader.
         suffixes = "".join(dataset_path.suffixes).lower()
-        if any(ext in suffixes for ext in [".bag", ".db3", ".mcap", ".mcap.zstd"]):
+        if any(ext in suffixes for ext in [".bag", ".db3", ".mcap"]):
             return "rosbag"
         return None
     
@@ -112,6 +114,10 @@ def load_dataset_sample(
         return _load_nuscenes_sample(dataset_path, sample_index)
     elif dataset_type == "sim":
         return _load_sim_sample(dataset_path, sample_index)
+    elif dataset_type == "rosbag":
+        # For rosbag we expect dataset_path to point to an extracted folder
+        # produced by components.dataset_loaders.rosbag_extractor.extract_bag_to_folder.
+        return _load_rosbag_sample(dataset_path, sample_index)
     else:
         print(f"Error: Unsupported dataset type: {dataset_type}")
         return None, None, None
@@ -403,6 +409,76 @@ def _load_sim_sample(
     except Exception as e:
         print(f"Error loading sim sample: {e}")
         import traceback
+        traceback.print_exc()
+        return None, None, None
+
+
+def _load_rosbag_sample(
+    dataset_path: str,
+    sample_index: int,
+) -> Tuple[Optional[Dict], Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Load a sample that was extracted from a ROS bag into a KITTI-like folder.
+
+    Expected layout (produced by rosbag_extractor.extract_bag_to_folder):
+        dataset_path/
+          image_2/    000000.png, 000001.png, ...
+          velodyne/   000000.bin, 000001.bin, ...
+          calib.npz   camera_intrinsic, camera_to_lidar, camera_frame, lidar_frame
+    """
+    try:
+        root = Path(dataset_path)
+        image_dir = root / "image_2"
+        velodyne_dir = root / "velodyne"
+        calib_path = root / "calib.npz"
+
+        img_path = image_dir / f"{int(sample_index):06d}.png"
+        pc_path = velodyne_dir / f"{int(sample_index):06d}.bin"
+
+        if not img_path.exists() or not pc_path.exists():
+            print(f"Error: ROS bag extracted sample {sample_index} not found in {dataset_path}")
+            return None, None, None
+
+        # Load image (BGR → RGB)
+        image_bgr = cv2.imread(str(img_path))
+        if image_bgr is None:
+            print(f"Error: Could not read image {img_path}")
+            return None, None, None
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        # Load point cloud (float32 XYZ)
+        pc_raw = np.fromfile(str(pc_path), dtype=np.float32)
+        if pc_raw.size % 3 != 0:
+            print(f"Error: Unexpected point cloud size in {pc_path}")
+            return None, None, None
+        point_cloud = pc_raw.reshape(-1, 3)
+
+        # Load calibration if present
+        if calib_path.exists():
+            calib = np.load(str(calib_path), allow_pickle=True)
+            camera_intrinsic = calib.get("camera_intrinsic", np.eye(3, dtype=np.float64))
+            camera_to_lidar = calib.get("camera_to_lidar", np.eye(4, dtype=np.float64))
+        else:
+            camera_intrinsic = np.eye(3, dtype=np.float64)
+            camera_to_lidar = np.eye(4, dtype=np.float64)
+
+        sample_meta_data = {
+            "image_path": str(img_path),
+            "point_cloud_path": str(pc_path),
+            "camera_intrinsic": camera_intrinsic,
+            "camera_extrinsic": np.eye(4, dtype=np.float64),
+            "camera_to_lidar_transform": camera_to_lidar,
+            "ground_truth_boxes": [],
+            "sample_index": int(sample_index),
+            "dataset_type": "rosbag",
+        }
+
+        return sample_meta_data, image_rgb, point_cloud
+
+    except Exception as e:
+        print(f"Error loading ROS bag extracted sample: {e}")
+        import traceback
+
         traceback.print_exc()
         return None, None, None
 

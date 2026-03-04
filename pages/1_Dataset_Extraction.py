@@ -10,6 +10,17 @@ from typing import Optional, Dict, List, Tuple
 
 from components.dataset_loaders.utils import detect_dataset_type, load_dataset_sample
 from components.dataset_loaders.dataset_loader import LinkedDataHandler
+from components.dataset_loaders.nuscenes_dataset_loader import NuScenesDatasetLoader
+from components.dataset_loaders.rosbag_extractor import (
+    get_image_topics as get_ros_image_topics,
+    get_pointcloud_topics as get_ros_pointcloud_topics,
+    get_camera_info_topics as get_ros_camera_info_topics,
+    get_tf_topics as get_ros_tf_topics,
+    suggest_topics_from_metadata,
+    filter_rosbag_frames,
+    extract_bag_to_folder,
+    sanitize_bag_name,
+)
 from components.utils.visualization_helper import create_3d_scatter_plot
 from components.core.pointcloud_projection import PointCloud
 from components.core.filter import (
@@ -149,6 +160,45 @@ def main():
                         Sample a random batch of KITTI images, filter them by quality, and send the filtered batch to the detection page.
                         """)
 
+                        # Quick presets for indoor / outdoor scenes
+                        col_kitti_preset1, col_kitti_preset2 = st.columns(2)
+                        with col_kitti_preset1:
+                            if st.button("🌳 Outdoor Scenes", key="kitti_outdoor_preset"):
+                                st.session_state.kitti_filter_params.update(
+                                    {
+                                        "motion_thresh": 8,
+                                        "blur_gate": 140,
+                                        "hash_thresh": 8,
+                                        "min_bright": 30,
+                                        "max_bright": 245,
+                                        "min_contrast": 0.12,
+                                        "enable_blur": True,
+                                        "enable_dedup": True,
+                                        "enable_motion": True,
+                                        "enable_brightness": True,
+                                        "enable_contrast": True,
+                                    }
+                                )
+                                st.rerun()
+                        with col_kitti_preset2:
+                            if st.button("🏠 Indoor Scenes", key="kitti_indoor_preset"):
+                                st.session_state.kitti_filter_params.update(
+                                    {
+                                        "motion_thresh": 4,
+                                        "blur_gate": 110,
+                                        "hash_thresh": 6,
+                                        "min_bright": 40,
+                                        "max_bright": 235,
+                                        "min_contrast": 0.10,
+                                        "enable_blur": True,
+                                        "enable_dedup": True,
+                                        "enable_motion": True,
+                                        "enable_brightness": True,
+                                        "enable_contrast": True,
+                                    }
+                                )
+                                st.rerun()
+
                         # Filter configuration
                         with st.expander("⚙️ Filter Settings (KITTI)", expanded=False):
                             col1, col2 = st.columns(2)
@@ -283,6 +333,14 @@ def main():
                             st.info(f"Found {len(filtered_batch)} KITTI samples that passed all filters")
 
                             if st.button("📚 Load all filtered samples for detection", key="load_all_kitti_for_detection"):
+                                # Standardized batch sample descriptor:
+                                # {
+                                #   "dataset_type": str,
+                                #   "dataset_path": str,
+                                #   "sample_index": Union[int, str],
+                                #   "image_path": str,
+                                #   "point_cloud_path": str,
+                                # }
                                 batch_samples = []
                                 for item in filtered_batch:
                                     batch_samples.append({
@@ -290,6 +348,8 @@ def main():
                                         "dataset_path": dataset_path,
                                         "sample_index": item["sample_index"],
                                         "image_path": item.get("image_path", ""),
+                                        # For KITTI we resolve LiDAR internally in loaders; keep path optional here.
+                                        "point_cloud_path": "",
                                     })
                                 st.session_state.batch_samples = batch_samples
                                 st.session_state.process_all_samples = True
@@ -330,7 +390,6 @@ def main():
                     st.warning("Please enter a sample token")
 
             # nuScenes: random batch filtering + send to detection
-            from components.dataset_loaders.nuscenes_dataset_loader import NuScenesDatasetLoader  # local import to avoid heavy dependency if unused
 
             if 'nuscenes_filter_params' not in st.session_state:
                 st.session_state.nuscenes_filter_params = {
@@ -354,6 +413,45 @@ def main():
             st.markdown("""
             Sample a random batch of nuScenes images (CAM_FRONT), filter them by quality, and send the filtered batch to the detection page.
             """)
+
+            # Quick presets for indoor / outdoor scenes
+            col_nusc_preset1, col_nusc_preset2 = st.columns(2)
+            with col_nusc_preset1:
+                if st.button("🌳 Outdoor Scenes", key="nuscenes_outdoor_preset"):
+                    st.session_state.nuscenes_filter_params.update(
+                        {
+                            "motion_thresh": 8,
+                            "blur_gate": 140,
+                            "hash_thresh": 8,
+                            "min_bright": 30,
+                            "max_bright": 245,
+                            "min_contrast": 0.12,
+                            "enable_blur": True,
+                            "enable_dedup": True,
+                            "enable_motion": True,
+                            "enable_brightness": True,
+                            "enable_contrast": True,
+                        }
+                    )
+                    st.rerun()
+            with col_nusc_preset2:
+                if st.button("🏠 Indoor Scenes", key="nuscenes_indoor_preset"):
+                    st.session_state.nuscenes_filter_params.update(
+                        {
+                            "motion_thresh": 4,
+                            "blur_gate": 110,
+                            "hash_thresh": 6,
+                            "min_bright": 40,
+                            "max_bright": 235,
+                            "min_contrast": 0.10,
+                            "enable_blur": True,
+                            "enable_dedup": True,
+                            "enable_motion": True,
+                            "enable_brightness": True,
+                            "enable_contrast": True,
+                        }
+                    )
+                    st.rerun()
 
             # Filter configuration
             with st.expander("⚙️ Filter Settings (nuScenes)", expanded=False):
@@ -511,12 +609,338 @@ def main():
                             "dataset_path": dataset_path,
                             "sample_index": item["sample_token"],
                             "image_path": item.get("image_path", ""),
+                            # nuScenes LiDAR path is resolved by its dataset loader.
+                            "point_cloud_path": "",
                         })
                     st.session_state.batch_samples = batch_samples
                     st.session_state.process_all_samples = True
                     st.success(f"✅ Prepared {len(batch_samples)} nuScenes samples. Go to **2_Detection** and click **Process entire batch**.")
                     st.rerun()
         
+        elif dataset_type == "rosbag":
+            # ROS bag: configure topics, filter frames, then extract and load batch
+            st.info("ROS bag detected. Configure topics and filters, then process the bag into samples.")
+
+            bag_path_obj = Path(dataset_path)
+
+            # Topic discovery (best-effort)
+            suggestions = suggest_topics_from_metadata(bag_path_obj)
+
+            image_topics: List[str] = []
+            pointcloud_topics: List[str] = []
+            camera_info_topics: List[str] = []
+            tf_topics: List[str] = []
+
+            try:
+                image_topics = get_ros_image_topics(bag_path_obj)
+                pointcloud_topics = get_ros_pointcloud_topics(bag_path_obj)
+                camera_info_topics = get_ros_camera_info_topics(bag_path_obj)
+                tf_topics = get_ros_tf_topics(bag_path_obj)
+            except Exception as e:
+                st.warning(f"Could not inspect ROS bag topics automatically: {e}")
+
+            st.subheader("ROS Bag Topics")
+            col_t1, col_t2 = st.columns(2)
+
+            with col_t1:
+                # Image topic
+                if image_topics:
+                    default_image = suggestions.get("image_topic")
+                    idx = 0
+                    if default_image and default_image in image_topics:
+                        idx = image_topics.index(default_image)
+                    image_topic = st.selectbox(
+                        "Image topic",
+                        image_topics,
+                        index=idx,
+                        help="Topic containing camera images",
+                        key="rosbag_image_topic",
+                    )
+                else:
+                    image_topic = st.text_input(
+                        "Image topic",
+                        value=suggestions.get("image_topic") or "",
+                        help="Enter the image topic manually (e.g. /sync/flir/compressed)",
+                        key="rosbag_image_topic_text",
+                    )
+
+                # CameraInfo topic
+                if camera_info_topics:
+                    default_ci = suggestions.get("camera_info_topic")
+                    idx_ci = 0
+                    if default_ci and default_ci in camera_info_topics:
+                        idx_ci = camera_info_topics.index(default_ci)
+                    camera_info_topic = st.selectbox(
+                        "CameraInfo topic (for intrinsics)",
+                        camera_info_topics,
+                        index=idx_ci,
+                        help="Topic containing sensor_msgs/CameraInfo",
+                        key="rosbag_camera_info_topic",
+                    )
+                else:
+                    camera_info_topic = st.text_input(
+                        "CameraInfo topic (optional)",
+                        value=suggestions.get("camera_info_topic") or "",
+                        help="Leave empty to skip intrinsics from CameraInfo",
+                        key="rosbag_camera_info_topic_text",
+                    ) or None
+
+            with col_t2:
+                # PointCloud2 topic
+                if pointcloud_topics:
+                    default_pc = suggestions.get("pointcloud_topic")
+                    idx_pc = 0
+                    if default_pc and default_pc in pointcloud_topics:
+                        idx_pc = pointcloud_topics.index(default_pc)
+                    pc_choice = st.selectbox(
+                        "PointCloud2 topic (optional)",
+                        ["(none)"] + pointcloud_topics,
+                        index=(idx_pc + 1) if default_pc and default_pc in pointcloud_topics else 0,
+                        help="LiDAR PointCloud2 topic (set to '(none)' for image-only)",
+                        key="rosbag_pc_topic",
+                    )
+                    pointcloud_topic = None if pc_choice == "(none)" else pc_choice
+                else:
+                    pointcloud_topic = st.text_input(
+                        "PointCloud2 topic (optional)",
+                        value=suggestions.get("pointcloud_topic") or "",
+                        help="Leave empty if no LiDAR is present in the bag",
+                        key="rosbag_pc_topic_text",
+                    ) or None
+
+                # TF topic
+                if tf_topics:
+                    default_tf = suggestions.get("tf_topic") or "/tf_static"
+                    idx_tf = tf_topics.index(default_tf) if default_tf in tf_topics else 0
+                    tf_topic = st.selectbox(
+                        "TF topic for extrinsics",
+                        tf_topics,
+                        index=idx_tf,
+                        help="Topic containing TFMessage with static transforms",
+                        key="rosbag_tf_topic",
+                    )
+                else:
+                    tf_topic = st.text_input(
+                        "TF topic (optional)",
+                        value=suggestions.get("tf_topic") or "/tf_static",
+                        help="Usually /tf_static or /tf",
+                        key="rosbag_tf_topic_text",
+                    ) or None
+
+            # Initialize ROS bag filter params (reuse KITTI defaults)
+            if "rosbag_filter_params" not in st.session_state:
+                st.session_state.rosbag_filter_params = {
+                    "blur_gate": 120,
+                    "hash_thresh": 6,
+                    "motion_thresh": 5,
+                    "min_contrast": 0.10,
+                    "min_bright": 30,
+                    "max_bright": 235,
+                    "enable_blur": True,
+                    "enable_dedup": True,
+                    "enable_motion": False,
+                    "enable_brightness": True,
+                    "enable_contrast": True,
+                }
+            if "rosbag_filtered_frames" not in st.session_state:
+                st.session_state.rosbag_filtered_frames = None
+
+            st.markdown("---")
+            st.subheader("🖼️ Frame Filtering (ROS bag)")
+            st.markdown(
+                "Apply the same quality filters as for KITTI/nuScenes, but directly on the ROS bag frames."
+            )
+
+            with st.expander("⚙️ Filter Settings (ROS bag)", expanded=False):
+                col_f1, col_f2 = st.columns(2)
+
+                with col_f1:
+                    rp = st.session_state.rosbag_filter_params
+                    rp["enable_blur"] = st.checkbox(
+                        "Enable Blur Filter",
+                        value=rp["enable_blur"],
+                        help="Remove blurry images using Laplacian variance",
+                        key="rosbag_enable_blur",
+                    )
+                    if rp["enable_blur"]:
+                        rp["blur_gate"] = st.slider(
+                            "Blur Gate (Laplacian Variance)",
+                            0,
+                            500,
+                            rp["blur_gate"],
+                            help="Minimum Laplacian variance (higher = sharper)",
+                            key="rosbag_blur_gate",
+                        )
+
+                    rp["enable_dedup"] = st.checkbox(
+                        "Enable Deduplication",
+                        value=rp["enable_dedup"],
+                        help="Remove visually similar images",
+                        key="rosbag_enable_dedup",
+                    )
+                    if rp["enable_dedup"]:
+                        rp["hash_thresh"] = st.slider(
+                            "Deduplication Threshold (Hamming)",
+                            0,
+                            16,
+                            rp["hash_thresh"],
+                            help="Maximum Hamming distance for duplicates",
+                            key="rosbag_hash_thresh",
+                        )
+
+                    rp["enable_motion"] = st.checkbox(
+                        "Enable Motion Filter",
+                        value=rp["enable_motion"],
+                        help="Skip static frames (sequential messages)",
+                        key="rosbag_enable_motion",
+                    )
+                    if rp["enable_motion"]:
+                        rp["motion_thresh"] = st.slider(
+                            "Motion Threshold",
+                            0,
+                            20,
+                            rp["motion_thresh"],
+                            help="Minimum motion score between frames",
+                            key="rosbag_motion_thresh",
+                        )
+
+                with col_f2:
+                    rp = st.session_state.rosbag_filter_params
+                    rp["enable_brightness"] = st.checkbox(
+                        "Enable Brightness Filter",
+                        value=rp["enable_brightness"],
+                        help="Remove over/under-exposed images",
+                        key="rosbag_enable_brightness",
+                    )
+                    if rp["enable_brightness"]:
+                        rp["min_bright"] = st.slider(
+                            "Min Brightness",
+                            0,
+                            255,
+                            rp["min_bright"],
+                            key="rosbag_min_bright",
+                        )
+                        rp["max_bright"] = st.slider(
+                            "Max Brightness",
+                            0,
+                            255,
+                            rp["max_bright"],
+                            key="rosbag_max_bright",
+                        )
+
+                    rp["enable_contrast"] = st.checkbox(
+                        "Enable Contrast Filter",
+                        value=rp["enable_contrast"],
+                        help="Remove low-contrast images",
+                        key="rosbag_enable_contrast",
+                    )
+                    if rp["enable_contrast"]:
+                        rp["min_contrast"] = st.slider(
+                            "Min Contrast",
+                            0.0,
+                            0.5,
+                            rp["min_contrast"],
+                            step=0.01,
+                            key="rosbag_min_contrast",
+                        )
+
+                    rosbag_max_frames = st.number_input(
+                        "Max frames to consider from bag (0 = all)",
+                        min_value=0,
+                        value=0,
+                        step=1,
+                        key="rosbag_max_frames",
+                    )
+
+            # Button to process bag (filter frames)
+            if st.button("🎬 Process bag (filter frames)", type="primary", key="rosbag_process_bag"):
+                if not image_topic:
+                    st.error("Please specify an image topic for the bag.")
+                else:
+                    with st.spinner("Filtering ROS bag frames..."):
+                        try:
+                            max_frames_val = (
+                                int(st.session_state.rosbag_max_frames)
+                                if st.session_state.rosbag_max_frames > 0
+                                else None
+                            )
+                        except Exception:
+                            max_frames_val = None
+
+                        try:
+                            accepted = filter_rosbag_frames(
+                                bag_path=bag_path_obj,
+                                image_topic=image_topic,
+                                filter_params=st.session_state.rosbag_filter_params,
+                                max_frames=max_frames_val,
+                                progress_callback=None,
+                            )
+                            st.session_state.rosbag_filtered_frames = accepted
+                            st.success(f"✅ {len(accepted)} frames passed all filters.")
+                        except Exception as e:
+                            st.error(f"ROS bag filtering failed: {e}")
+
+            filtered_frames = st.session_state.get("rosbag_filtered_frames") or []
+            if filtered_frames:
+                st.markdown("---")
+                st.subheader("📋 Filtered Frame Summary (ROS bag)")
+                st.info(
+                    f"Found {len(filtered_frames)} frames that passed all filters. "
+                    "You can now extract them to disk and load them as a batch for processing."
+                )
+
+                if st.button(
+                    "💾 Save data batch and load batch for processing",
+                    type="primary",
+                    key="rosbag_save_and_load_batch",
+                ):
+                    with st.spinner("Extracting filtered frames from ROS bag..."):
+                        bag_name = sanitize_bag_name(bag_path_obj.name)
+                        out_dir = st.session_state.output_root_dir + "/" + bag_name + "_extracted"
+
+                        timestamps = [f["timestamp_ns"] for f in filtered_frames]
+                        try:
+                            frames, stats = extract_bag_to_folder(
+                                bag_path=bag_path_obj,
+                                out_dir=out_dir,
+                                image_topic=image_topic,
+                                pointcloud_topic=pointcloud_topic,
+                                accepted_timestamps_ns=timestamps,
+                                max_frames=None,
+                                progress_callback=None,
+                                camera_info_topic=camera_info_topic,
+                                tf_topics=[tf_topic] if tf_topic else None,
+                            )
+                        except Exception as e:
+                            st.error(f"Failed to extract filtered frames: {e}")
+                            frames = []
+                    print(f'frames={frames}, stats={stats}')
+                    if frames:
+                        batch_samples = []
+                        for f in frames:
+                            batch_samples.append(
+                                {
+                                    "dataset_type": "rosbag",
+                                    "dataset_path": str(out_dir),
+                                    "sample_index": f["frame_index"],
+                                    "image_path": f.get("image_path", ""),
+                                    # For ROS bags we often know the exact LiDAR file path.
+                                    "point_cloud_path": f.get("point_cloud_path", ""),
+                                }
+                            )
+                        st.session_state.batch_samples = batch_samples
+                        st.session_state.process_all_samples = True
+                        # Indicate that raw samples have already been saved for batch
+                        st.session_state.batch_samples_saved = True
+                        st.success(
+                            f"✅ Prepared {len(batch_samples)} ROS bag samples. "
+                            "Go to **2_Detection** and click **Process entire batch**."
+                        )
+                        st.info(f"Extracted data directory: `{out_dir}`")
+                        st.rerun()
+            else:
+                st.info("Click **Process bag (filter frames)** to create a filtered frame list.")
+
         elif dataset_type == "sim":
             # sim/LinkedDataHandler: Filter images and create batch selection
             try:
@@ -559,6 +983,45 @@ def main():
                         Filter images from the dataset using quality metrics.
                         Only images that pass all enabled filters will be available for selection.
                         """)
+
+                        # Quick presets for indoor / outdoor scenes
+                        col_sim_preset1, col_sim_preset2 = st.columns(2)
+                        with col_sim_preset1:
+                            if st.button("🌳 Outdoor Scenes", key="sim_outdoor_preset"):
+                                st.session_state.sim_filter_params.update(
+                                    {
+                                        "motion_thresh": 8,
+                                        "blur_gate": 140,
+                                        "hash_thresh": 8,
+                                        "min_bright": 30,
+                                        "max_bright": 245,
+                                        "min_contrast": 0.12,
+                                        "enable_blur": True,
+                                        "enable_dedup": True,
+                                        "enable_motion": True,
+                                        "enable_brightness": True,
+                                        "enable_contrast": True,
+                                    }
+                                )
+                                st.rerun()
+                        with col_sim_preset2:
+                            if st.button("🏠 Indoor Scenes", key="sim_indoor_preset"):
+                                st.session_state.sim_filter_params.update(
+                                    {
+                                        "motion_thresh": 4,
+                                        "blur_gate": 110,
+                                        "hash_thresh": 6,
+                                        "min_bright": 40,
+                                        "max_bright": 235,
+                                        "min_contrast": 0.10,
+                                        "enable_blur": True,
+                                        "enable_dedup": True,
+                                        "enable_motion": True,
+                                        "enable_brightness": True,
+                                        "enable_contrast": True,
+                                    }
+                                )
+                                st.rerun()
                         
                         # Filter configuration
                         with st.expander("⚙️ Filter Settings", expanded=True):
@@ -729,6 +1192,8 @@ def main():
                                             "dataset_path": dataset_path,
                                             "sample_index": item["link_token"],
                                             "image_path": item.get("image_path", ""),
+                                            # Sim LiDAR path is resolved in the sim dataset loader.
+                                            "point_cloud_path": "",
                                         })
                                     st.session_state.batch_samples = batch_samples
                                     st.session_state.process_all_samples = True
