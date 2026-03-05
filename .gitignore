@@ -19,6 +19,7 @@ __pycache__/
 *.eps
 nul
 
+.vscode
 .claude
 .cursor
 checkpoints/
