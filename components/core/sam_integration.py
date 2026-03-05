@@ -33,24 +33,59 @@ except ImportError:
     SAM3_AVAILABLE = False
 
 
+def get_available_models() -> Dict[str, List[str]]:
+    """
+    Discover available model files in the project's models directory.
+    Returns base names for SAM models and filenames (with extension) for YOLO models.
+    """
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    models_dir = os.path.abspath(os.path.join(project_root, "models"))
+
+    discovered = {"sam2": [], "sam3": [], "yolo": []}
+    if not os.path.isdir(models_dir):
+        return discovered
+
+    files = sorted(os.listdir(models_dir))
+    for fname in files:
+        fpath = os.path.join(models_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+
+        base, ext = os.path.splitext(fname)
+        if ext.lower() not in {".pt", ".pth"}:
+            continue
+
+        b = base.lower()
+        if b.startswith("sam2_") or b == "sam2":
+            discovered["sam2"].append(base)
+        elif b.startswith("sam3"):
+            discovered["sam3"].append(base)
+        elif b.startswith("yolo") or "world" in b:
+            discovered["yolo"].append(fname)
+
+    return discovered
+
+
 class SAMIntegration:
     """
     Unified class for SAM model management and segmentation operations.
     Supports SAM2 (bounding box segmentation) and SAM3 (bounding box + text-based semantic segmentation).
     """
     
-    def __init__(self, model_type: str = "sam2_t"):
+    def __init__(self, model_type: str = "sam2_t", use_gpu: bool = True):
         """
         Initialize SAM integration manager.
         
         Args:
             model_type: Type of SAM model to use
                       Options: "sam2_t", "sam2_b", "sam2_l", "sam3", "sam_b", "mobile_sam"
+            use_gpu: Boolean flag to enable GPU usage (if available)
         """
         self.model_type = model_type
         self.model = None
         self.predictor = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.device = torch.device("cuda" if self.use_gpu else "cpu")
         self.current_image = None
         self._yolo_integration = None  # Lazy initialization for SAM2 pipeline
         
@@ -66,30 +101,31 @@ class SAMIntegration:
         models_dir = os.path.join(project_root, "models")
         models_dir = os.path.abspath(models_dir)  # Convert to absolute path
         
-        if self.model_type == "sam3":
+        if self.model_type.startswith("sam3"):
             if not SAM3_AVAILABLE:
                 raise ImportError("SAM3 not available. Install with: pip install ultralytics")
-            
-            model_path = os.path.join(models_dir, "sam3.pt")
-            model_path = os.path.abspath(model_path)  # Ensure absolute path
+
+            model_file = f"{self.model_type}.pt"
+            model_path = os.path.abspath(os.path.join(models_dir, model_file))
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"SAM3 model not found at {model_path}")
-            
+
             overrides = dict(
                 conf=0.25,
                 task="segment",
                 mode="predict",
                 model=model_path,
-                half=True,  # Use FP16 for faster inference
+                half=self.use_gpu,
                 save=True,
+                device=0 if self.use_gpu else "cpu",
             )
             self.predictor = SAM3SemanticPredictor(overrides=overrides)
-            print(f"Loaded SAM3 model from {model_path}")
-            
+            print(f"Loaded SAM3 model from {model_path} on {self.device}")
+
         elif self.model_type.startswith("sam2"):
             if not ULTRALYTICS_AVAILABLE:
                 raise ImportError("Ultralytics not available. Install with: pip install ultralytics")
-            
+
             if self.model_type == "sam2_t":
                 model_file = "sam2_t.pt"
             elif self.model_type == "sam2_b":
@@ -97,17 +133,15 @@ class SAMIntegration:
             elif self.model_type == "sam2_l":
                 model_file = "sam2_l.pt"
             else:
-                raise ValueError(f"Unknown SAM2 model type: {self.model_type}")
-            
-            model_path = os.path.join(models_dir, model_file)
-            model_path = os.path.abspath(model_path)  # Ensure absolute path
+                model_file = f"{self.model_type}.pt"
+
+            model_path = os.path.abspath(os.path.join(models_dir, model_file))
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"SAM2 model '{model_file}' not found at {model_path}")
-            
-            # Use SAM class directly (like the example) instead of SAM2DynamicInteractivePredictor
+
             self.model = SAM(model_path)
             self.model.info()
-            print(f"Loaded SAM2 model from {model_path}")
+            print(f"Loaded SAM2 model from {model_path} on {self.device}")
             
         elif self.model_type == "sam_b":
             model_path = os.path.join(models_dir, "sam_b.pt")
@@ -116,7 +150,7 @@ class SAMIntegration:
                 raise FileNotFoundError(f"SAM-b model not found at {model_path}")
             self.model = SAM(model_path)
             self.model.info()
-            print(f"Loaded SAM-b model from {model_path}")
+            print(f"Loaded SAM-b model from {model_path} on {self.device}")
             
         elif self.model_type == "mobile_sam":
             model_path = os.path.join(models_dir, "FastSAM-s.pt")
@@ -125,7 +159,7 @@ class SAMIntegration:
                 raise FileNotFoundError(f"MobileSAM model not found at {model_path}")
             self.model = FastSAM(model_path)
             self.model.info()
-            print(f"Loaded MobileSAM model from {model_path}")
+            print(f"Loaded MobileSAM model from {model_path} on {self.device}")
             
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
@@ -191,7 +225,7 @@ class SAMIntegration:
             
             # Run inference with bboxes parameter directly (mimicking the example)
             # The model accepts bboxes as a list: bboxes=[x1, y1, x2, y2]
-            results = self.model(image, bboxes=bbox)
+            results = self.model(image, bboxes=bbox, device=0 if self.use_gpu else "cpu")
             
             # Extract mask from results
             if results and len(results) > 0:
@@ -254,7 +288,7 @@ class SAMIntegration:
             if self.model is None:
                 raise RuntimeError("Model not loaded")
             
-            results = self.model(image)
+            results = self.model(image, device=0 if self.use_gpu else "cpu")
             # Extract mask from first result
             if results and len(results) > 0:
                 result = results[0]
@@ -456,7 +490,7 @@ class SAMIntegration:
             raise RuntimeError("Model not loaded")
         
         # Run inference without prompts - SAM2 will automatically segment everything
-        results = self.model(image)
+        results = self.model(image, device=0 if self.use_gpu else "cpu")
         
         masks = []
         if results and len(results) > 0:
@@ -663,7 +697,7 @@ class SAMIntegration:
             if yolo_model_path is None:
                 yolo_model_path = "yolov8s-world.pt"
             try:
-                self._yolo_integration = YOLOIntegration(yolo_model_path)
+                self._yolo_integration = YOLOIntegration(yolo_model_path, use_gpu=self.use_gpu)
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize YOLO integration: {str(e)}")
         
@@ -766,12 +800,13 @@ class YOLOIntegration:
     This module provides unified class for integrating YOLO models.
     Supports YOLO-World models for open-vocabulary object detection.
     """
-    def __init__(self, model_path: str = "yolov8s-world.pt"):
+    def __init__(self, model_path: str = "yolov8x-worldv2.pt", use_gpu: bool = True):
         """
         Initialize YOLO integration manager.
         
         Args:
             model_path: Path to YOLO-World model file (default: "yolov8s-world.pt")
+            use_gpu: Boolean flag to enable GPU usage (if available)
         """
         if not ULTRALYTICS_AVAILABLE:
             raise ImportError("Ultralytics not available. Install with: pip install ultralytics")
@@ -788,13 +823,15 @@ class YOLOIntegration:
         
         self.model_path = model_path
         self.model = None
+        self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.device = "cuda:0" if self.use_gpu else "cpu"
         self._load_model()
     
     def _load_model(self):
         """Load the YOLO model."""
         self.model = YOLO(self.model_path)
-        print(f"Loaded YOLO model from {self.model_path}")
-    
+        print(f"Loaded YOLO model from {self.model_path} on {self.device}")
+
     def detect_with_classes(self, image: np.ndarray, class_names: List[str], 
                            conf_threshold: float = 0.25) -> List[Dict]:
         """
@@ -819,7 +856,7 @@ class YOLOIntegration:
         self.model.set_classes(class_names)
         
         # Run inference
-        results = self.model(image, conf=conf_threshold, verbose=False)
+        results = self.model(image, conf=conf_threshold, verbose=False, device=self.device)
         
         detections = []
         if results and len(results) > 0:

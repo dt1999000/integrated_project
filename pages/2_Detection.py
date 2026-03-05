@@ -14,10 +14,11 @@ import open3d as o3d
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import torch
 
 from components.core.pointcloud_projection import PointCloud, Projection
 from components.core.depth_estimation import compute_sparse_depth_map
-from components.core.sam_integration import SAMIntegration, assign_points_to_masks
+from components.core.sam_integration import SAMIntegration, assign_points_to_masks, get_available_models
 from components.core.pose_estimation import fit_cuboid_to_points
 from components.core.clustering_manager import ClusteringManager, select_best_cluster_points
 from components.core.utils import get_bbox_from_mask, calculate_iou
@@ -201,7 +202,8 @@ def step_3_sam_segmentation(
     class_names: List[str],
     sam_model_type: str = 'sam2_t',
     yolo_model_path: Optional[str] = None,
-    conf_threshold: float = 0.25
+    conf_threshold: float = 0.25,
+    use_gpu: bool = True,
 ) -> Dict:
     """
     Step 3: Generate SAM masks using open-vocabulary detection and assign original LiDAR points to masks.
@@ -214,6 +216,7 @@ def step_3_sam_segmentation(
         sam_model_type: 'sam2_t' or 'sam3'
         yolo_model_path: Optional path to YOLO-World model (only used for SAM2)
         conf_threshold: Confidence threshold for YOLO detections (default: 0.25)
+        use_gpu: Whether to use GPU for inference (default: True)
     
     Returns:
         Dict with 'sam_masks', 'mask_assignments', 'mask_bboxes', 'class_names', 'confidences'
@@ -223,8 +226,9 @@ def step_3_sam_segmentation(
     # Initialize SAM integration if needed
     if 'sam_integration' not in st.session_state or st.session_state.sam_integration is None:
         try:
-            st.session_state.sam_integration = SAMIntegration(model_type=sam_model_type)
+            st.session_state.sam_integration = SAMIntegration(model_type=sam_model_type, use_gpu=use_gpu)
             st.session_state.sam_initialized_model_type = sam_model_type
+            st.session_state.sam_initialized_use_gpu = use_gpu
         except Exception as e:
             return {
                 'error': f"SAM initialization failed: {str(e)}",
@@ -237,10 +241,11 @@ def step_3_sam_segmentation(
     if 'sam_initialized_model_type' not in st.session_state:
         st.session_state.sam_initialized_model_type = sam_model_type
     
-    if st.session_state.sam_initialized_model_type != sam_model_type:
+    if st.session_state.sam_initialized_model_type != sam_model_type or st.session_state.sam_initialized_use_gpu != use_gpu:
         try:
-            st.session_state.sam_integration = SAMIntegration(model_type=sam_model_type)
+            st.session_state.sam_integration = SAMIntegration(model_type=sam_model_type, use_gpu=use_gpu)
             st.session_state.sam_initialized_model_type = sam_model_type
+            st.session_state.sam_initialized_use_gpu = use_gpu
         except Exception as e:
             return {
                 'error': f"SAM reinitialization failed: {str(e)}",
@@ -623,7 +628,8 @@ def run_full_pipeline(params: Dict) -> Dict:
         class_names=class_names,
         sam_model_type=params.get('sam_model_type', 'sam2_t'),
         yolo_model_path=params.get('yolo_model_path', None),
-        conf_threshold=params.get('yolo_conf_threshold', 0.25)
+        conf_threshold=params.get('yolo_conf_threshold', 0.25),
+        use_gpu=params.get('use_gpu', True)
     )
     results['step_3'] = {'completed': True, 'result': step_3_result}
     st.session_state.pipeline_state['step_3'] = results['step_3']
@@ -783,10 +789,18 @@ def main():
             'sam_model_type': 'sam2_t',
             'class_names': ['car', 'person', 'bicycle'],
             'yolo_model_path': None,
-            'yolo_conf_threshold': 0.25
+            'yolo_conf_threshold': 0.25,
+            'use_gpu': True
         }
-    
-    # Batch mode: process entire batch only (no per-sample image view)
+
+    # Discover available models (cheap; safe on rerun)
+    available = get_available_models()
+    sam2_models = available.get("sam2", [])
+    sam3_models = available.get("sam3", [])
+    yolo_models = available.get("yolo", [])
+    st.session_state.available_models = available
+
+    # Batch mode: moved below sidebar so user can set params first
     batch_samples = st.session_state.get("batch_samples", [])
     process_all_samples = st.session_state.get("process_all_samples", False)
     if batch_samples and process_all_samples:
@@ -871,13 +885,29 @@ def main():
         )
     
     st.sidebar.markdown("### SAM Model")
+    sam_options = sam2_models + sam3_models
+    if not sam_options:
+        sam_options = ['sam2_t', 'sam3']
+
+    current_sam = st.session_state.params.get('sam_model_type')
+    if current_sam in sam_options:
+        default_sam_index = sam_options.index(current_sam)
+    else:
+        if sam3_models:
+            default_sam = sam3_models[0]
+        elif sam2_models:
+            default_sam = sam2_models[0]
+        else:
+            default_sam = 'sam3' if 'sam3' in sam_options else sam_options[0]
+        default_sam_index = sam_options.index(default_sam)
+
     st.session_state.params['sam_model_type'] = st.sidebar.selectbox(
         "SAM Model Type",
-        options=['sam2_t', 'sam3'],
-        index=0,
-        help="SAM2: Uses YOLOWorld for open vocab bounding boxes and segment with SAM2. SAM3: Uses text prompts, full open vocab capability."
+        options=sam_options,
+        index=default_sam_index,
+        help="Automatically discovered from models directory."
     )
-    
+
     # Class names input
     st.sidebar.markdown("### Open Vocabulary Detection")
     class_names_input = st.sidebar.text_input(
@@ -938,8 +968,22 @@ def main():
     if not st.session_state.params['class_names']:
         st.sidebar.warning("⚠️ Please enter at least one class name")
     
-    # YOLO confidence threshold (only for SAM2)
-    if st.session_state.params['sam_model_type'].startswith('sam2'):
+    is_sam2 = st.session_state.params['sam_model_type'].startswith('sam2')
+    if is_sam2:
+        st.sidebar.markdown("### YOLO (Open-Vocab) Model")
+        if yolo_models:
+            current_yolo = st.session_state.params.get('yolo_model_path')
+            yolo_index = yolo_models.index(current_yolo) if current_yolo in yolo_models else 0
+            st.session_state.params['yolo_model_path'] = st.sidebar.selectbox(
+                "YOLO Model",
+                options=yolo_models,
+                index=yolo_index,
+                help="Discovered from models directory."
+            )
+        else:
+            st.session_state.params['yolo_model_path'] = None
+            st.sidebar.warning("⚠️ No YOLO models found in models directory.")
+
         st.session_state.params['yolo_conf_threshold'] = st.sidebar.slider(
             "YOLO Confidence Threshold",
             0.0, 1.0, 0.25, 0.05,
@@ -947,9 +991,22 @@ def main():
         )
         st.sidebar.info("💡 SAM2 uses YOLO-World for detection, then SAM2 for segmentation")
     else:
+        st.session_state.params['yolo_model_path'] = None
         st.sidebar.info("💡 SAM3 uses direct text prompts for open-vocabulary segmentation")
     
-    st.sidebar.caption("ℹ️ Confidence scores are shown for reference only and not used in further processing")
+    # Compute Device
+    st.sidebar.markdown("### Compute Device")
+    gpu_available = torch.cuda.is_available()
+    st.session_state.params['use_gpu'] = st.sidebar.checkbox(
+        "Use GPU (CUDA)",
+        value=st.session_state.params.get('use_gpu', True) and gpu_available,
+        disabled=not gpu_available,
+        help="Enable CUDA acceleration for SAM/YOLO when available."
+    )
+    if gpu_available:
+        st.sidebar.caption("CUDA available")
+    else:
+        st.sidebar.caption("CUDA not available, using CPU")
     
     # Main controls
     col1, col2 = st.columns(2)
@@ -1328,7 +1385,8 @@ def main():
                             class_names=class_names,
                             sam_model_type=st.session_state.params['sam_model_type'],
                             yolo_model_path=st.session_state.params.get('yolo_model_path', None),
-                            conf_threshold=st.session_state.params.get('yolo_conf_threshold', 0.25)
+                            conf_threshold=st.session_state.params.get('yolo_conf_threshold', 0.25),
+                            use_gpu=st.session_state.params.get('use_gpu', True)
                         )
                         st.session_state.pipeline_state['step_3'] = {
                             'completed': True,
@@ -1787,8 +1845,7 @@ def main():
         
         if step_5_state.get('error'):
             st.error(f"❌ Error: {step_5_state['error']}")
-
-
+            
+            
 if __name__ == "__main__":
     main()
-

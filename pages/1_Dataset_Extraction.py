@@ -57,6 +57,8 @@ def main():
         value="",
         help="Enter the root directory path of your dataset"
     )
+    if dataset_path:
+        dataset_path = str(Path(dataset_path).expanduser().resolve(strict=False))
 
     # Output directory for saving processed samples (images + LiDAR)
     if "output_root_dir" not in st.session_state:
