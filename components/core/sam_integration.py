@@ -191,7 +191,31 @@ class SAMIntegration:
             if results and len(results) > 0:
                 result = results[0]
                 if result.masks is not None and len(result.masks) > 0:
-                    mask = result.masks[0].cpu().numpy()
+                    mask_obj = result.masks
+                    
+                    # Masks is a wrapper class; get underlying tensor/ndarray
+                    if hasattr(mask_obj, "data"):
+                        mask_tensor = mask_obj.data
+                        if hasattr(mask_tensor, "cpu"):
+                            masks_np = mask_tensor.cpu().numpy()
+                        elif hasattr(mask_tensor, "numpy"):
+                            masks_np = mask_tensor.numpy()
+                        else:
+                            masks_np = np.array(mask_tensor)
+                    else:
+                        masks_np = mask_obj.numpy() if hasattr(mask_obj, "numpy") else mask_obj.cpu().numpy()
+                    
+                    # Handle different possible shapes and take the first mask
+                    if masks_np.ndim == 2:
+                        mask = masks_np
+                    elif masks_np.ndim == 3:
+                        mask = masks_np[0]
+                    elif masks_np.ndim == 4:
+                        mask = masks_np[0, 0]
+                    else:
+                        h, w = image.shape[:2]
+                        return np.zeros((h, w), dtype=np.uint8)
+
                     # Validate mask dimensions
                     if mask.size == 0 or mask.ndim < 2:
                         h, w = image.shape[:2]
@@ -356,13 +380,36 @@ class SAMIntegration:
                 if result.masks is not None and len(result.masks) > 0:
                     # Check if result has scores attribute
                     result_scores = None
-                    if hasattr(result, 'scores') and result.scores is not None:
-                        result_scores = result.scores.cpu().numpy() if hasattr(result.scores, 'cpu') else result.scores
-                    elif hasattr(result, 'score') and result.score is not None:
-                        result_scores = result.score.cpu().numpy() if hasattr(result.score, 'cpu') else result.score
-                    
-                    for j, mask in enumerate(result.masks):
-                        mask_np = mask.cpu().numpy()
+                    if hasattr(result, "scores") and result.scores is not None:
+                        result_scores = result.scores.cpu().numpy() if hasattr(result.scores, "cpu") else result.scores
+                    elif hasattr(result, "score") and result.score is not None:
+                        result_scores = result.score.cpu().numpy() if hasattr(result.score, "cpu") else result.score
+
+                    # Convert Masks wrapper to a numpy array
+                    mask_obj = result.masks
+                    if hasattr(mask_obj, "data"):
+                        mask_tensor = mask_obj.data
+                        if hasattr(mask_tensor, "cpu"):
+                            all_masks = mask_tensor.cpu().numpy()
+                        elif hasattr(mask_tensor, "numpy"):
+                            all_masks = mask_tensor.numpy()
+                        else:
+                            all_masks = np.array(mask_tensor)
+                    else:
+                        all_masks = mask_obj.numpy() if hasattr(mask_obj, "numpy") else mask_obj.cpu().numpy()
+
+                    # Normalize to a list of 2D masks
+                    mask_list = []
+                    if all_masks.ndim == 2:
+                        mask_list = [all_masks]
+                    elif all_masks.ndim == 3:
+                        for k in range(all_masks.shape[0]):
+                            mask_list.append(all_masks[k])
+                    elif all_masks.ndim == 4:
+                        for k in range(all_masks.shape[1]):
+                            mask_list.append(all_masks[0, k])
+
+                    for j, mask_np in enumerate(mask_list):
                         # Validate mask dimensions
                         if mask_np.size == 0 or mask_np.ndim < 2:
                             h, w = image.shape[:2]
@@ -629,6 +676,57 @@ class SAMIntegration:
             return self._segment_by_class_names_sam2(image, class_names, yolo_model_path, conf_threshold)
         else:
             raise RuntimeError(f"segment_by_class_names not supported for model type: {self.model_type}")
+
+    def export_segmentation_results(
+        self,
+        masks: List[np.ndarray],
+        bboxes: Optional[List[List[float]]] = None,
+        class_names: Optional[List[str]] = None,
+        confidences: Optional[List[Optional[float]]] = None,
+    ) -> Dict:
+        """
+        Export segmentation results in a unified dictionary format.
+
+        This helper mirrors the output structure of segment_by_class_names so
+        callers can easily serialize or post-process results regardless of
+        how the masks were produced (SAM2, SAM3, or external pipelines).
+        """
+        num_masks = len(masks)
+
+        # Derive bounding boxes from masks if not provided
+        if bboxes is None:
+            bboxes = [get_bbox_from_mask(m) for m in masks]
+        else:
+            # Ensure length consistency
+            if len(bboxes) < num_masks:
+                bboxes = bboxes + [get_bbox_from_mask(m) for m in masks[len(bboxes):]]
+            elif len(bboxes) > num_masks:
+                bboxes = bboxes[:num_masks]
+
+        # Normalize class names
+        if class_names is None:
+            class_names = ["object"] * num_masks
+        else:
+            if len(class_names) < num_masks:
+                class_names = class_names + ["object"] * (num_masks - len(class_names))
+            elif len(class_names) > num_masks:
+                class_names = class_names[:num_masks]
+
+        # Normalize confidences
+        if confidences is None:
+            confidences = [None] * num_masks
+        else:
+            if len(confidences) < num_masks:
+                confidences = confidences + [None] * (num_masks - len(confidences))
+            elif len(confidences) > num_masks:
+                confidences = confidences[:num_masks]
+
+        return {
+            "masks": masks,
+            "bboxes": bboxes,
+            "class_names": class_names,
+            "confidences": confidences,
+        }
     
     def _segment_by_class_names_sam3(self, image: np.ndarray, class_names: List[str]) -> Dict:
         """
