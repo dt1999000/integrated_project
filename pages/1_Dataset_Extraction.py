@@ -131,6 +131,8 @@ def main():
                                         'image': image,
                                         'point_cloud': point_cloud
                                     }
+                                    # Ensure single-sample mode on Detection page
+                                    st.session_state.process_all_samples = False
                                     st.success(f"✅ Sample {sample_index} loaded successfully!")
                                     st.rerun()
                                 else:
@@ -382,6 +384,8 @@ def main():
                                 'image': image,
                                 'point_cloud': point_cloud
                             }
+                            # Ensure single-sample mode on Detection page
+                            st.session_state.process_all_samples = False
                             st.success(f"✅ Sample {sample_token} loaded successfully!")
                             st.rerun()
                         else:
@@ -914,7 +918,6 @@ def main():
                         except Exception as e:
                             st.error(f"Failed to extract filtered frames: {e}")
                             frames = []
-                    print(f'frames={frames}, stats={stats}')
                     if frames:
                         batch_samples = []
                         for f in frames:
@@ -940,6 +943,89 @@ def main():
                         st.rerun()
             else:
                 st.info("Click **Process bag (filter frames)** to create a filtered frame list.")
+
+            # After a rosbag extraction: show saved images and let user pick one sample to load (like KITTI/nuScenes)
+            if st.session_state.get("batch_samples_saved") and st.session_state.get("batch_samples"):
+                _batch = st.session_state.batch_samples
+                if _batch and all(s.get("dataset_type") == "rosbag" for s in _batch):
+                    st.markdown("---")
+                    st.subheader("📷 Extracted samples")
+                    st.info(
+                        f"**{len(_batch)}** samples were saved. "
+                        "Choose one below to load for the **2_Detection** tab and check image–LiDAR fusion."
+                    )
+                    # Thumbnail grid (first 24 in 4 columns)
+                    n_show = min(24, len(_batch))
+                    cols = st.columns(4)
+                    for i in range(n_show):
+                        with cols[i % 4]:
+                            img_path = _batch[i].get("image_path") or ""
+                            if img_path and Path(img_path).exists():
+                                img = cv2.imread(img_path)
+                                if img is not None:
+                                    st.image(
+                                        cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+                                        caption=f"Frame {_batch[i]['sample_index']}",
+                                    )
+                    if len(_batch) > n_show:
+                        st.caption(f"Showing first {n_show} of {len(_batch)}. Use the selector below to load any sample.")
+                    selected_idx = st.selectbox(
+                        "Choose sample to load for Detection tab",
+                        options=list(range(len(_batch))),
+                        format_func=lambda i, b=_batch: f"Frame {b[i]['sample_index']}",
+                        key="rosbag_extracted_sample_selector",
+                    )
+                    if st.button("🔄 Load this sample for Detection", key="rosbag_load_one_sample"):
+                        with st.spinner("Loading sample..."):
+                            meta, image, pc = load_dataset_sample(
+                                dataset_path=_batch[selected_idx]["dataset_path"],
+                                sample_index=_batch[selected_idx]["sample_index"],
+                                dataset_type="rosbag",
+                                filter_forward_only=False,
+                            )
+                        if meta is not None and image is not None and pc is not None:
+                            st.session_state.sample = {
+                                "sample_meta_data": meta,
+                                "image": image,
+                                "point_cloud": pc,
+                            }
+                            # Ensure single-sample mode on Detection page
+                            st.session_state.process_all_samples = False
+                            st.success("✅ Sample loaded. Go to **2_Detection** to run the pipeline and check fusion.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to load sample. Check that image and point cloud files exist in the extracted folder.")
+                    # Show calibration matrices from extracted calib.npz for debugging fusion
+                    calib_path = Path(_batch[0]["dataset_path"]) / "calib.npz"
+                    if calib_path.exists():
+                        with st.expander("📐 Calibration (calib.npz) — inspect for fusion issues"):
+                            try:
+                                calib = np.load(str(calib_path), allow_pickle=True)
+                                camera_intrinsic = calib.get("camera_intrinsic")
+                                camera_to_lidar = calib.get("camera_to_lidar")
+                                camera_frame = calib.get("camera_frame", None)
+                                lidar_frame = calib.get("lidar_frame", None)
+                                if camera_frame is not None and hasattr(camera_frame, "item"):
+                                    camera_frame = camera_frame.item()
+                                if lidar_frame is not None and hasattr(lidar_frame, "item"):
+                                    lidar_frame = lidar_frame.item()
+                                st.markdown("**Frames**")
+                                st.text(f"camera_frame: {camera_frame}\nlidar_frame: {lidar_frame}")
+                                st.markdown("**Camera intrinsic (3×3)** — maps camera 3D to image (u,v)")
+                                if camera_intrinsic is not None:
+                                    st.dataframe(np.asarray(camera_intrinsic).round(4))
+                                else:
+                                    st.warning("Missing")
+                                st.markdown("**Camera → LiDAR transform (4×4)** — transforms points from camera to LiDAR frame")
+                                if camera_to_lidar is not None:
+                                    st.dataframe(np.asarray(camera_to_lidar).round(4))
+                                else:
+                                    st.warning("Missing")
+                            except Exception as e:
+                                st.error(f"Could not load calib.npz: {e}")
+                    else:
+                        with st.expander("📐 Calibration (calib.npz)"):
+                            st.warning(f"No calib.npz found at {calib_path}. Fusion may use identity matrices.")
 
         elif dataset_type == "sim":
             # sim/LinkedDataHandler: Filter images and create batch selection
@@ -1149,7 +1235,7 @@ def main():
                                         else:
                                             thumbnail = image
                                         
-                                        st.image(thumbnail, use_container_width=True)
+                                        st.image(thumbnail)
                                         
                                         # Display metrics
                                         st.caption(f"**Token:** {link_token[:12]}...")
@@ -1179,6 +1265,8 @@ def main():
                                                 'image': image,
                                                 'point_cloud': point_cloud
                                             }
+                                            # Ensure single-sample mode on Detection page
+                                            st.session_state.process_all_samples = False
                                             st.success(f"✅ Sample {selected_sample['link_token']} loaded successfully!")
                                             st.rerun()
                                         else:
@@ -1223,7 +1311,7 @@ def main():
         
         with col1:
             st.markdown("**Image Preview**")
-            st.image(image, use_container_width=True)
+            st.image(image)
             st.caption(f"Image shape: {image.shape}")
         
         with col2:
@@ -1272,7 +1360,7 @@ def main():
                             color_by_depth=False,
                             title="Point Cloud (After Ground Removal)"
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig)
                         st.success(f"✅ Point cloud visualized successfully! {len(point_cloud_ground_removed):,} points remaining after ground removal.")
                     else:
                         st.warning("⚠️ Point cloud is empty after ground removal. Try adjusting the parameters.")

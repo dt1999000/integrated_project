@@ -954,9 +954,9 @@ def main():
     # Main controls
     col1, col2 = st.columns(2)
     with col1:
-        run_full = st.button("🚀 Run Full Pipeline", type="primary", use_container_width=True)
+        run_full = st.button("🚀 Run Full Pipeline", type="primary")
     with col2:
-        reset_pipeline = st.button("🔄 Reset Pipeline", use_container_width=True)
+        reset_pipeline = st.button("🔄 Reset Pipeline")
     
     if reset_pipeline:
         st.session_state.pipeline_state = {
@@ -1183,7 +1183,7 @@ def main():
                     color_by_depth=False,
                     title="Point Cloud After Ground Removal"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig)
         
         if step_1_state.get('error'):
             st.error(f"❌ Error: {step_1_state['error']}")
@@ -1239,7 +1239,7 @@ def main():
                 # 2D Visualizations
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.image(image, caption="Original Image", use_container_width=True)
+                    st.image(image, caption="Original Image")
                 with col2:
                     sparse_depth = result['sparse_depth_map']
                     fig, ax = plt.subplots(figsize=(8, 6))
@@ -1400,7 +1400,7 @@ def main():
                             'BBox': f"[{bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f}]" if bbox and len(bbox) == 4 else "N/A"
                         })
                     df_detections = pd.DataFrame(detection_data)
-                    st.dataframe(df_detections, use_container_width=True)
+                    st.dataframe(df_detections)
                 
                 # 3D Visualization: Points assigned to masks
                 st.markdown("#### 3D Point Assignment Visualization")
@@ -1467,7 +1467,7 @@ def main():
                         ),
                         height=600
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig)
                 else:
                     st.warning("No mask assignments to visualize")
         
@@ -1530,7 +1530,7 @@ def main():
                     # Statistics table
                     st.markdown("#### Clustering Statistics")
                     df = pd.DataFrame(result['clustering_results'])
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(df)
                     
                     # 3D Visualization: Clusters
                     st.markdown("#### 3D Cluster Visualization")
@@ -1641,7 +1641,7 @@ def main():
                         ),
                         height=600
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig)
         
         if step_4_state.get('error'):
             st.error(f"❌ Error: {step_4_state['error']}")
@@ -1763,7 +1763,7 @@ def main():
                             'Points': cuboid.get('n_points', 0),
                         })
                     df = pd.DataFrame(cuboid_data)
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(df)
                     
                     # 3D Visualization
                     step_1_result = st.session_state.pipeline_state['step_1']['result']
@@ -1783,7 +1783,7 @@ def main():
                     )
                     if result['detected_cuboids']:
                         add_cuboids_to_figure(fig, result['detected_cuboids'], color='red', opacity=0.3, name_prefix="Detected: ")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig)
         
         if step_5_state.get('error'):
             st.error(f"❌ Error: {step_5_state['error']}")

@@ -19,6 +19,7 @@ import numpy as np
 import yaml
 import re
 from scipy.spatial.transform import Rotation as R
+import open3d as o3d
 
 from components.core.filter import image_passes_quality_filters
 
@@ -251,8 +252,8 @@ def _build_tf_adjacency(reader, tf_topics: Iterable[str]) -> Dict[str, Dict[str,
             if not parent or not child:
                 continue
             T_parent_child = _transform_to_matrix(t.transform)
-            adj.setdefault(parent, {})[child] = T_parent_child
-            adj.setdefault(child, {})[parent] = np.linalg.inv(T_parent_child)
+            adj.setdefault(parent, {})[child] = np.linalg.inv(T_parent_child)
+            adj.setdefault(child, {})[parent] = T_parent_child
     return adj
 
 
@@ -264,7 +265,7 @@ def _find_transform(
     Returns 4x4 matrix T such that X_target = T @ X_source.
     """
     from collections import deque
-
+    print(f'source_frame={source_frame}, target_frame={target_frame}')
     if source_frame == target_frame:
         return np.eye(4, dtype=np.float64)
 
@@ -350,19 +351,19 @@ def compute_rosbag_calibration(
                 if header is not None and getattr(header, "frame_id", ""):
                     lidar_frame = header.frame_id
                     break
-
+    print(f'camera_frame={camera_frame}, lidar_frame={lidar_frame}')
     if camera_frame is None or lidar_frame is None:
         return RosbagCalibration(camera_intrinsic, None, camera_frame, lidar_frame)
 
     # Second pass: TF tree for extrinsics
     with open_reader(bag_path) as reader:
         adj = _build_tf_adjacency(reader, tf_topics)
-
+    print(f'adj={adj}')
     if not adj:
         return RosbagCalibration(camera_intrinsic, None, camera_frame, lidar_frame)
 
     T_cam_lidar = _find_transform(adj, camera_frame, lidar_frame)
-
+    print(f'T_cam_lidar={T_cam_lidar}')
     return RosbagCalibration(camera_intrinsic, T_cam_lidar, camera_frame, lidar_frame)
 
 # -----------------------------------------------------------------------------
@@ -467,17 +468,17 @@ def extract_bag_to_folder(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Extract images (and optionally point clouds) from a ROS bag.
-
+    
     If accepted_timestamps_ns is provided, ONLY those timestamps are exported and
     no internal quality filtering is applied. This is intended to be used after
     a prior filtering pass (e.g. via filter_rosbag_frames).
-
+    
     The output layout is:
         out_dir/
           image_2/    000000.png, 000001.png, ...
-          velodyne/   000000.bin, 000001.bin, ...
+          velodyne/   000000.pcd, 000001.pcd, ...   (PCD: XYZ)
           calib.npz   camera_intrinsic, camera_to_lidar, camera_frame, lidar_frame
-
+    
     Returns:
         frames: list of {
             "frame_index": int,
@@ -490,6 +491,7 @@ def extract_bag_to_folder(
     if not HAS_ROSBAGS:
         raise RuntimeError("rosbags is required. Install with: pip install rosbags")
 
+    print(f'image_topic={image_topic}, pointcloud_topic={pointcloud_topic}')
     bag_path = Path(bag_path)
     out_dir = Path(out_dir)
     out_images = out_dir / "image_2"
@@ -620,7 +622,6 @@ def extract_bag_to_folder(
 
     with open_reader(bag_path) as reader:
         pc_conns = [c for c in reader.connections if c.topic == pointcloud_topic]
-        print(f'pc_conns={pc_conns}')
         if not pc_conns:
             return frames, stats
 
@@ -651,8 +652,19 @@ def extract_bag_to_folder(
                 assigned[fi] = (ts_ns, xyz)
 
     for fi, (_, xyz) in assigned.items():
-        pc_path = out_velodyne / f"{fi:06d}.bin"
-        xyz.astype(np.float32).tofile(str(pc_path))
+        # Save each point cloud as a PCD file (XYZ only).
+        # This format is widely supported (e.g., Open3D, PCL, CVAT).
+        pc_path = out_velodyne / f"{fi:06d}.pcd"
+        try:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float32))
+            # Use ASCII for maximum interoperability; change to write_ascii=False
+            # if binary PCD is preferred.
+            o3d.io.write_point_cloud(str(pc_path), pcd, write_ascii=True)
+        except Exception as e:
+            print(f"[rosbag_extractor] Failed to write PCD file {pc_path}: {e}")
+            continue
+
         for f in frames:
             if f["frame_index"] == fi:
                 f["pointcloud_path"] = str(pc_path)

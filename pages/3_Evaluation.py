@@ -129,7 +129,7 @@ def main():
             df_matching = pd.DataFrame(matching_results)
             df_matching['3D IoU'] = df_matching['3D IoU'].apply(lambda x: f"{x:.3f}")
             df_matching['2D IoU'] = df_matching['2D IoU'].apply(lambda x: f"{x:.3f}" if x is not None else "N/A")
-            st.dataframe(df_matching, use_container_width=True)
+            st.dataframe(df_matching)
     
     # 2D Visualization
     st.subheader("📷 2D Visualization")
@@ -137,19 +137,19 @@ def main():
     
     # Show image with ground truth boxes
     img_with_gt = draw_2d_boxes_on_image(image.copy(), ground_truth_boxes)
-    st.image(img_with_gt, caption="Image with Ground Truth Boxes", use_container_width=True)
+    st.image(img_with_gt, caption="Image with Ground Truth Boxes")
     
     # Show reprojected cuboid bboxes if available
     if detected_cuboids:
         st.subheader("📐 Reprojected Cuboid Bounding Boxes")
         img_proj = draw_projected_cuboid_bboxes(image.copy(), detected_cuboids, ground_truth_boxes)
-        st.image(img_proj, caption="Reprojected 3D Cuboids to 2D", use_container_width=True)
+        st.image(img_proj, caption="Reprojected 3D Cuboids to 2D")
     
     # 3D Comparison Visualization
     if point_cloud_obj:
         st.subheader("🎯 3D Comparison Visualization")
         fig_unified = create_comparison_plot(point_cloud_obj, ground_truth_boxes, detected_cuboids)
-        st.plotly_chart(fig_unified, use_container_width=True)
+        st.plotly_chart(fig_unified)
 
 
 if __name__ == "__main__":

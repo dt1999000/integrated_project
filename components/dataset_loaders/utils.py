@@ -419,11 +419,11 @@ def _load_rosbag_sample(
 ) -> Tuple[Optional[Dict], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Load a sample that was extracted from a ROS bag into a KITTI-like folder.
-
+    
     Expected layout (produced by rosbag_extractor.extract_bag_to_folder):
         dataset_path/
           image_2/    000000.png, 000001.png, ...
-          velodyne/   000000.bin, 000001.bin, ...
+          velodyne/   000000.pcd, 000001.pcd, ... or 000000.bin (legacy)
           calib.npz   camera_intrinsic, camera_to_lidar, camera_frame, lidar_frame
     """
     try:
@@ -431,11 +431,12 @@ def _load_rosbag_sample(
         image_dir = root / "image_2"
         velodyne_dir = root / "velodyne"
         calib_path = root / "calib.npz"
-
+        
         img_path = image_dir / f"{int(sample_index):06d}.png"
-        pc_path = velodyne_dir / f"{int(sample_index):06d}.bin"
-
-        if not img_path.exists() or not pc_path.exists():
+        pcd_path = velodyne_dir / f"{int(sample_index):06d}.pcd"
+        bin_path = velodyne_dir / f"{int(sample_index):06d}.bin"
+        
+        if not img_path.exists() or (not pcd_path.exists() and not bin_path.exists()):
             print(f"Error: ROS bag extracted sample {sample_index} not found in {dataset_path}")
             return None, None, None
 
@@ -445,13 +446,34 @@ def _load_rosbag_sample(
             print(f"Error: Could not read image {img_path}")
             return None, None, None
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-
-        # Load point cloud (float32 XYZ)
-        pc_raw = np.fromfile(str(pc_path), dtype=np.float32)
-        if pc_raw.size % 3 != 0:
-            print(f"Error: Unexpected point cloud size in {pc_path}")
+        
+        # Load point cloud (prefer PCD, fall back to legacy BIN)
+        point_cloud = None
+        pc_path_str: Optional[str] = None
+        
+        if pcd_path.exists():
+            try:
+                import open3d as o3d
+                pcd = o3d.io.read_point_cloud(str(pcd_path))
+                pts = np.asarray(pcd.points)
+                if pts.size == 0:
+                    print(f"Error: PCD file {pcd_path} contains no points")
+                    return None, None, None
+                point_cloud = pts.astype(np.float32)
+                pc_path_str = str(pcd_path)
+            except Exception as e:
+                print(f"Error: Failed to read PCD file {pcd_path}: {e}")
+                return None, None, None
+        elif bin_path.exists():
+            pc_raw = np.fromfile(str(bin_path), dtype=np.float32)
+            if pc_raw.size % 3 != 0:
+                print(f"Error: Unexpected point cloud size in {bin_path}")
+                return None, None, None
+            point_cloud = pc_raw.reshape(-1, 3)
+            pc_path_str = str(bin_path)
+        else:
+            print(f"Error: No point cloud file found for sample {sample_index} in {velodyne_dir}")
             return None, None, None
-        point_cloud = pc_raw.reshape(-1, 3)
 
         # Load calibration if present
         if calib_path.exists():
@@ -464,7 +486,7 @@ def _load_rosbag_sample(
 
         sample_meta_data = {
             "image_path": str(img_path),
-            "point_cloud_path": str(pc_path),
+            "point_cloud_path": pc_path_str,
             "camera_intrinsic": camera_intrinsic,
             "camera_extrinsic": np.eye(4, dtype=np.float64),
             "camera_to_lidar_transform": camera_to_lidar,
