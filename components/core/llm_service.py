@@ -3,12 +3,10 @@ LLM Service for Object Dimension Estimation
 
 Uses Hugging Face transformers to query an LLM for typical object dimensions
 when the class name is not in the predefined templates.
-Also uses sentence transformers for semantic similarity matching.
 """
 
 from typing import Tuple, Optional, Dict, List
 import re
-import numpy as np
 
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -17,13 +15,6 @@ try:
 except ImportError:
     HF_AVAILABLE = False
     print("Warning: transformers library not available. Install with: pip install transformers torch")
-
-try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
-    print("Warning: sentence-transformers library not available. Install with: pip install sentence-transformers")
 
 # Import KITTI templates from constants
 try:
@@ -46,8 +37,6 @@ except ImportError:
 # Global model cache to avoid reloading
 _model_cache = None
 _tokenizer_cache = None
-_sentence_model_cache = None
-_template_embeddings_cache = None
 
 # Global LLM temperature setting (default: 0.3)
 _llm_temperature = 0.3
@@ -104,68 +93,10 @@ def _get_llm_model():
     return _model_cache, _tokenizer_cache
 
 
-def _get_sentence_model():
-    """Get or initialize the sentence transformer model (cached)"""
-    global _sentence_model_cache
-    
-    if not SENTENCE_TRANSFORMERS_AVAILABLE:
-        return None
-    
-    if _sentence_model_cache is None:
-        try:
-            # Use a lightweight sentence transformer model for semantic similarity
-            model_name = "all-MiniLM-L6-v2"
-            print(f"[LLM Service] Loading sentence transformer model: {model_name}...")
-            _sentence_model_cache = SentenceTransformer(model_name)
-            print(f"[LLM Service] Sentence transformer model loaded successfully")
-            print(f"[LLM Service] Model device: {_sentence_model_cache.device}")
-            
-            # Pre-compute embeddings for all template class names
-            _precompute_template_embeddings()
-        except Exception as e:
-            print(f"[LLM Service] Failed to load sentence transformer model: {e}")
-            return None
-    
-    return _sentence_model_cache
-
-
-def _precompute_template_embeddings():
-    """Pre-compute embeddings for all KITTI template class names"""
-    global _template_embeddings_cache
-    
-    if _sentence_model_cache is None:
-        return
-    
-    try:
-        print(f"[LLM Service] Pre-computing embeddings for {len(KITTI_CUBOID_TEMPLATES)} template classes...")
-        template_names = list(KITTI_CUBOID_TEMPLATES.keys())
-        _template_embeddings_cache = _sentence_model_cache.encode(
-            template_names,
-            convert_to_numpy=True,
-            show_progress_bar=False
-        )
-        print(f"[LLM Service] Template embeddings computed successfully")
-        print(f"[LLM Service] Embedding shape: {_template_embeddings_cache.shape}")
-    except Exception as e:
-        print(f"[LLM Service] Failed to pre-compute template embeddings: {e}")
-        _template_embeddings_cache = None
-
-
-def _cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    """Compute cosine similarity between two vectors"""
-    dot_product = np.dot(vec1, vec2)
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    return dot_product / (norm1 * norm2)
-
-
 def get_default_dimensions(class_name: Optional[str]) -> Tuple[float, float, float]:
     """
     Get default dimensions for a class name from KITTI_CUBOID_TEMPLATES.
     
-    Uses semantic similarity to find the most similar class name if exact match fails.
     Returns dimensions as a tuple.
     
     Args:
@@ -191,57 +122,6 @@ def get_default_dimensions(class_name: Optional[str]) -> Tuple[float, float, flo
         if key.lower() == class_lower:
             print(f"[LLM Service] Found case-insensitive match: '{class_name}' -> '{key}'")
             return (float(value['length']), float(value['width']), float(value['height']))
-    
-    # Try semantic similarity using sentence transformers
-    if SENTENCE_TRANSFORMERS_AVAILABLE:
-        print(f"[LLM Service] Attempting semantic similarity search for '{class_name}'...")
-        sentence_model = _get_sentence_model()
-        if sentence_model is None:
-            print(f"[LLM Service] Sentence transformer model not available")
-        elif _template_embeddings_cache is None:
-            print(f"[LLM Service] Template embeddings not pre-computed, computing now...")
-            _precompute_template_embeddings()
-        
-        if sentence_model is not None and _template_embeddings_cache is not None:
-            try:
-                # Encode the input class name
-                print(f"[LLM Service] Encoding query: '{class_name}'")
-                query_embedding = sentence_model.encode([class_name], convert_to_numpy=True)[0]
-                print(f"[LLM Service] Query embedding shape: {query_embedding.shape}")
-                
-                # Compute cosine similarity with all template embeddings
-                similarities = []
-                template_names = list(KITTI_CUBOID_TEMPLATES.keys())
-                print(f"[LLM Service] Computing similarities with {len(template_names)} templates...")
-                for i, template_name in enumerate(template_names):
-                    similarity = _cosine_similarity(query_embedding, _template_embeddings_cache[i])
-                    similarities.append((similarity, template_name))
-                
-                # Sort by similarity (highest first)
-                similarities.sort(reverse=True, key=lambda x: x[0])
-                
-                best_similarity, best_match = similarities[0]
-                print(f"[LLM Service] Semantic similarity search for '{class_name}':")
-                print(f"[LLM Service]   Best match: '{best_match}' (similarity: {best_similarity:.4f})")
-                
-                # Show top 3 matches for debugging
-                for i, (sim, name) in enumerate(similarities[:3]):
-                    print(f"[LLM Service]   Top {i+1}: '{name}' (similarity: {sim:.4f})")
-                
-                # Use template if similarity is very high (threshold: 0.75)
-                if best_similarity >= 0.75:
-                    template = KITTI_CUBOID_TEMPLATES.get(best_match)
-                    if template is not None:
-                        print(f"[LLM Service] Using template dimensions for '{best_match}' (similarity: {best_similarity:.4f})")
-                        return (float(template['length']), float(template['width']), float(template['height']))
-                else:
-                    print(f"[LLM Service] Similarity too low ({best_similarity:.4f} < 0.75), will query LLM")
-            except Exception as e:
-                print(f"[LLM Service] Error in semantic similarity search: {e}")
-                import traceback
-                traceback.print_exc()
-    else:
-        print(f"[LLM Service] Sentence transformers not available (SENTENCE_TRANSFORMERS_AVAILABLE={SENTENCE_TRANSFORMERS_AVAILABLE})")
     
     # Fallback to Unknown template
     template = KITTI_CUBOID_TEMPLATES.get('Unknown', {'length': 2.0, 'width': 1.5, 'height': 1.5})

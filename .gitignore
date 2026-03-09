@@ -19,6 +19,7 @@ __pycache__/
 *.eps
 nul
 
+.agents
 .vscode
 .claude
 .cursor
@@ -36,3 +37,4 @@ POINTCLOUD_EXTENSION_PLAN.md
 
 output/
 *.ts
+runs

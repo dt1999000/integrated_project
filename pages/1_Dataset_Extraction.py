@@ -1251,28 +1251,29 @@ def main():
                                 
                                 # Handle selection
                                 if selected_sample_idx is not None:
-                                    selected_sample = filtered_batch[selected_sample_idx]
-                                    
-                                    # Load the full sample data
-                                    with st.spinner(f"Loading sample {selected_sample['link_token']}..."):
-                                        sample_meta_data, image, point_cloud = load_dataset_sample(
-                                            dataset_path=dataset_path,
-                                            sample_index=selected_sample['link_token'],
-                                            dataset_type=dataset_type
-                                        )
+                                    if st.button('Load selected sample for detection', key='load_selected_sample_for_detection'):
+                                        st.session_state.process_all_samples = False
+                                        selected_sample = filtered_batch[selected_sample_idx]
                                         
-                                        if sample_meta_data and image is not None and point_cloud is not None:
-                                            st.session_state.sample = {
-                                                'sample_meta_data': sample_meta_data,
-                                                'image': image,
-                                                'point_cloud': point_cloud
-                                            }
-                                            # Ensure single-sample mode on Detection page
-                                            st.session_state.process_all_samples = False
-                                            st.success(f"✅ Sample {selected_sample['link_token']} loaded successfully!")
-                                            st.rerun()
-                                        else:
-                                            st.error("❌ Failed to load selected sample")
+                                        # Load the full sample data
+                                        with st.spinner(f"Loading sample {selected_sample['link_token']}..."):
+                                            sample_meta_data, image, point_cloud = load_dataset_sample(
+                                                dataset_path=dataset_path,
+                                                sample_index=selected_sample['link_token'],
+                                                dataset_type=dataset_type
+                                            )
+                                            
+                                            if sample_meta_data and image is not None and point_cloud is not None:
+                                                st.session_state.sample = {
+                                                    'sample_meta_data': sample_meta_data,
+                                                    'image': image,
+                                                    'point_cloud': point_cloud
+                                                }
+                                                st.success(f"✅ Sample {selected_sample['link_token']} loaded successfully!")
+                                                st.rerun()
+                                            else:
+                                                st.error("❌ Failed to load selected sample")
+                                        
                                 # Load entire batch for detection (process all on 2_Detection)
                                 if st.button("📚 Load all filtered samples for detection", key="load_all_sim_for_detection"):
                                     batch_samples = []
@@ -1300,85 +1301,6 @@ def main():
                 import traceback
                 st.code(traceback.format_exc())
     
-    # Display loaded sample
-    if st.session_state.sample is not None:
-        st.subheader("📊 Loaded Sample Preview")
-        
-        sample = st.session_state.sample
-        sample_meta_data = sample['sample_meta_data']
-        image = sample['image']
-        point_cloud = sample['point_cloud']
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**Image Preview**")
-            st.image(image)
-            st.caption(f"Image shape: {image.shape}")
-        
-        with col2:
-            st.markdown("**Point Cloud Info**")
-            st.metric("Number of Points", f"{len(point_cloud):,}")
-            if len(point_cloud) > 0:
-                st.caption(f"X range: [{point_cloud[:, 0].min():.2f}, {point_cloud[:, 0].max():.2f}]")
-                st.caption(f"Y range: [{point_cloud[:, 1].min():.2f}, {point_cloud[:, 1].max():.2f}]")
-                st.caption(f"Z range: [{point_cloud[:, 2].min():.2f}, {point_cloud[:, 2].max():.2f}]")
-        
-        # Point cloud visualization with ground removal
-        st.markdown("---")
-        st.subheader("📊 Point Cloud Visualization")
-        
-        if len(point_cloud) > 0:
-            try:
-                # Apply ground removal
-                with st.spinner("Removing ground plane..."):
-                    point_cloud_obj = PointCloud(point_cloud)
-                    
-                    # Get ground-removed points
-                    point_cloud_ground_removed = point_cloud_obj.original_point_cloud
-                    
-                    # Display statistics
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Original Points", f"{len(point_cloud):,}")
-                    with col2:
-                        st.metric("After Ground Removal", f"{len(point_cloud_ground_removed):,}")
-                    with col3:
-                        reduction_pct = (1 - len(point_cloud_ground_removed) / len(point_cloud)) * 100
-                        st.metric("Reduction", f"{reduction_pct:.1f}%")
-                    
-                    if len(point_cloud_ground_removed) > 0:
-                        # Visualize ground-removed point cloud
-                        fig = create_3d_scatter_plot(
-                            points=point_cloud_ground_removed,
-                            labels=None,
-                            mask_points=None,
-                            cuboids=None,
-                            rays=None,
-                            points_in_frustums=None,
-                            reconstructed_points=None,
-                            show_lidar=True,
-                            show_reconstructed=False,
-                            color_by_depth=False,
-                            title="Point Cloud (After Ground Removal)"
-                        )
-                        st.plotly_chart(fig)
-                        st.success(f"✅ Point cloud visualized successfully! {len(point_cloud_ground_removed):,} points remaining after ground removal.")
-                    else:
-                        st.warning("⚠️ Point cloud is empty after ground removal. Try adjusting the parameters.")
-                        
-            except Exception as e:
-                st.error(f"❌ Error processing point cloud: {str(e)}")
-                import traceback
-                st.code(traceback.format_exc())
-        else:
-            st.warning("⚠️ Point cloud is empty")
-        
-        # Sample metadata
-        with st.expander("Sample Metadata", expanded=False):
-            st.json(sample_meta_data)
-        
-        st.success("✅ Sample is ready! Navigate to **2_Detection.py** to run the detection pipeline.")
 
 
 def _filter_kitti_images(*args, **kwargs):

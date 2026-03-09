@@ -800,45 +800,6 @@ def main():
     yolo_models = available.get("yolo", [])
     st.session_state.available_models = available
 
-    # Batch mode: moved below sidebar so user can set params first
-    batch_samples = st.session_state.get("batch_samples", [])
-    process_all_samples = st.session_state.get("process_all_samples", False)
-    if batch_samples and process_all_samples:
-        st.subheader("📚 Batch Processing")
-        total = len(batch_samples)
-        st.info(f"Batch loaded: **{total}** samples. Process the entire batch to run detection on all samples.")
-        if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
-            results_list = []
-            progress = st.progress(0.0)
-            for i, sample_desc in enumerate(batch_samples):
-                progress.progress((i + 1) / total)
-                export_res = _run_pipeline_for_batch_sample(
-                    dataset_path=sample_desc["dataset_path"],
-                    dataset_type=sample_desc.get("dataset_type", "kitti"),
-                    sample_index=sample_desc["sample_index"],
-                )
-                if export_res is not None:
-                    results_list.append(export_res)
-            st.session_state.batch_export_results = {"samples": results_list}
-            st.session_state.process_all_samples = False
-            st.success(f"✅ Processed **{len(results_list)}** / {total} samples. Go to **4_Export** to save (e.g. XML).")
-            st.rerun()
-        if st.session_state.get("batch_export_results"):
-            br = st.session_state.batch_export_results
-            n = len(br.get("samples", []))
-            st.success(f"Last batch: **{n}** samples ready for export on **4_Export**.")
-        return
-    
-    # Check if sample is loaded
-    if 'sample' not in st.session_state or st.session_state.sample is None:
-        st.info("👈 Please load a sample from **1_Dataset_Extraction** page first.")
-        return
-    
-    sample = st.session_state.sample
-    sample_meta_data = sample['sample_meta_data']
-    image = sample['image']
-    point_cloud = sample['point_cloud']
-    
     # Sidebar: Parameters
     st.sidebar.header("⚙️ Pipeline Parameters")
     
@@ -1008,6 +969,46 @@ def main():
     else:
         st.sidebar.caption("CUDA not available, using CPU")
     
+    #batch processing
+    batch_samples = st.session_state.get("batch_samples", [])
+    process_all_samples = st.session_state.get("process_all_samples", False)
+    if batch_samples and process_all_samples:
+        st.subheader("📚 Batch Processing")
+        total = len(batch_samples)
+        st.info(f"Batch loaded: **{total}** samples. Process the entire batch to run detection on all samples.")
+        if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
+            results_list = []
+            # Initialize progress bar at 0 and update from 0.0 to 1.0
+            progress = st.progress(0.0)
+            for i, sample_desc in enumerate(batch_samples):
+                progress.progress((i + 1) / total)
+                export_res = _run_pipeline_for_batch_sample(
+                    dataset_path=sample_desc["dataset_path"],
+                    dataset_type=sample_desc.get("dataset_type", "kitti"),
+                    sample_index=sample_desc["sample_index"],
+                )
+                if export_res is not None:
+                    results_list.append(export_res)
+                    print(f"Processed sample {i + 1} of {total}")
+            st.session_state.batch_export_results = {"samples": results_list}
+            st.success(f"✅ Processed **{len(results_list)}** / {total} samples. Go to **3_Export** to save (e.g. XML).")
+            st.rerun()
+        if st.session_state.get("batch_export_results"):
+            br = st.session_state.batch_export_results
+            n = len(br.get("samples", []))
+            st.success(f"Last batch: **{n}** samples ready for export on **3_Export**.")
+        return
+    
+    # Check if sample is loaded
+    if 'sample' not in st.session_state or st.session_state.sample is None:
+        st.info("👈 Please load a sample from **1_Dataset_Extraction** page first.")
+        return
+    
+    sample = st.session_state.sample
+    sample_meta_data = sample['sample_meta_data']
+    image = sample['image']
+    point_cloud = sample['point_cloud']
+    
     # Main controls
     col1, col2 = st.columns(2)
     with col1:
@@ -1066,15 +1067,6 @@ def main():
                         export_results['ground_truth_cuboids'] = ground_truth_cuboids
                         export_results['metadata']['n_ground_truth'] = len(ground_truth_cuboids)
                 st.session_state.export_results = export_results
-
-                # Save processed sample (single-sample mode) to disk
-                current_image = st.session_state.sample.get("image")
-                current_pc = st.session_state.sample.get("point_cloud")
-                save_sample_to_hard_drive_after_processing(
-                    image=current_image,
-                    point_cloud=current_pc,
-                    sample_meta_data=sample_meta_data,
-                )
 
                 # Explore and display what the pipeline returns
                 st.success("✅ Pipeline completed successfully!")
