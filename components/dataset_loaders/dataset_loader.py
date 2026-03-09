@@ -7,6 +7,7 @@ import csv
 import open3d as o3d
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from components.utils.export_utils import Export
 
 
 class Annotation():
@@ -803,6 +804,7 @@ class LinkedDataHandler:
                 "items": []
             }
 
+            items = []
             frame_id = 0
             item_id = 0
             for link in subset["links"]:
@@ -810,30 +812,35 @@ class LinkedDataHandler:
                     "id": link["samples"]["lidar"]["filename"][7:-4],
                     "annotations": [],
                     "attr": {"frame": frame_id},
-                    "point_cloud": {"path": link["samples"]["lidar"]["filename"][7:]}
+                    "point_cloud": {"path": link["samples"]["lidar"]["filename"][7:]},
                 }
                 for i, anno in enumerate(link["samples"]["lidar"]["annotations"]):
                     keyFrame = False
                     if frame_id%keyFrameSteps == 0:
                         keyFrame = True
+                    ann_size = anno["size"]
                     ann = {
                         "id": i,
                         "type": "cuboid_3d",
                         "attributes": {
                             "occluded": anno.get("occluded", False),
                             "track_id": anno.get("track_id", 0),
-                            "keyframe": keyFrame
+                            "keyframe": keyFrame,
                         },
                         "group": 0,
                         "label_id": 0,
-                        "position": anno['translation'],
-                        "rotation": [0,0,0],
-                        "scale": anno['size']
+                        "position": anno["translation"],
+                        "rotation": [0, 0, 0],
+                        "scale": Export.swap_cvat_dimensions(ann_size),
                     }
                     item["annotations"].append(ann)
-                export["items"].append(item)
+                items.append(item)
                 frame_id += 1
                 item_id += 1
+
+            # Reverse frame order for CVAT export to match external tools.
+            export["items"] = Export.reverse_frame_order(items)
+
             with open(str(self.root_dir) + "/" + subset_name + "_cvat.json", "w") as f:
                 f.write(json.dumps(export, indent=2))
 

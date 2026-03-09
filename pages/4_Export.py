@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from components.dataset_loaders.dataset_loader import LinkedDataHandler
+from components.utils.export_utils import Export
 
 
 def _to_serializable(obj: Any) -> Any:
@@ -39,7 +40,8 @@ def _batch_to_tracklet_xml(samples: List[Dict]) -> str:
         '<tracklets version="0" tracking_level="0" class_id="0">',
     ]
     all_items = []
-    for frame_idx, export_res in enumerate(samples):
+    ordered_samples = Export.reverse_frame_order(samples)
+    for frame_idx, export_res in enumerate(ordered_samples):
         cuboids = export_res.get("detected_cuboids", [])
         for c in cuboids:
             center = c.get("center", [0, 0, 0])
@@ -98,6 +100,13 @@ def main():
     
     st.header("💾 Export Results")
 
+    st.subheader("🚗 KITTI format exports")
+    st.caption(
+        "Exports in this section follow KITTI-style conventions. "
+        "Note: **CVAT's KITTI-compatible import currently does not support tracking**; "
+        "for tracked exports use the *Datumaro-style* section below."
+    )
+
     # ------------------------------------------------------------------
     # 1) Batch tracklet XML export (from 2_Detection batch processing)
     # ------------------------------------------------------------------
@@ -126,11 +135,42 @@ def main():
                     st.error(f"Could not save tracklet XML: {e}")
 
         st.markdown("---")
+        
+    # ------------------------------------------------------------------
+    # 4) Datumaro-style export with tracking
+    # ------------------------------------------------------------------
+    st.subheader("📦 Datumaro-style export (with tracking)")
+    st.caption(
+        "Exports batch detections in a Datumaro/CVAT-compatible JSON format that "
+        "includes 3D cuboid tracks (track_id, keyframes, occlusion flags). "
+        "Uses the tracking state built during batch processing on **2_Detection**."
+    )
+
+    tracking_state = st.session_state.get("datumaro_tracking")
+    batch_results_for_tracking = st.session_state.get("batch_export_results")
+
+    if not tracking_state or not batch_results_for_tracking or not batch_results_for_tracking.get("samples"):
+        st.info(
+            "No tracking information found. Run batch processing on **2_Detection** "
+            "with tracking enabled before exporting in Datumaro style."
+        )
+        return
+
+    if st.button("💾 Save Datumaro-style tracking JSON", key="export_datumaro_tracking_json"):
+        export_root = Path(output_root).expanduser()
+        export_root.mkdir(parents=True, exist_ok=True)
+
+        datumaro_json = tracking_state
+        out_file = export_root / "detections_datumaro_tracking.json"
+        out_file.write_text(json.dumps(datumaro_json, indent=2), encoding="utf-8")
+        st.success(f"✅ Saved Datumaro-style tracking annotations to **{out_file}**")
+
+    st.markdown("---")
 
     # ------------------------------------------------------------------
     # 2) Dataset annotations (CVAT) using LinkedDataHandler
     # ------------------------------------------------------------------
-    st.subheader("📤 Export dataset annotations (CVAT)")
+    st.markdown("### 📤 Export dataset annotations (CVAT, KITTI-style)")
     st.markdown(
         "Export all subsets to CVAT-style JSON files (uses `LinkedDataHandler.exportAnnotations`). "
         "The dataset root comes from **1_Dataset_Extraction** (`Dataset Path`)."
@@ -176,7 +216,7 @@ def main():
     # ------------------------------------------------------------------
     # 3) Per-sample detection export (3D cuboids + 2D image annotations)
     # ------------------------------------------------------------------
-    st.subheader("🧊 Export detection results to JSON")
+    st.subheader("🧊 Export detection results to JSON (KITTI-style)")
     st.markdown(
         "Export the last detection result from **2_Detection** as JSON. "
         "3D cuboid annotations and 2D image annotations are saved as separate files."
@@ -213,22 +253,19 @@ def main():
     st.caption("Exports the detected 3D cuboids (and ground-truth cuboids if available) as JSON.")
 
     if st.button("💾 Save 3D cuboids to JSON", key="export_3d_cuboids_json"):
-        try:
-            cuboid_payload: Dict[str, Any] = {
-                "metadata": _to_serializable(meta),
-                "detected_cuboids": _to_serializable(export_results.get("detected_cuboids", [])),
-            }
-            if "ground_truth_cuboids" in export_results:
-                cuboid_payload["ground_truth_cuboids"] = _to_serializable(
-                    export_results.get("ground_truth_cuboids", [])
-                )
+        cuboid_payload: Dict[str, Any] = {
+            "metadata": _to_serializable(meta),
+            "detected_cuboids": _to_serializable(export_results.get("detected_cuboids", [])),
+        }
+        if "ground_truth_cuboids" in export_results:
+            cuboid_payload["ground_truth_cuboids"] = _to_serializable(
+                export_results.get("ground_truth_cuboids", [])
+            )
 
-            fname_3d = f"det3d_{dataset_type}_{sample_index}.json"
-            out_file_3d = out_dir / fname_3d
-            out_file_3d.write_text(json.dumps(cuboid_payload, indent=2), encoding="utf-8")
-            st.success(f"✅ Saved 3D cuboid annotations to **{out_file_3d}**")
-        except Exception as e:
-            st.error(f"Could not save 3D cuboid JSON: {e}")
+        fname_3d = f"det3d_{dataset_type}_{sample_index}.json"
+        out_file_3d = out_dir / fname_3d
+        out_file_3d.write_text(json.dumps(cuboid_payload, indent=2), encoding="utf-8")
+        st.success(f"✅ Saved 3D cuboid annotations to **{out_file_3d}**")
 
     st.markdown("#### 2D image annotations (JSON)")
     st.caption(
@@ -248,38 +285,37 @@ def main():
         return
 
     if st.button("💾 Save 2D image annotations to JSON", key="export_2d_image_json"):
-        try:
-            # Masks are numpy arrays of shape (H, W); convert to lists of ints (0/1) to stay close to original.
-            raw_masks = step_3_result.get("sam_masks", []) or []
-            masks_serializable: List[Any] = []
-            for m in raw_masks:
-                if isinstance(m, np.ndarray):
-                    # Ensure binary int mask for JSON
-                    m_bin = (m > 0).astype(np.uint8)
-                    masks_serializable.append(m_bin.tolist())
-                else:
-                    masks_serializable.append(_to_serializable(m))
+        # Masks are numpy arrays of shape (H, W); convert to lists of ints (0/1) to stay close to original.
+        raw_masks = step_3_result.get("sam_masks", []) or []
+        masks_serializable: List[Any] = []
+        for m in raw_masks:
+            if isinstance(m, np.ndarray):
+                # Ensure binary int mask for JSON
+                m_bin = (m > 0).astype(np.uint8)
+                masks_serializable.append(m_bin.tolist())
+            else:
+                masks_serializable.append(_to_serializable(m))
 
-            image_annotations: Dict[str, Any] = {
-                # Keep key names aligned with the original Step 3 result where possible
-                "masks": masks_serializable,
-                "mask_bboxes": _to_serializable(step_3_result.get("mask_bboxes", [])),
-                "class_names": _to_serializable(step_3_result.get("class_names", [])),
-                "confidences": _to_serializable(step_3_result.get("confidences", [])),
-                "n_masks": _to_serializable(step_3_result.get("n_masks", len(raw_masks))),
-            }
+        image_annotations: Dict[str, Any] = {
+            # Keep key names aligned with the original Step 3 result where possible
+            "masks": masks_serializable,
+            "mask_bboxes": _to_serializable(step_3_result.get("mask_bboxes", [])),
+            "class_names": _to_serializable(step_3_result.get("class_names", [])),
+            "confidences": _to_serializable(step_3_result.get("confidences", [])),
+            "n_masks": _to_serializable(step_3_result.get("n_masks", len(raw_masks))),
+        }
 
-            image_payload: Dict[str, Any] = {
-                "metadata": _to_serializable(meta),
-                "image_annotations": image_annotations,
-            }
+        image_payload: Dict[str, Any] = {
+            "metadata": _to_serializable(meta),
+            "image_annotations": image_annotations,
+        }
 
-            fname_2d = f"det2d_{dataset_type}_{sample_index}.json"
-            out_file_2d = out_dir / fname_2d
-            out_file_2d.write_text(json.dumps(image_payload, indent=2), encoding="utf-8")
-            st.success(f"✅ Saved 2D image annotations to **{out_file_2d}**")
-        except Exception as e:
-            st.error(f"Could not save 2D image annotation JSON: {e}")
+        fname_2d = f"det2d_{dataset_type}_{sample_index}.json"
+        out_file_2d = out_dir / fname_2d
+        out_file_2d.write_text(json.dumps(image_payload, indent=2), encoding="utf-8")
+        st.success(f"✅ Saved 2D image annotations to **{out_file_2d}**")
+
+    st.markdown("---")
 
 
 if __name__ == "__main__":

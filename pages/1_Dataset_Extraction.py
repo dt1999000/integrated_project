@@ -49,7 +49,10 @@ def main():
     # Initialize session state for sample
     if 'sample' not in st.session_state:
         st.session_state.sample = None
-    
+    # Batch mode is False by default; only "Load all ... for detection" sets it to True.
+    if 'process_all_samples' not in st.session_state:
+        st.session_state.process_all_samples = False
+
     # Dataset path input
     st.subheader("Dataset Selection")
     dataset_path = st.text_input(
@@ -971,17 +974,22 @@ def main():
                                     )
                     if len(_batch) > n_show:
                         st.caption(f"Showing first {n_show} of {len(_batch)}. Use the selector below to load any sample.")
+                    # Persist selected index so it survives reruns when Load button is clicked
+                    if "rosbag_selected_sample_idx" not in st.session_state:
+                        st.session_state.rosbag_selected_sample_idx = 0
                     selected_idx = st.selectbox(
                         "Choose sample to load for Detection tab",
                         options=list(range(len(_batch))),
                         format_func=lambda i, b=_batch: f"Frame {b[i]['sample_index']}",
                         key="rosbag_extracted_sample_selector",
                     )
+                    st.session_state.rosbag_selected_sample_idx = selected_idx
+                    load_idx = min(st.session_state.rosbag_selected_sample_idx, len(_batch) - 1) if _batch else 0
                     if st.button("🔄 Load this sample for Detection", key="rosbag_load_one_sample"):
                         with st.spinner("Loading sample..."):
                             meta, image, pc = load_dataset_sample(
-                                dataset_path=_batch[selected_idx]["dataset_path"],
-                                sample_index=_batch[selected_idx]["sample_index"],
+                                dataset_path=_batch[load_idx]["dataset_path"],
+                                sample_index=_batch[load_idx]["sample_index"],
                                 dataset_type="rosbag",
                                 filter_forward_only=False,
                             )
@@ -1212,13 +1220,15 @@ def main():
                             if len(filtered_batch) > 0:
                                 # Display batch as grid with thumbnails
                                 st.markdown("**Select a sample from the filtered batch:**")
-                                
+                                # Persist selected index so it survives reruns (button click triggers new run)
+                                sim_batch_key = f"sim_selected_idx_{selected_subset}"
+                                if sim_batch_key not in st.session_state:
+                                    st.session_state[sim_batch_key] = None
+
                                 # Create selection interface
                                 num_cols = 3
                                 cols = st.columns(num_cols)
-                                
-                                selected_sample_idx = None
-                                
+
                                 for idx, sample_info in enumerate(filtered_batch):
                                     col_idx = idx % num_cols
                                     with cols[col_idx]:
@@ -1226,7 +1236,7 @@ def main():
                                         image = sample_info['image']
                                         link_token = sample_info['link_token']
                                         metrics = sample_info['metrics']
-                                        
+
                                         # Resize for thumbnail
                                         h, w = image.shape[:2]
                                         max_size = 200
@@ -1236,19 +1246,25 @@ def main():
                                             thumbnail = cv2.resize(image, (new_w, new_h))
                                         else:
                                             thumbnail = image
-                                        
+
                                         st.image(thumbnail)
-                                        
+
                                         # Display metrics
                                         st.caption(f"**Token:** {link_token[:12]}...")
                                         st.caption(f"Blur: {metrics.get('blur', 0):.1f}")
                                         st.caption(f"Contrast: {metrics.get('contrast', 0):.3f}")
                                         st.caption(f"Brightness: {metrics.get('brightness', 0):.1f}")
-                                        
-                                        # Selection button
+
+                                        # Selection button: persist index in session state
                                         if st.button(f"Select", key=f"select_sample_{idx}"):
-                                            selected_sample_idx = idx
-                                
+                                            st.session_state[sim_batch_key] = idx
+                                            st.rerun()
+
+                                selected_sample_idx = st.session_state[sim_batch_key]
+                                if selected_sample_idx is not None and selected_sample_idx >= len(filtered_batch):
+                                    st.session_state[sim_batch_key] = None
+                                    selected_sample_idx = None
+
                                 # Handle selection
                                 if selected_sample_idx is not None:
                                     if st.button('Load selected sample for detection', key='load_selected_sample_for_detection'):

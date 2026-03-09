@@ -22,6 +22,7 @@ from components.core.sam_integration import SAMIntegration, assign_points_to_mas
 from components.core.pose_estimation import fit_cuboid_to_points
 from components.core.clustering_manager import ClusteringManager, select_best_cluster_points
 from components.core.utils import get_bbox_from_mask, calculate_iou
+from components.core.tracking import ObjectTracker
 from components.dataset_loaders.utils import load_dataset_sample
 from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
@@ -42,6 +43,7 @@ def save_sample_to_hard_drive_after_processing(
     image: Optional[np.ndarray],
     point_cloud: Optional[np.ndarray],
     sample_meta_data: Dict,
+    base_name: Optional[str] = None,
 ) -> None:
     """
     Save processed sample (image + LiDAR) to disk under the output_root_dir specified
@@ -67,7 +69,8 @@ def save_sample_to_hard_drive_after_processing(
     dataset_type = (sample_meta_data or {}).get("dataset_type", "unknown")
     sample_index = (sample_meta_data or {}).get("sample_index", "unknown")
 
-    base_name = f"{dataset_type}_{sample_index}"
+    if base_name is None:
+        base_name = f"{dataset_type}_{sample_index}"
 
     # Save image
     if image is not None:
@@ -667,8 +670,15 @@ def _run_pipeline_for_batch_sample(
     dataset_path: str,
     dataset_type: str,
     sample_index,
+    tracker: Optional[ObjectTracker],
+    frame_index: int,
 ) -> Optional[Dict]:
-    """Load one sample, run full pipeline, return export_results for Export page."""
+    """Load one sample, run full pipeline, update tracker, return export_results for Export page."""
+    print(
+        f"[batch] start sample "
+        f"dataset_path={dataset_path}, dataset_type={dataset_type}, "
+        f"sample_index={sample_index}, frame_index={frame_index}"
+    )
     meta, image, point_cloud = load_dataset_sample(
         dataset_path=dataset_path,
         sample_index=sample_index,
@@ -676,7 +686,18 @@ def _run_pipeline_for_batch_sample(
         filter_forward_only=False,
     )
     if meta is None or image is None or point_cloud is None:
+        print(
+            f"[batch] load_dataset_sample returned None "
+            f"(meta is None: {meta is None}, "
+            f"image is None: {image is None}, "
+            f"point_cloud is None: {point_cloud is None})"
+        )
         return None
+    print(
+        f"[batch] loaded sample: "
+        f"image_shape={image.shape if hasattr(image, 'shape') else 'n/a'}, "
+        f"num_points={len(point_cloud)}"
+    )
     st.session_state.sample = {
         "sample_meta_data": meta,
         "image": image,
@@ -690,8 +711,14 @@ def _run_pipeline_for_batch_sample(
         "step_5": {"completed": False, "result": None, "time": None, "error": None},
     }
     try:
+        print("[batch] running full pipeline")
         results = run_full_pipeline(st.session_state.params)
-    except Exception:
+        print("[batch] pipeline finished")
+    except Exception as e:
+        print(f"[batch] run_full_pipeline raised exception: {e}")
+        import traceback
+
+        traceback.print_exc()
         return None
     step_5_result = results["step_5"]["result"]
     dataset_type_lower = meta.get("dataset_type", "unknown").lower()
@@ -727,11 +754,35 @@ def _run_pipeline_for_batch_sample(
             export_results["ground_truth_cuboids"] = ground_truth_cuboids
             export_results["metadata"]["n_ground_truth"] = len(ground_truth_cuboids)
 
-    # Save each processed batch sample (image + LiDAR) to disk
+    if tracker is not None:
+        print(
+            f"[batch] updating tracker for frame_index={frame_index}, "
+            f"n_detections={step_5_result.get('n_detected', 0)}"
+        )
+        step_3_result = results["step_3"]["result"]
+        if step_3_result is None:
+            print("[batch] step_3_result is None, skipping tracker update")
+        else:
+            mask_bboxes = step_3_result.get("mask_bboxes", [])
+            class_names = step_3_result.get("class_names", [])
+            print(
+                f"[batch] step_3_result: "
+                f"n_bboxes={len(mask_bboxes)}, n_class_names={len(class_names)}"
+            )
+            tracker.update_for_frame(
+                frame_index=frame_index,
+                image=image,
+                detected_cuboids=step_5_result["detected_cuboids"],
+                mask_bboxes=mask_bboxes,
+                class_names=class_names,
+                meta=meta,
+            )
+
     save_sample_to_hard_drive_after_processing(
         image=image,
         point_cloud=point_cloud,
         sample_meta_data=meta,
+        base_name=f"frame_{frame_index:06d}",
     )
 
     return export_results
@@ -977,26 +1028,46 @@ def main():
         total = len(batch_samples)
         st.info(f"Batch loaded: **{total}** samples. Process the entire batch to run detection on all samples.")
         if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
+            print(f"[batch] starting batch processing for {total} samples")
             results_list = []
-            # Initialize progress bar at 0 and update from 0.0 to 1.0
+            tracker = ObjectTracker()
             progress = st.progress(0.0)
             for i, sample_desc in enumerate(batch_samples):
+                print(
+                    f"[batch] processing index {i} / {total - 1}, "
+                    f"dataset_type={sample_desc.get('dataset_type')}, "
+                    f"sample_index={sample_desc.get('sample_index')}"
+                )
                 progress.progress((i + 1) / total)
                 export_res = _run_pipeline_for_batch_sample(
                     dataset_path=sample_desc["dataset_path"],
                     dataset_type=sample_desc.get("dataset_type", "kitti"),
                     sample_index=sample_desc["sample_index"],
+                    tracker=tracker,
+                    frame_index=i,
                 )
                 if export_res is not None:
                     results_list.append(export_res)
-                    print(f"Processed sample {i + 1} of {total}")
+                else:
+                    print(f"[batch] sample {i} returned no export_res")
             st.session_state.batch_export_results = {"samples": results_list}
-            st.success(f"✅ Processed **{len(results_list)}** / {total} samples. Go to **3_Export** to save (e.g. XML).")
+            print(f"[batch] collected {len(results_list)} successful samples")
+            datumaro_state = tracker.build_datumaro_state()
+            print(
+                "[batch] built datumaro_state: "
+                f"n_items={len(datumaro_state.get('items', []))}, "
+                f"categories={list(datumaro_state.get('categories', {}).keys())}"
+            )
+            st.session_state.datumaro_tracking = datumaro_state
+            st.success(
+                f"✅ Processed **{len(results_list)}** / {total} samples. "
+                "Go to **4_Export** to save KITTI and Datumaro-style exports."
+            )
             st.rerun()
         if st.session_state.get("batch_export_results"):
             br = st.session_state.batch_export_results
             n = len(br.get("samples", []))
-            st.success(f"Last batch: **{n}** samples ready for export on **3_Export**.")
+            st.success(f"Last batch: **{n}** samples ready for export on **4_Export**.")
         return
     
     # Check if sample is loaded
