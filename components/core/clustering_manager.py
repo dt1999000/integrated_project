@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Set
 
 
 # Standard clustering algorithms from scikit-learn
@@ -499,6 +499,107 @@ class ClusteringManager:
         return pose_cuboid
 
 
+def filter_clusters_by_max_volume(
+    points: np.ndarray,
+    labels: np.ndarray,
+    template_volume: float, 
+    volume_factor: float
+) -> np.ndarray:
+    """
+    Filter out clusters whose 3D bounding box volume is significantly larger than a target.
+
+    Args:
+        points: Nx3 array of points (all clusters together)
+        labels: N array of cluster labels for each point (e.g., from DBSCAN)
+        template_volume: template volume in m^3. Clusters whose
+                    volume exceeds this * volume_factor are removed.
+        volume_factor: factor to scale volume to make the algorithm robust
+
+    Returns:
+        Boolean mask of shape (N,) where True means the point is kept.
+    """
+    if points.size == 0:
+        return np.zeros(0, dtype=bool)
+    max_volume = template_volume*volume_factor
+    keep_mask = np.zeros(len(points), dtype=bool)
+    unique_labels = np.unique(labels)
+    unique_labels = unique_labels[unique_labels >= 0]
+
+    for cluster_id in unique_labels:
+        cluster_mask = labels == cluster_id
+        cluster_points = points[cluster_mask]
+        if len(cluster_points) == 0:
+            continue
+
+        min_xyz = np.min(cluster_points, axis=0)
+        max_xyz = np.max(cluster_points, axis=0)
+        extents = np.maximum(max_xyz - min_xyz, 0.0)
+        volume = float(extents[0] * extents[1] * extents[2])
+
+        if volume <= max_volume:
+            keep_mask[cluster_mask] = True
+    
+    return keep_mask
+
+
+def compute_sparse_iou_2d(
+    sparse_depth_map: np.ndarray,
+    mask: np.ndarray,
+    cluster_points_3d: np.ndarray,
+    projection,
+    image_shape: Tuple[int, int],
+) -> float:
+    """
+    Compute 2D IoU between a cluster's reprojected pixels and the mask in sparse depth space.
+
+    Because LiDAR is sparse, we only consider pixels that have valid depth in the sparse
+    depth map. We reproject the cluster's 3D points to 2D, then compute overlap with
+    the set of pixels that are both inside the mask and have valid sparse depth.
+
+    IoU = |cluster_pixels ∩ mask_sparse_pixels| / |cluster_pixels ∪ mask_sparse_pixels|
+
+    Args:
+        sparse_depth_map: HxW array with depth > 0 at projected LiDAR pixels, 0 elsewhere
+        mask: HxW binary mask (e.g. SAM segment)
+        cluster_points_3d: Nx3 array of 3D points in the cluster (LiDAR coords)
+        projection: Projection instance with point_to_pixel(points_3d) -> (pixels, valid_mask)
+        image_shape: (height, width)
+
+    Returns:
+        IoU in [0, 1], or 0.0 if union is empty
+    """
+    h, w = image_shape
+    if len(cluster_points_3d) == 0:
+        return 0.0
+
+    pixels, valid_mask = projection.point_to_pixel(cluster_points_3d)
+    valid_pixels = pixels[valid_mask]
+
+    in_bounds = (
+        (valid_pixels[:, 0] >= 0) & (valid_pixels[:, 0] < w) &
+        (valid_pixels[:, 1] >= 0) & (valid_pixels[:, 1] < h)
+    )
+    valid_pixels = valid_pixels[in_bounds]
+    if len(valid_pixels) == 0:
+        return 0.0
+
+    cluster_pixels: Set[Tuple[int, int]] = set()
+    for u, v in valid_pixels.astype(int):
+        cluster_pixels.add((int(u), int(v)))
+
+    v_idx, u_idx = np.where((sparse_depth_map > 0) & (mask > 0))
+    mask_sparse_pixels: Set[Tuple[int, int]] = set(zip(u_idx.tolist(), v_idx.tolist()))
+
+    if len(mask_sparse_pixels) == 0:
+        return 0.0
+
+    intersection = cluster_pixels & mask_sparse_pixels
+    union = cluster_pixels | mask_sparse_pixels
+    if len(union) == 0:
+        return 0.0
+    return len(intersection) / len(union)
+
+
 def select_best_cluster_points(
     mask_points: np.ndarray,
     mask: np.ndarray,
@@ -506,11 +607,15 @@ def select_best_cluster_points(
     image_shape: Tuple[int, int],
     dbscan_eps: float = 0.5,
     dbscan_min_samples: int = 5,
+    sparse_depth_map: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
     """
-    Cluster mask points with DBSCAN and select the cluster closest to the mask center.
-    Returns the points of the selected cluster, or None if no valid cluster is found.
-    
+    Cluster mask points with DBSCAN and select the cluster with highest 2D IoU to the mask.
+
+    Reprojects each cluster onto the 2D image and computes sparse IoU with the mask
+    (using the sparse depth map to define valid pixels). The cluster with the highest
+    IoU is returned. Requires sparse_depth_map for IoU-based selection.
+
     Args:
         mask_points: Nx3 array of 3D points assigned to a mask
         mask: Binary mask (H, W) as numpy array
@@ -518,7 +623,10 @@ def select_best_cluster_points(
         image_shape: (height, width) tuple
         dbscan_eps: DBSCAN eps parameter
         dbscan_min_samples: DBSCAN min_samples parameter
-    
+        sparse_depth_map: HxW sparse depth map (depth > 0 at LiDAR pixels). If provided,
+                          best cluster is selected by highest 2D IoU with mask; if None,
+                          falls back to cluster closest to mask center.
+
     Returns:
         Points of the best cluster, or None if no valid cluster found
     """
@@ -527,65 +635,70 @@ def select_best_cluster_points(
 
     h, w = image_shape
 
-    # Find center of mask in image space
-    mask_coords = np.column_stack(np.where(mask > 0))
-    if len(mask_coords) == 0:
-        return None
-
-    center_y, center_x = mask_coords.mean(axis=0)
-
-    # Project all mask points to 2D
-    pixels, valid_mask = projection.point_to_pixel(mask_points)
-    valid_pixels = pixels[valid_mask]
-    valid_indices = np.where(valid_mask)[0]
-
-    if len(valid_pixels) == 0:
-        return None
-
-    # Compute distances from projected points to mask center
-    distances = np.sqrt(
-        (valid_pixels[:, 0] - center_x) ** 2 + (valid_pixels[:, 1] - center_y) ** 2
-    )
-
-    # Use 10% of closest points to approximate center region in 3D
-    n_sample = max(1, int(len(mask_points) * 0.1))
-    closest_indices = np.argsort(distances)[:n_sample]
-    sampled_point_indices = valid_indices[closest_indices]
-    center_points = mask_points[sampled_point_indices]
-
-    if len(center_points) == 0:
-        return None
-
-    center_centroid = np.mean(center_points, axis=0)
-
-    # Run DBSCAN on all mask points
     clustering_manager = ClusteringManager(mask_points)
     cluster_labels = clustering_manager.run_dbscan(
         eps=dbscan_eps, min_samples=dbscan_min_samples
     )
 
     unique_labels = np.unique(cluster_labels)
-    unique_labels = unique_labels[unique_labels >= 0]  # remove noise (-1)
+    unique_labels = unique_labels[unique_labels >= 0]
     if len(unique_labels) == 0:
         return None
 
+    if sparse_depth_map is not None:
+        best_cluster_id = -1
+        best_iou = -1.0
+        for cluster_id in unique_labels:
+            cluster_points = mask_points[cluster_labels == cluster_id]
+            if len(cluster_points) < 5:
+                continue
+            iou = compute_sparse_iou_2d(
+                sparse_depth_map=sparse_depth_map,
+                mask=mask,
+                cluster_points_3d=cluster_points,
+                projection=projection,
+                image_shape=image_shape,
+            )
+            print(f'iou for cluster id {cluster_id} is {iou}')
+            if iou > best_iou:
+                best_iou = iou
+                best_cluster_id = cluster_id
+        if best_cluster_id == -1:
+            return None
+        return mask_points[cluster_labels == best_cluster_id]
+
+    mask_coords = np.column_stack(np.where(mask > 0))
+    if len(mask_coords) == 0:
+        return None
+    center_y, center_x = mask_coords.mean(axis=0)
+
+    pixels, valid_mask = projection.point_to_pixel(mask_points)
+    valid_pixels = pixels[valid_mask]
+    valid_indices = np.where(valid_mask)[0]
+    if len(valid_pixels) == 0:
+        return None
+    distances = np.sqrt(
+        (valid_pixels[:, 0] - center_x) ** 2 + (valid_pixels[:, 1] - center_y) ** 2
+    )
+    n_sample = max(1, int(len(mask_points) * 0.1))
+    closest_indices = np.argsort(distances)[:n_sample]
+    center_points = mask_points[valid_indices[closest_indices]]
+    if len(center_points) == 0:
+        return None
+    center_centroid = np.mean(center_points, axis=0)
+
     best_cluster_id = -1
     min_distance = float("inf")
-
     for cluster_id in unique_labels:
         cluster_points = mask_points[cluster_labels == cluster_id]
         if len(cluster_points) < 5:
             continue
-
-        cluster_centroid = np.mean(cluster_points, axis=0)
-        distance = np.linalg.norm(cluster_centroid - center_centroid)
+        distance = np.linalg.norm(np.mean(cluster_points, axis=0) - center_centroid)
         if distance < min_distance:
             min_distance = distance
             best_cluster_id = cluster_id
-
     if best_cluster_id == -1:
         return None
-    
     return mask_points[cluster_labels == best_cluster_id]
 
     

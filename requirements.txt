@@ -16,7 +16,6 @@ tqdm>=4.65.0
 # Additional dependencies for segmentation and ML
 torch==2.4.0
 torchvision==0.19.0
-torchaudio==2.4.0
 ultralytics>=8.0.0
 
 # SegDINO3D wrapper runtime dependencies

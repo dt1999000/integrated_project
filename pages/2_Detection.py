@@ -334,7 +334,9 @@ def step_4_clustering(
     sam_masks: List[np.ndarray],
     mask_assignments: np.ndarray,
     dbscan_eps: float = 0.5,
-    dbscan_min_samples: int = 5
+    dbscan_min_samples: int = 5,
+    sparse_depth_map: Optional[np.ndarray] = None,
+    volume_factor: float = 1.5,
 ) -> Dict:
     """
     Step 4: Run DBSCAN clustering on points assigned to each mask.
@@ -346,12 +348,23 @@ def step_4_clustering(
         mask_assignments: N array assigning each point to a mask index
         dbscan_eps: DBSCAN eps parameter
         dbscan_min_samples: DBSCAN min_samples parameter
+        sparse_depth_map: Optional HxW sparse depth map from step 2. When provided,
+                          best cluster per mask is selected by highest 2D IoU with the mask.
     
     Returns:
         Dict with 'mask_cluster_labels', 'clustering_results', 'best_cluster_points'
     """
     start_time = time.time()
     
+    # Get per-class dimensions estimated via LLM or templates (stored in session_state)
+    dimensions_by_class = st.session_state.params.get('dimensions_by_class', {})
+
+    # Get detected class names from step 3 (mask-wise categories)
+    detected_class_names = []
+    if 'step_3' in st.session_state.pipeline_state:
+        step_3_result = st.session_state.pipeline_state['step_3'].get('result', {})
+        detected_class_names = step_3_result.get('class_names', [])
+
     # Get image shape
     if 'image' in st.session_state.sample:
         h, w = st.session_state.sample['image'].shape[:2]
@@ -368,6 +381,7 @@ def step_4_clustering(
     mask_cluster_labels = {}
     clustering_results = []
     best_cluster_points_dict = {}
+    filtered_mask_points_dict = {}
     
     for mask_idx, mask in enumerate(sam_masks):
         if mask is None:
@@ -379,22 +393,65 @@ def step_4_clustering(
         if len(mask_points) < dbscan_min_samples:
             continue
         
+        # Derive expected object volume for this mask from LLM/template dimensions
+        category = 'Unknown'
+        if mask_idx < len(detected_class_names):
+            category = detected_class_names[mask_idx] or 'Unknown'
+
+        dims = dimensions_by_class.get(category)
+        if dims is None:
+            from components.core.constants import KITTI_CUBOID_TEMPLATES
+            t = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
+            dims = (float(t['length']), float(t['width']), float(t['height']))
+
+        length, width, height = float(dims[0]), float(dims[1]), float(dims[2])
+        reference_volume = length * width * height
+
         # Run DBSCAN clustering
         clustering_manager = ClusteringManager(mask_points)
         cluster_labels = clustering_manager.run_dbscan(
             eps=dbscan_eps, min_samples=dbscan_min_samples
         )
+
+        # Remove clusters that are significantly larger than expected dimensions
+        from components.core.clustering_manager import filter_clusters_by_max_volume
+        keep_mask = filter_clusters_by_max_volume(
+            points=mask_points,
+            labels=cluster_labels,
+            template_volume=reference_volume,
+            volume_factor=volume_factor,
+        )
+        mask_points_filtered = mask_points[keep_mask]
+        cluster_labels = cluster_labels[keep_mask]
+
+        filtered_mask_points_dict[mask_idx] = mask_points_filtered
+
+        if len(mask_points_filtered) < dbscan_min_samples:
+            # Not enough points left for clustering/selection; use all remaining points
+            best_cluster_points_dict[mask_idx] = mask_points_filtered
+            unique_clusters = np.unique(cluster_labels)
+            n_clusters = np.sum(unique_clusters >= 0)
+            n_cluster_points = np.sum(cluster_labels >= 0)
+            clustering_results.append({
+                'Mask ID': mask_idx + 1,
+                'Total Points': len(mask_points),
+                'Clusters Found': int(n_clusters),
+                'Clustered Points': int(n_cluster_points),
+                'Best Cluster Points': len(mask_points),
+            })
+            continue
         
         mask_cluster_labels[mask_idx] = cluster_labels
-        
-        # Select best cluster
+        print(f'mask_id: {mask_idx}')
+        # Select best cluster (by 2D IoU with mask when sparse_depth_map is provided)
         best_cluster_points = select_best_cluster_points(
-            mask_points=mask_points,
+            mask_points=mask_points_filtered,
             mask=mask,
             projection=projection,
             image_shape=(h, w),
             dbscan_eps=dbscan_eps,
-            dbscan_min_samples=dbscan_min_samples
+            dbscan_min_samples=dbscan_min_samples,
+            sparse_depth_map=sparse_depth_map,
         )
         
         if best_cluster_points is not None:
@@ -419,6 +476,7 @@ def step_4_clustering(
         'mask_cluster_labels': mask_cluster_labels,
         'clustering_results': clustering_results,
         'best_cluster_points': best_cluster_points_dict,
+        'filtered_mask_points': filtered_mask_points_dict,
         'time': elapsed_time
     }
 
@@ -643,6 +701,7 @@ def run_full_pipeline(params: Dict) -> Dict:
         sparse_points=step_2_result['colored_sparse_points'],
         sam_masks=step_3_result['sam_masks'],
         mask_assignments=step_3_result['mask_assignments'],
+        sparse_depth_map=step_2_result['sparse_depth_map'],
         **params['clustering']
     )
     results['step_4'] = {'completed': True, 'result': step_4_result}
@@ -874,6 +933,11 @@ def main():
         )
         st.session_state.params['clustering']['dbscan_min_samples'] = st.slider(
             "Min Samples", 3, 20, 5, 1
+        )
+        st.session_state.params['clustering']['volume_factor'] = st.slider(
+            "Max Cluster Volume Factor",
+            0.5, 5.0, 1.5, 0.1,
+            help="Multiplier on the template volume used to discard clusters that are too large."
         )
     
     with st.sidebar.expander("Cuboid Fitting (Step 5)", expanded=False):
@@ -1622,6 +1686,7 @@ def main():
                             sparse_points=step_2_result['colored_sparse_points'],
                             sam_masks=step_3_result['sam_masks'],
                             mask_assignments=step_3_result['mask_assignments'],
+                            sparse_depth_map=step_2_result['sparse_depth_map'],
                             **st.session_state.params['clustering']
                         )
                         st.session_state.pipeline_state['step_4'] = {
@@ -1660,6 +1725,7 @@ def main():
                     step_3_result = st.session_state.pipeline_state['step_3']['result']
                     mask_assignments = step_3_result['mask_assignments']
                     mask_cluster_labels = result['mask_cluster_labels']
+                    filtered_mask_points = result.get('filtered_mask_points', {})
                     
                     # Create visualization showing clusters
                     fig = go.Figure()
@@ -1676,7 +1742,9 @@ def main():
                     
                     # Add points for each cluster
                     for mask_idx, cluster_labels in mask_cluster_labels.items():
-                        mask_points = sparse_points[mask_assignments == mask_idx]
+                        mask_points = filtered_mask_points.get(mask_idx)
+                        if mask_points is None:
+                            continue
                         if len(mask_points) == 0:
                             continue
                         

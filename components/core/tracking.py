@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import cv2
 import numpy as np
@@ -93,6 +93,7 @@ class ObjectTracker:
         bbox: List[float],
         label: str,
         detection: Dict[str, Any],
+        used_track_ids: Optional[Set[int]] = None,
     ) -> int:
         patch = self._crop_patch(image, bbox)
         if patch is None:
@@ -116,6 +117,8 @@ class ObjectTracker:
 
         for tr in self._tracks:
             if tr.label != label:
+                continue
+            if used_track_ids is not None and tr.track_id in used_track_ids:
                 continue
             score = _similarity(tr.feature, feature)
             if score > best_score:
@@ -167,6 +170,8 @@ class ObjectTracker:
             }
             self._frames[frame_index] = frame_entry
 
+        used_track_ids: Set[int] = set()
+
         for det_idx, det in enumerate(detected_cuboids):
             mask_idx = det.get("mask_idx")
             if mask_idx is None:
@@ -188,8 +193,11 @@ class ObjectTracker:
                 bbox=bbox,
                 label=label,
                 detection=det,
+                used_track_ids=used_track_ids,
             )
             print(f"[tracking] det[{det_idx}] assigned track_id={track_id}")
+
+            used_track_ids.add(track_id)
 
             det["track_id"] = track_id
 
