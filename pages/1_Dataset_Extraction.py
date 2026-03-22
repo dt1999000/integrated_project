@@ -6,7 +6,7 @@ import streamlit as st
 import numpy as np
 import cv2
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 
 from components.dataset_loaders.utils import detect_dataset_type, load_dataset_sample
 from components.dataset_loaders.dataset_loader import LinkedDataHandler
@@ -20,6 +20,8 @@ from components.dataset_loaders.rosbag_extractor import (
     filter_rosbag_frames,
     extract_bag_to_folder,
     sanitize_bag_name,
+    get_tf_frames as get_ros_tf_frames,
+    compute_rosbag_calibration,
 )
 from components.utils.visualization_helper import create_3d_scatter_plot
 from components.core.pointcloud_projection import PointCloud
@@ -28,6 +30,196 @@ from components.core.filter import (
     filter_nuscenes_images,
     filter_sim_images,
 )
+
+
+DEFAULT_FILTER_PARAMS = {
+    "blur_gate": 120,
+    "hash_thresh": 6,
+    "motion_thresh": 5,
+    "min_contrast": 0.10,
+    "min_bright": 30,
+    "max_bright": 235,
+    "enable_blur": True,
+    "enable_dedup": True,
+    "enable_motion": False,
+    "enable_brightness": True,
+    "enable_contrast": True,
+}
+
+
+def _every_nth_indices(total_count: int, stride: int, start: int = 0) -> np.ndarray:
+    """
+    Utility: return indices [start, start+stride, ...] < total_count as int array.
+    """
+    if stride <= 0:
+        raise ValueError(f"stride must be positive, got {stride}")
+    if total_count <= 0:
+        return np.array([], dtype=int)
+    start = max(0, min(start, total_count - 1))
+    return np.arange(start, total_count, stride, dtype=int)
+
+def ensure_filter_state(prefix: str) -> None:
+    """Ensure st.session_state[f'{prefix}_filter_params'] exists with defaults."""
+    key = f"{prefix}_filter_params"
+    if key not in st.session_state:
+        st.session_state[key] = DEFAULT_FILTER_PARAMS.copy()
+
+
+def render_filter_controls(prefix: str, title: str, expanded: bool = False) -> Dict[str, Any]:
+    """
+    Render common blur/dedup/motion/brightness/contrast controls for image filtering.
+
+    Updates and returns st.session_state[f'{prefix}_filter_params'].
+    """
+    state_key = f"{prefix}_filter_params"
+    ensure_filter_state(prefix)
+    params = st.session_state[state_key]
+
+    with st.expander(f"⚙️ Filter Settings ({title})", expanded=expanded):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            params["enable_blur"] = st.checkbox(
+                "Enable Blur Filter",
+                value=params["enable_blur"],
+                help="Remove blurry images using Laplacian variance",
+                key=f"{prefix}_enable_blur",
+            )
+            if params["enable_blur"]:
+                params["blur_gate"] = st.slider(
+                    "Blur Gate (Laplacian Variance)",
+                    0,
+                    500,
+                    params["blur_gate"],
+                    help="Minimum Laplacian variance (higher = sharper)",
+                    key=f"{prefix}_blur_gate",
+                )
+
+            params["enable_dedup"] = st.checkbox(
+                "Enable Deduplication",
+                value=params["enable_dedup"],
+                help="Remove visually similar images",
+                key=f"{prefix}_enable_dedup",
+            )
+            if params["enable_dedup"]:
+                params["hash_thresh"] = st.slider(
+                    "Deduplication Threshold (Hamming)",
+                    0,
+                    16,
+                    params["hash_thresh"],
+                    help="Maximum Hamming distance for duplicates",
+                    key=f"{prefix}_hash_thresh",
+                )
+
+            params["enable_motion"] = st.checkbox(
+                "Enable Motion Filter",
+                value=params["enable_motion"],
+                help="Skip static frames",
+                key=f"{prefix}_enable_motion",
+            )
+            if params["enable_motion"]:
+                params["motion_thresh"] = st.slider(
+                    "Motion Threshold",
+                    0,
+                    20,
+                    params["motion_thresh"],
+                    help="Minimum motion score between frames",
+                    key=f"{prefix}_motion_thresh",
+                )
+
+        with col2:
+            params["enable_brightness"] = st.checkbox(
+                "Enable Brightness Filter",
+                value=params["enable_brightness"],
+                help="Remove over/under-exposed images",
+                key=f"{prefix}_enable_brightness",
+            )
+            if params["enable_brightness"]:
+                params["min_bright"] = st.slider(
+                    "Min Brightness",
+                    0,
+                    255,
+                    params["min_bright"],
+                    key=f"{prefix}_min_bright",
+                )
+                params["max_bright"] = st.slider(
+                    "Max Brightness",
+                    0,
+                    255,
+                    params["max_bright"],
+                    key=f"{prefix}_max_bright",
+                )
+
+            params["enable_contrast"] = st.checkbox(
+                "Enable Contrast Filter",
+                value=params["enable_contrast"],
+                help="Remove low-contrast images",
+                key=f"{prefix}_enable_contrast",
+            )
+            if params["enable_contrast"]:
+                params["min_contrast"] = st.slider(
+                    "Min Contrast",
+                    0.0,
+                    0.5,
+                    params["min_contrast"],
+                    step=0.01,
+                    key=f"{prefix}_min_contrast",
+                )
+
+    st.session_state[state_key] = params
+    return params
+
+
+def _resolve_current_calibration(dataset_flag: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[Any]]:
+    """
+    Resolve calibration for the current session based on a dataset flag.
+    
+    Returns a tuple of (calib_dict_or_None, dataset_type, sample_index).
+    calib_dict has keys: camera_intrinsic, camera_to_lidar, camera_frame, lidar_frame.
+    """
+    calib: Optional[Dict[str, Any]] = None
+    dataset_type: Optional[str] = dataset_flag
+    sample_index: Optional[Any] = None
+
+    # ROS bag: always prefer the live calibration computed from TF/frame selection.
+    # This is recomputed whenever frames change in ROS mode.
+    if dataset_type == "rosbag":
+        rosbag_calib = st.session_state.get("rosbag_calibration")
+        if rosbag_calib:
+            camera_intrinsic = rosbag_calib.get("camera_intrinsic")
+            camera_to_lidar = rosbag_calib.get("camera_to_lidar")
+            camera_frame = rosbag_calib.get("camera_frame")
+            lidar_frame = rosbag_calib.get("lidar_frame")
+            calib = {
+                "camera_intrinsic": camera_intrinsic,
+                "camera_to_lidar": camera_to_lidar,
+                "camera_frame": camera_frame,
+                "lidar_frame": lidar_frame,
+            }
+            return calib, dataset_type, sample_index
+
+    # Other datasets (KITTI, nuScenes, sim, extracted rosbag samples):
+    # prefer calibration coming from the currently loaded sample's metadata.
+    if "sample" in st.session_state and st.session_state.sample is not None:
+        meta = st.session_state.sample.get("sample_meta_data", {})
+        meta_dataset_type = meta.get("dataset_type")
+        if dataset_type is None:
+            dataset_type = meta_dataset_type
+        if meta_dataset_type == dataset_type or dataset_type is None:
+            camera_intrinsic = meta.get("camera_intrinsic")
+            camera_to_lidar = meta.get("camera_to_lidar_transform")
+            sample_index = meta.get("sample_index")
+            camera_frame = meta.get("camera_frame")
+            lidar_frame = meta.get("lidar_frame")
+            if camera_intrinsic is not None or camera_to_lidar is not None:
+                calib = {
+                    "camera_intrinsic": camera_intrinsic,
+                    "camera_to_lidar": camera_to_lidar,
+                    "camera_frame": camera_frame,
+                    "lidar_frame": lidar_frame,
+                }
+
+    return calib, dataset_type, sample_index
 
 
 def main():
@@ -52,6 +244,9 @@ def main():
     # Batch mode is False by default; only "Load all ... for detection" sets it to True.
     if 'process_all_samples' not in st.session_state:
         st.session_state.process_all_samples = False
+    # Ensure global params dict exists so we can store bag frequency for tracking.
+    if 'params' not in st.session_state:
+        st.session_state.params = {}
 
     # Dataset path input
     st.subheader("Dataset Selection")
@@ -82,6 +277,8 @@ def main():
             # Persist dataset root so other pages (e.g. 4_Export) can reuse it
             st.session_state.dataset_path = dataset_path
             dataset_type = detect_dataset_type(dataset_path)
+            # Persist the detected dataset type as a flag for other pages/helpers
+            st.session_state.current_dataset_type = dataset_type
             if dataset_type:
                 st.success(f"✅ Detected dataset type: **{dataset_type.upper()}**")
             else:
@@ -131,11 +328,16 @@ def main():
                                 )
                                 
                                 if sample_meta_data and image is not None and point_cloud is not None:
+                                    kitti_gt = sample_meta_data.get("ground_truth_boxes", [])
                                     st.session_state.sample = {
                                         'sample_meta_data': sample_meta_data,
                                         'image': image,
                                         'point_cloud': point_cloud
                                     }
+                                    st.session_state.ground_truth_annotations = kitti_gt
+                                    st.session_state.ground_truth_2d_boxes = [
+                                        box for box in kitti_gt if box.get("bbox_2d") is not None
+                                    ]
                                     # Ensure single-sample mode on Detection page
                                     st.session_state.process_all_samples = False
                                     st.success(f"✅ Sample {sample_index} loaded successfully!")
@@ -206,138 +408,57 @@ def main():
                                 )
                                 st.rerun()
 
-                        # Filter configuration
-                        with st.expander("⚙️ Filter Settings (KITTI)", expanded=False):
-                            col1, col2 = st.columns(2)
-
-                            with col1:
-                                st.session_state.kitti_filter_params['enable_blur'] = st.checkbox(
-                                    "Enable Blur Filter",
-                                    value=st.session_state.kitti_filter_params['enable_blur'],
-                                    help="Remove blurry images using Laplacian variance",
-                                    key="kitti_enable_blur"
-                                )
-                                if st.session_state.kitti_filter_params['enable_blur']:
-                                    st.session_state.kitti_filter_params['blur_gate'] = st.slider(
-                                        "Blur Gate (Laplacian Variance)",
-                                        0, 500,
-                                        st.session_state.kitti_filter_params['blur_gate'],
-                                        help="Minimum Laplacian variance (higher = sharper)",
-                                        key="kitti_blur_gate"
-                                    )
-
-                                st.session_state.kitti_filter_params['enable_dedup'] = st.checkbox(
-                                    "Enable Deduplication",
-                                    value=st.session_state.kitti_filter_params['enable_dedup'],
-                                    help="Remove visually similar images",
-                                    key="kitti_enable_dedup"
-                                )
-                                if st.session_state.kitti_filter_params['enable_dedup']:
-                                    st.session_state.kitti_filter_params['hash_thresh'] = st.slider(
-                                        "Deduplication Threshold (Hamming)",
-                                        0, 16,
-                                        st.session_state.kitti_filter_params['hash_thresh'],
-                                        help="Maximum Hamming distance for duplicates",
-                                        key="kitti_hash_thresh"
-                                    )
-
-                                st.session_state.kitti_filter_params['enable_motion'] = st.checkbox(
-                                    "Enable Motion Filter",
-                                    value=st.session_state.kitti_filter_params['enable_motion'],
-                                    help="Skip static frames (sequential indices)",
-                                    key="kitti_enable_motion"
-                                )
-                                if st.session_state.kitti_filter_params['enable_motion']:
-                                    st.session_state.kitti_filter_params['motion_thresh'] = st.slider(
-                                        "Motion Threshold",
-                                        0, 20,
-                                        st.session_state.kitti_filter_params['motion_thresh'],
-                                        help="Minimum motion score between frames",
-                                        key="kitti_motion_thresh"
-                                    )
-
-                            with col2:
-                                st.session_state.kitti_filter_params['enable_brightness'] = st.checkbox(
-                                    "Enable Brightness Filter",
-                                    value=st.session_state.kitti_filter_params['enable_brightness'],
-                                    help="Remove over/under-exposed images",
-                                    key="kitti_enable_brightness"
-                                )
-                                if st.session_state.kitti_filter_params['enable_brightness']:
-                                    st.session_state.kitti_filter_params['min_bright'] = st.slider(
-                                        "Min Brightness",
-                                        0, 255,
-                                        st.session_state.kitti_filter_params['min_bright'],
-                                        key="kitti_min_bright"
-                                    )
-                                    st.session_state.kitti_filter_params['max_bright'] = st.slider(
-                                        "Max Brightness",
-                                        0, 255,
-                                        st.session_state.kitti_filter_params['max_bright'],
-                                        key="kitti_max_bright"
-                                    )
-
-                                st.session_state.kitti_filter_params['enable_contrast'] = st.checkbox(
-                                    "Enable Contrast Filter",
-                                    value=st.session_state.kitti_filter_params['enable_contrast'],
-                                    help="Remove low-contrast images",
-                                    key="kitti_enable_contrast"
-                                )
-                                if st.session_state.kitti_filter_params['enable_contrast']:
-                                    st.session_state.kitti_filter_params['min_contrast'] = st.slider(
-                                        "Min Contrast",
-                                        0.0, 0.5,
-                                        st.session_state.kitti_filter_params['min_contrast'],
-                                        step=0.01,
-                                        key="kitti_min_contrast"
-                                    )
+                        # Filter configuration (shared UI)
+                        render_filter_controls(prefix="kitti", title="KITTI")
 
                         # Random batch parameters
                         col_a, col_b = st.columns(2)
                         with col_a:
-                            kitti_batch_size = st.number_input(
-                                "Batch size (random KITTI samples)",
+                            kitti_stride = st.number_input(
+                                "Take every n-th frame (KITTI)",
                                 min_value=1,
-                                max_value=num_samples,
-                                value=min(64, num_samples),
+                                max_value=max(1, num_samples),
+                                value=min(10, max(1, num_samples)),
                                 step=1,
-                                key="kitti_batch_size"
+                                key="kitti_stride_every_nth",
                             )
                         with col_b:
-                            kitti_seed = st.number_input(
-                                "Random seed",
+                            kitti_start = st.number_input(
+                                "Start index",
                                 min_value=0,
-                                max_value=1_000_000,
-                                value=42,
+                                max_value=max(0, num_samples - 1),
+                                value=0,
                                 step=1,
-                                key="kitti_batch_seed"
+                                key="kitti_every_nth_start",
                             )
 
-                        # Filter random batch button
-                        if st.button("🔍 Filter Random Batch (KITTI)", type="primary", key="filter_kitti_batch"):
-                            with st.spinner("Sampling and filtering KITTI images..."):
-                                rng = np.random.default_rng(int(kitti_seed))
-                                all_indices = np.arange(num_samples)
-                                if kitti_batch_size < num_samples:
-                                    sampled_indices = rng.choice(all_indices, size=int(kitti_batch_size), replace=False)
-                                else:
-                                    sampled_indices = all_indices
-
-                                filtered_batch = filter_kitti_images(
-                                    dataset_path=dataset_path,
-                                    indices=sorted(int(i) for i in sampled_indices),
-                                    filter_params=st.session_state.kitti_filter_params
-                                )
+                        if st.button("📚 Prepare KITTI batch (every n-th frame)", type="primary", key="filter_kitti_batch"):
+                            with st.spinner("Preparing KITTI batch..."):
+                                step = int(kitti_stride)
+                                start_idx = int(kitti_start)
+                                indices_every_nth = _every_nth_indices(num_samples, step, start_idx)
+                                filtered_batch = []
+                                for idx in indices_every_nth:
+                                    if 0 <= int(idx) < len(image_files):
+                                        filtered_batch.append(
+                                            {
+                                                "sample_index": int(idx),
+                                                "image_path": str(image_files[int(idx)]),
+                                            }
+                                        )
                                 st.session_state.kitti_filtered_batch = filtered_batch
-                            st.success(f"✅ Filtered {len(st.session_state.kitti_filtered_batch)} samples from {num_samples} total images")
+                            st.success(
+                                f"✅ Selected {len(st.session_state.kitti_filtered_batch)} KITTI frames "
+                                f"using start={start_idx}, step={step}."
+                            )
                             st.rerun()
 
                         # Display filtered batch summary and allow sending to detection
                         if st.session_state.kitti_filtered_batch:
                             filtered_batch = st.session_state.kitti_filtered_batch
                             st.markdown("---")
-                            st.subheader("📋 Filtered Sample Batch (KITTI)")
-                            st.info(f"Found {len(filtered_batch)} KITTI samples that passed all filters")
+                            st.subheader("📋 Subsampled Sample Batch (KITTI)")
+                            st.info(f"Prepared {len(filtered_batch)} KITTI samples (every n-th frame)")
 
                             if st.button("📚 Load all filtered samples for detection", key="load_all_kitti_for_detection"):
                                 # Standardized batch sample descriptor:
@@ -398,7 +519,7 @@ def main():
                 else:
                     st.warning("Please enter a sample token")
 
-            # nuScenes: random batch filtering + send to detection
+            # nuScenes: simple subsampling (every n-th sample) + send to detection
 
             if 'nuscenes_filter_params' not in st.session_state:
                 st.session_state.nuscenes_filter_params = {
@@ -462,91 +583,8 @@ def main():
                     )
                     st.rerun()
 
-            # Filter configuration
-            with st.expander("⚙️ Filter Settings (nuScenes)", expanded=False):
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.session_state.nuscenes_filter_params['enable_blur'] = st.checkbox(
-                        "Enable Blur Filter",
-                        value=st.session_state.nuscenes_filter_params['enable_blur'],
-                        help="Remove blurry images using Laplacian variance",
-                        key="nuscenes_enable_blur"
-                    )
-                    if st.session_state.nuscenes_filter_params['enable_blur']:
-                        st.session_state.nuscenes_filter_params['blur_gate'] = st.slider(
-                            "Blur Gate (Laplacian Variance)",
-                            0, 500,
-                            st.session_state.nuscenes_filter_params['blur_gate'],
-                            help="Minimum Laplacian variance (higher = sharper)",
-                            key="nuscenes_blur_gate"
-                        )
-
-                    st.session_state.nuscenes_filter_params['enable_dedup'] = st.checkbox(
-                        "Enable Deduplication",
-                        value=st.session_state.nuscenes_filter_params['enable_dedup'],
-                        help="Remove visually similar images",
-                        key="nuscenes_enable_dedup"
-                    )
-                    if st.session_state.nuscenes_filter_params['enable_dedup']:
-                        st.session_state.nuscenes_filter_params['hash_thresh'] = st.slider(
-                            "Deduplication Threshold (Hamming)",
-                            0, 16,
-                            st.session_state.nuscenes_filter_params['hash_thresh'],
-                            help="Maximum Hamming distance for duplicates",
-                            key="nuscenes_hash_thresh"
-                        )
-
-                    st.session_state.nuscenes_filter_params['enable_motion'] = st.checkbox(
-                        "Enable Motion Filter",
-                        value=st.session_state.nuscenes_filter_params['enable_motion'],
-                        help="Skip static frames (sequential samples)",
-                        key="nuscenes_enable_motion"
-                    )
-                    if st.session_state.nuscenes_filter_params['enable_motion']:
-                        st.session_state.nuscenes_filter_params['motion_thresh'] = st.slider(
-                            "Motion Threshold",
-                            0, 20,
-                            st.session_state.nuscenes_filter_params['motion_thresh'],
-                            help="Minimum motion score between frames",
-                            key="nuscenes_motion_thresh"
-                        )
-
-                with col2:
-                    st.session_state.nuscenes_filter_params['enable_brightness'] = st.checkbox(
-                        "Enable Brightness Filter",
-                        value=st.session_state.nuscenes_filter_params['enable_brightness'],
-                        help="Remove over/under-exposed images",
-                        key="nuscenes_enable_brightness"
-                    )
-                    if st.session_state.nuscenes_filter_params['enable_brightness']:
-                        st.session_state.nuscenes_filter_params['min_bright'] = st.slider(
-                            "Min Brightness",
-                            0, 255,
-                            st.session_state.nuscenes_filter_params['min_bright'],
-                            key="nuscenes_min_bright"
-                        )
-                        st.session_state.nuscenes_filter_params['max_bright'] = st.slider(
-                            "Max Brightness",
-                            0, 255,
-                            st.session_state.nuscenes_filter_params['max_bright'],
-                            key="nuscenes_max_bright"
-                        )
-
-                    st.session_state.nuscenes_filter_params['enable_contrast'] = st.checkbox(
-                        "Enable Contrast Filter",
-                        value=st.session_state.nuscenes_filter_params['enable_contrast'],
-                        help="Remove low-contrast images",
-                        key="nuscenes_enable_contrast"
-                    )
-                    if st.session_state.nuscenes_filter_params['enable_contrast']:
-                        st.session_state.nuscenes_filter_params['min_contrast'] = st.slider(
-                            "Min Contrast",
-                            0.0, 0.5,
-                            st.session_state.nuscenes_filter_params['min_contrast'],
-                            step=0.01,
-                            key="nuscenes_min_contrast"
-                        )
+            # Filter configuration (shared UI)
+            render_filter_controls(prefix="nuscenes", title="nuScenes")
 
             # Random batch parameters
             col_n1, col_n2 = st.columns(2)
@@ -736,6 +774,54 @@ def main():
                         key="rosbag_tf_topic_text",
                     ) or None
 
+            # Sidebar controls to choose calibration frames (once TF topic is known)
+            if tf_topic:
+                tf_frames = get_ros_tf_frames(bag_path_obj, [tf_topic])
+                if tf_frames:
+                    # Initialize defaults in session_state so choices persist
+                    if "rosbag_camera_frame_override" not in st.session_state:
+                        st.session_state.rosbag_camera_frame_override = tf_frames[0]
+                    if "rosbag_lidar_frame_override" not in st.session_state:
+                        st.session_state.rosbag_lidar_frame_override = tf_frames[min(1, len(tf_frames) - 1)]
+
+                    with st.sidebar:
+                        st.markdown("### ROS calibration frames")
+                        st.session_state.rosbag_camera_frame_override = st.selectbox(
+                            "Camera frame for calibration",
+                            tf_frames,
+                            index=tf_frames.index(st.session_state.rosbag_camera_frame_override)
+                            if st.session_state.rosbag_camera_frame_override in tf_frames
+                            else 0,
+                            help="TF frame to treat as camera for camera→LiDAR transform",
+                            key="rosbag_camera_frame_override_select",
+                        )
+                        st.session_state.rosbag_lidar_frame_override = st.selectbox(
+                            "LiDAR frame for calibration",
+                            tf_frames,
+                            index=tf_frames.index(st.session_state.rosbag_lidar_frame_override)
+                            if st.session_state.rosbag_lidar_frame_override in tf_frames
+                            else min(1, len(tf_frames) - 1),
+                            help="TF frame to treat as LiDAR for camera→LiDAR transform",
+                            key="rosbag_lidar_frame_override_select",
+                        )
+
+                        # Recompute calibration immediately when frame selection changes
+                        calib = compute_rosbag_calibration(
+                            bag_path=bag_path_obj,
+                            image_topic=image_topic,
+                            pointcloud_topic=pointcloud_topic,
+                            camera_info_topic=camera_info_topic,
+                            tf_topics=[tf_topic] if tf_topic else None,
+                            camera_frame_override=st.session_state.rosbag_camera_frame_override,
+                            lidar_frame_override=st.session_state.rosbag_lidar_frame_override,
+                        )
+                        st.session_state.rosbag_calibration = {
+                            "camera_intrinsic": calib.camera_intrinsic,
+                            "camera_to_lidar": calib.camera_to_lidar_transform,
+                            "camera_frame": calib.camera_frame,
+                            "lidar_frame": calib.lidar_frame,
+                        }
+
             # Initialize ROS bag filter params (reuse KITTI defaults)
             if "rosbag_filter_params" not in st.session_state:
                 st.session_state.rosbag_filter_params = {
@@ -760,106 +846,57 @@ def main():
                 "Apply the same quality filters as for KITTI/nuScenes, but directly on the ROS bag frames."
             )
 
-            with st.expander("⚙️ Filter Settings (ROS bag)", expanded=False):
-                col_f1, col_f2 = st.columns(2)
+            # Filter configuration (shared UI) plus ROS bag–specific limit
+            render_filter_controls(prefix="rosbag", title="ROS bag")
+            rosbag_max_frames = st.number_input(
+                "Max frames to consider from bag (0 = all)",
+                min_value=0,
+                value=0,
+                step=1,
+                key="rosbag_max_frames",
+            )
 
-                with col_f1:
-                    rp = st.session_state.rosbag_filter_params
-                    rp["enable_blur"] = st.checkbox(
-                        "Enable Blur Filter",
-                        value=rp["enable_blur"],
-                        help="Remove blurry images using Laplacian variance",
-                        key="rosbag_enable_blur",
-                    )
-                    if rp["enable_blur"]:
-                        rp["blur_gate"] = st.slider(
-                            "Blur Gate (Laplacian Variance)",
-                            0,
-                            500,
-                            rp["blur_gate"],
-                            help="Minimum Laplacian variance (higher = sharper)",
-                            key="rosbag_blur_gate",
-                        )
+            # Simple subsampling option: take every n-th ROS bag frame without applying quality filters
+            st.markdown("**Alternatively, create a simple batch by taking every n-th ROS bag frame (no quality filters).**")
+            col_stride1, col_stride2 = st.columns(2)
+            with col_stride1:
+                rosbag_stride = st.number_input(
+                    "Take every n-th frame (ROS bag)",
+                    min_value=1,
+                    value=10,
+                    step=1,
+                    key="rosbag_stride_every_nth",
+                )
+            with col_stride2:
+                rosbag_simple_max = st.number_input(
+                    "Max sampled frames (0 = unlimited)",
+                    min_value=0,
+                    value=0,
+                    step=1,
+                    key="rosbag_simple_max_frames",
+                )
 
-                    rp["enable_dedup"] = st.checkbox(
-                        "Enable Deduplication",
-                        value=rp["enable_dedup"],
-                        help="Remove visually similar images",
-                        key="rosbag_enable_dedup",
+            if st.button(
+                "📚 Sample ROS bag every n-th frame (skip quality filters)",
+                key="rosbag_sample_every_nth",
+            ):
+                with st.spinner("Sampling ROS bag frames (every n-th)..."):
+                    stride = int(rosbag_stride)
+                    max_simple = int(rosbag_simple_max) if rosbag_simple_max > 0 else None
+                    sampled_frames = _sample_rosbag_frames_every_nth(
+                        bag_path=bag_path_obj,
+                        image_topic=image_topic,
+                        stride=stride,
+                        max_frames=max_simple,
                     )
-                    if rp["enable_dedup"]:
-                        rp["hash_thresh"] = st.slider(
-                            "Deduplication Threshold (Hamming)",
-                            0,
-                            16,
-                            rp["hash_thresh"],
-                            help="Maximum Hamming distance for duplicates",
-                            key="rosbag_hash_thresh",
-                        )
-
-                    rp["enable_motion"] = st.checkbox(
-                        "Enable Motion Filter",
-                        value=rp["enable_motion"],
-                        help="Skip static frames (sequential messages)",
-                        key="rosbag_enable_motion",
+                    st.session_state.rosbag_filtered_frames = sampled_frames
+                if sampled_frames:
+                    st.success(
+                        f"✅ Selected {len(sampled_frames)} frames by taking every {stride}-th message."
                     )
-                    if rp["enable_motion"]:
-                        rp["motion_thresh"] = st.slider(
-                            "Motion Threshold",
-                            0,
-                            20,
-                            rp["motion_thresh"],
-                            help="Minimum motion score between frames",
-                            key="rosbag_motion_thresh",
-                        )
-
-                with col_f2:
-                    rp = st.session_state.rosbag_filter_params
-                    rp["enable_brightness"] = st.checkbox(
-                        "Enable Brightness Filter",
-                        value=rp["enable_brightness"],
-                        help="Remove over/under-exposed images",
-                        key="rosbag_enable_brightness",
-                    )
-                    if rp["enable_brightness"]:
-                        rp["min_bright"] = st.slider(
-                            "Min Brightness",
-                            0,
-                            255,
-                            rp["min_bright"],
-                            key="rosbag_min_bright",
-                        )
-                        rp["max_bright"] = st.slider(
-                            "Max Brightness",
-                            0,
-                            255,
-                            rp["max_bright"],
-                            key="rosbag_max_bright",
-                        )
-
-                    rp["enable_contrast"] = st.checkbox(
-                        "Enable Contrast Filter",
-                        value=rp["enable_contrast"],
-                        help="Remove low-contrast images",
-                        key="rosbag_enable_contrast",
-                    )
-                    if rp["enable_contrast"]:
-                        rp["min_contrast"] = st.slider(
-                            "Min Contrast",
-                            0.0,
-                            0.5,
-                            rp["min_contrast"],
-                            step=0.01,
-                            key="rosbag_min_contrast",
-                        )
-
-                    rosbag_max_frames = st.number_input(
-                        "Max frames to consider from bag (0 = all)",
-                        min_value=0,
-                        value=0,
-                        step=1,
-                        key="rosbag_max_frames",
-                    )
+                    st.rerun()
+                else:
+                    st.warning("No frames were sampled. Check the image topic and stride.")
 
             # Button to process bag (filter frames)
             if st.button("🎬 Process bag (filter frames)", type="primary", key="rosbag_process_bag"):
@@ -919,6 +956,8 @@ def main():
                                 progress_callback=None,
                                 camera_info_topic=camera_info_topic,
                                 tf_topics=[tf_topic] if tf_topic else None,
+                                camera_frame_override=st.session_state.get("rosbag_camera_frame_override"),
+                                lidar_frame_override=st.session_state.get("rosbag_lidar_frame_override"),
                             )
                         except Exception as e:
                             st.error(f"Failed to extract filtered frames: {e}")
@@ -940,6 +979,7 @@ def main():
                         st.session_state.process_all_samples = True
                         # Indicate that raw samples have already been saved for batch
                         st.session_state.batch_samples_saved = True
+                        print(f'batch_samples_saved: {st.session_state.batch_samples_saved}, batch_samples: {batch_samples}')
                         st.success(
                             f"✅ Prepared {len(batch_samples)} ROS bag samples. "
                             "Go to **2_Detection** and click **Process entire batch**."
@@ -1005,37 +1045,16 @@ def main():
                             st.rerun()
                         else:
                             st.error("Failed to load sample. Check that image and point cloud files exist in the extracted folder.")
-                    # Show calibration matrices from extracted calib.npz for debugging fusion
-                    calib_path = Path(_batch[0]["dataset_path"]) / "calib.npz"
-                    if calib_path.exists():
-                        with st.expander("📐 Calibration (calib.npz) — inspect for fusion issues"):
-                            try:
-                                calib = np.load(str(calib_path), allow_pickle=True)
-                                camera_intrinsic = calib.get("camera_intrinsic")
-                                camera_to_lidar = calib.get("camera_to_lidar")
-                                camera_frame = calib.get("camera_frame", None)
-                                lidar_frame = calib.get("lidar_frame", None)
-                                if camera_frame is not None and hasattr(camera_frame, "item"):
-                                    camera_frame = camera_frame.item()
-                                if lidar_frame is not None and hasattr(lidar_frame, "item"):
-                                    lidar_frame = lidar_frame.item()
-                                st.markdown("**Frames**")
-                                st.text(f"camera_frame: {camera_frame}\nlidar_frame: {lidar_frame}")
-                                st.markdown("**Camera intrinsic (3×3)** — maps camera 3D to image (u,v)")
-                                if camera_intrinsic is not None:
-                                    st.dataframe(np.asarray(camera_intrinsic).round(4))
-                                else:
-                                    st.warning("Missing")
-                                st.markdown("**Camera → LiDAR transform (4×4)** — transforms points from camera to LiDAR frame")
-                                if camera_to_lidar is not None:
-                                    st.dataframe(np.asarray(camera_to_lidar).round(4))
-                                else:
-                                    st.warning("Missing")
-                            except Exception as e:
-                                st.error(f"Could not load calib.npz: {e}")
-                    else:
-                        with st.expander("📐 Calibration (calib.npz)"):
-                            st.warning(f"No calib.npz found at {calib_path}. Fusion may use identity matrices.")
+                    # Optional: load all extracted ROS bag samples as a batch for the Detection page
+                    if st.button("📚 Load all extracted ROS bag samples for detection", key="load_all_rosbag_for_detection"):
+                        st.session_state.batch_samples = _batch
+                        st.session_state.process_all_samples = True
+                        st.success(
+                            f"✅ Prepared {len(_batch)} ROS bag samples. "
+                            "Go to **2_Detection** and click **Process entire batch**."
+                        )
+                        st.rerun()
+                    # Calibration is now tracked live in st.session_state.rosbag_calibration
 
         elif dataset_type == "sim":
             # sim/LinkedDataHandler: Filter images and create batch selection
@@ -1080,6 +1099,44 @@ def main():
                         Only images that pass all enabled filters will be available for selection.
                         """)
 
+                        # Simple subsampling option: take every n-th sim link without quality filtering
+                        st.markdown("**Alternatively, create a simple batch by taking every n-th sim sample (no quality filters).**")
+                        sim_stride = st.number_input(
+                            "Take every n-th sample (Sim)",
+                            min_value=1,
+                            max_value=max(1, len(links)),
+                            value=min(10, max(1, len(links))),
+                            step=1,
+                            key=f"sim_stride_every_nth_{selected_subset}",
+                        )
+                        if st.button(
+                            "📚 Load every n-th sim sample for detection",
+                            key=f"load_every_nth_sim_for_detection_{selected_subset}",
+                        ):
+                            with st.spinner("Preparing every n-th sim sample for detection..."):
+                                step = int(sim_stride)
+                                indices_every_nth = _every_nth_indices(len(links), step)
+                                batch_samples = []
+                                for idx in indices_every_nth:
+                                    link = links[int(idx)]
+                                    batch_samples.append(
+                                        {
+                                            "dataset_type": "sim",
+                                            "dataset_path": dataset_path,
+                                            "sample_index": link["token"],
+                                            "image_path": "",
+                                            # Sim LiDAR path is resolved in the sim dataset loader.
+                                            "point_cloud_path": "",
+                                        }
+                                    )
+                                st.session_state.batch_samples = batch_samples
+                                st.session_state.process_all_samples = True
+                                st.success(
+                                    f"✅ Prepared {len(batch_samples)} sim samples by taking every {step}-th element. "
+                                    "Go to **2_Detection** and click **Process entire batch**."
+                                )
+                                st.rerun()
+
                         # Quick presets for indoor / outdoor scenes
                         col_sim_preset1, col_sim_preset2 = st.columns(2)
                         with col_sim_preset1:
@@ -1119,80 +1176,8 @@ def main():
                                 )
                                 st.rerun()
                         
-                        # Filter configuration
-                        with st.expander("⚙️ Filter Settings", expanded=True):
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                st.session_state.sim_filter_params['enable_blur'] = st.checkbox(
-                                    "Enable Blur Filter", 
-                                    value=st.session_state.sim_filter_params['enable_blur'],
-                                    help="Remove blurry images using Laplacian variance"
-                                )
-                                if st.session_state.sim_filter_params['enable_blur']:
-                                    st.session_state.sim_filter_params['blur_gate'] = st.slider(
-                                        "Blur Gate (Laplacian Variance)", 
-                                        0, 500, 
-                                        st.session_state.sim_filter_params['blur_gate'],
-                                        help="Minimum Laplacian variance (higher = sharper)"
-                                    )
-                                
-                                st.session_state.sim_filter_params['enable_dedup'] = st.checkbox(
-                                    "Enable Deduplication", 
-                                    value=st.session_state.sim_filter_params['enable_dedup'],
-                                    help="Remove visually similar images"
-                                )
-                                if st.session_state.sim_filter_params['enable_dedup']:
-                                    st.session_state.sim_filter_params['hash_thresh'] = st.slider(
-                                        "Deduplication Threshold (Hamming)", 
-                                        0, 16, 
-                                        st.session_state.sim_filter_params['hash_thresh'],
-                                        help="Maximum Hamming distance for duplicates"
-                                    )
-                                
-                                st.session_state.sim_filter_params['enable_motion'] = st.checkbox(
-                                    "Enable Motion Filter", 
-                                    value=st.session_state.sim_filter_params['enable_motion'],
-                                    help="Skip static frames (requires sequential processing)"
-                                )
-                                if st.session_state.sim_filter_params['enable_motion']:
-                                    st.session_state.sim_filter_params['motion_thresh'] = st.slider(
-                                        "Motion Threshold", 
-                                        0, 20, 
-                                        st.session_state.sim_filter_params['motion_thresh'],
-                                        help="Minimum motion score between frames"
-                                    )
-                            
-                            with col2:
-                                st.session_state.sim_filter_params['enable_brightness'] = st.checkbox(
-                                    "Enable Brightness Filter", 
-                                    value=st.session_state.sim_filter_params['enable_brightness'],
-                                    help="Remove over/under-exposed images"
-                                )
-                                if st.session_state.sim_filter_params['enable_brightness']:
-                                    st.session_state.sim_filter_params['min_bright'] = st.slider(
-                                        "Min Brightness", 
-                                        0, 255, 
-                                        st.session_state.sim_filter_params['min_bright']
-                                    )
-                                    st.session_state.sim_filter_params['max_bright'] = st.slider(
-                                        "Max Brightness", 
-                                        0, 255, 
-                                        st.session_state.sim_filter_params['max_bright']
-                                    )
-                                
-                                st.session_state.sim_filter_params['enable_contrast'] = st.checkbox(
-                                    "Enable Contrast Filter", 
-                                    value=st.session_state.sim_filter_params['enable_contrast'],
-                                    help="Remove low-contrast images"
-                                )
-                                if st.session_state.sim_filter_params['enable_contrast']:
-                                    st.session_state.sim_filter_params['min_contrast'] = st.slider(
-                                        "Min Contrast", 
-                                        0.0, 0.5, 
-                                        st.session_state.sim_filter_params['min_contrast'],
-                                        step=0.01
-                                    )
+                        # Filter configuration (shared UI)
+                        render_filter_controls(prefix="sim", title="Sim Dataset", expanded=True)
                         
                         # Filter images button
                         if st.button("🔍 Filter Images", type="primary", key="filter_sim_images"):
@@ -1317,7 +1302,112 @@ def main():
                 import traceback
                 st.code(traceback.format_exc())
     
+    # Global bag frequency control for batch processing / tracking
+    if st.session_state.get("process_all_samples") or st.session_state.get("batch_samples"):
+        if "bag_freq_hz" not in st.session_state.params:
+            st.session_state.params["bag_freq_hz"] = 45.0
+        with st.sidebar.expander("⏱️ Bag Frequency (tracking)", expanded=False):
+            st.session_state.params["bag_freq_hz"] = st.number_input(
+                "Bag Frequency (Hz)",
+                min_value=1.0,
+                max_value=200.0,
+                value=float(st.session_state.params["bag_freq_hz"]),
+                step=1.0,
+                help="Sampling frequency of the sequence. Used for motion-based tracking (default 45 Hz).",
+                key="bag_freq_hz_input",
+            )
 
+    # Persist currently loaded sample GT for downstream pages (Evaluation/Export).
+    if st.session_state.get("sample") is not None:
+        current_meta = st.session_state.sample.get("sample_meta_data", {})
+        gt_boxes = current_meta.get("ground_truth_boxes", [])
+        st.session_state.ground_truth_annotations = gt_boxes
+        st.session_state.ground_truth_2d_boxes = [
+            box for box in gt_boxes if box.get("bbox_2d") is not None
+        ]
+    elif "ground_truth_annotations" not in st.session_state:
+        st.session_state.ground_truth_annotations = []
+        st.session_state.ground_truth_2d_boxes = []
+
+    # Global calibration summary, resolved from the current session/sample
+    st.markdown("---")
+    with st.expander("📐 Current calibration (from loaded sample)"):
+        calib, dataset_type, sample_index = _resolve_current_calibration(
+            st.session_state.get("current_dataset_type")
+        )
+
+        if calib:
+            camera_intrinsic = calib.get("camera_intrinsic")
+            camera_to_lidar = calib.get("camera_to_lidar")
+            camera_frame = calib.get("camera_frame")
+            lidar_frame = calib.get("lidar_frame")
+
+            if dataset_type is not None:
+                st.markdown(f"**Dataset:** {str(dataset_type).upper()}  |  **Sample:** {sample_index}")
+
+            if camera_frame is not None or lidar_frame is not None:
+                st.markdown("**Frames**")
+                st.text(f"camera_frame: {camera_frame}\nlidar_frame: {lidar_frame}")
+
+            st.markdown("**Camera intrinsic (3×3)** — maps camera 3D to image (u,v)")
+            if camera_intrinsic is not None:
+                st.dataframe(np.asarray(camera_intrinsic).round(4))
+            else:
+                st.warning("Missing camera_intrinsic")
+
+            st.markdown("**Camera → LiDAR transform (4×4)** — transforms points from camera to LiDAR frame")
+            if camera_to_lidar is not None:
+                st.dataframe(np.asarray(camera_to_lidar).round(4))
+            else:
+                st.warning("Missing camera_to_lidar")
+        else:
+            st.info(
+                "No calibration data available yet. "
+                "Load a sample on this page (KITTI / nuScenes / sim / ROS bag) to populate calibration "
+                "used by the Projection object in **2_Detection**."
+            )
+
+
+def _sample_rosbag_frames_every_nth(
+    bag_path: Path,
+    image_topic: str,
+    stride: int,
+    max_frames: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Sample frames from a ROS bag image topic by taking every n-th message.
+
+    This intentionally ignores quality filters and only uses message index.
+    Returns a list of dicts compatible with rosbag_filtered_frames.
+    """
+    from components.dataset_loaders.rosbag_extractor import open_reader
+
+    bag_path = Path(bag_path)
+    frames: List[Dict[str, Any]] = []
+
+    with open_reader(bag_path) as reader:
+        img_conns = [c for c in reader.connections if c.topic == image_topic]
+        if not img_conns:
+            return []
+
+        msg_index = 0
+        accepted_index = 0
+
+        for conn, ts, _raw in reader.messages(connections=img_conns):
+            if msg_index % stride == 0:
+                if max_frames is not None and accepted_index >= max_frames:
+                    break
+                frames.append(
+                    {
+                        "frame_index": accepted_index,
+                        "timestamp_ns": int(ts),
+                        "metrics": {},
+                    }
+                )
+                accepted_index += 1
+            msg_index += 1
+
+    return frames
 
 def _filter_kitti_images(*args, **kwargs):
     """Backward-compat wrapper (deprecated). Use components.core.filter.filter_kitti_images instead."""

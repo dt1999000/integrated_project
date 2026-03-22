@@ -7,12 +7,16 @@ when the class name is not in the predefined templates.
 
 from typing import Tuple, Optional, Dict, List
 import re
+import os
 
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
     HF_AVAILABLE = True
 except ImportError:
+    AutoTokenizer = None
+    AutoModelForCausalLM = None
+    torch = None
     HF_AVAILABLE = False
     print("Warning: transformers library not available. Install with: pip install transformers torch")
 
@@ -44,6 +48,60 @@ _llm_temperature = 0.3
 # Dimension cache to avoid repeated queries for the same class names
 _dimension_cache: Dict[str, Tuple[float, float, float]] = {}
 
+# Common aliases to avoid unnecessary LLM fallback calls
+_CLASS_ALIASES: Dict[str, str] = {
+    "bicycle": "Cyclist",
+    "bike": "Cyclist",
+    "cyclist": "Cyclist",
+    "motorcycle": "Cyclist",
+    "motorbike": "Cyclist",
+    "person": "Person",
+    "pedestrian": "Pedestrian",
+    "human": "Person",
+    "bus": "Tram",
+    "coach": "Tram",
+    "lorry": "Truck",
+}
+
+
+def _normalize_class_name(class_name: Optional[str]) -> str:
+    """Normalize a class name for robust matching and cache keys."""
+    if class_name is None:
+        return ""
+    return " ".join(class_name.strip().lower().split())
+
+
+def _resolve_template_match(class_name: Optional[str]) -> Optional[str]:
+    """Resolve class_name to a known KITTI template key if possible."""
+    normalized = _normalize_class_name(class_name)
+    if not normalized:
+        return None
+
+    # Exact match on known key (case-insensitive)
+    for key in KITTI_CUBOID_TEMPLATES:
+        if key.lower() == normalized:
+            return key
+
+    # Alias match
+    alias_key = _CLASS_ALIASES.get(normalized)
+    if alias_key is not None and alias_key in KITTI_CUBOID_TEMPLATES:
+        return alias_key
+
+    # Lightweight semantic token match for common classes
+    if "bus" in normalized and "Tram" in KITTI_CUBOID_TEMPLATES:
+        return "Tram"
+    if any(token in normalized for token in ("truck", "lorry")) and "Truck" in KITTI_CUBOID_TEMPLATES:
+        return "Truck"
+    if any(token in normalized for token in ("bike", "bicycle", "cyclist", "motorcycle")) and "Cyclist" in KITTI_CUBOID_TEMPLATES:
+        return "Cyclist"
+    if any(token in normalized for token in ("person", "pedestrian", "human")):
+        if "Person" in KITTI_CUBOID_TEMPLATES:
+            return "Person"
+        if "Pedestrian" in KITTI_CUBOID_TEMPLATES:
+            return "Pedestrian"
+
+    return None
+
 
 def set_llm_temperature(temperature: float):
     """
@@ -63,20 +121,43 @@ def get_llm_temperature() -> float:
 
 
 def _get_llm_model():
-    """Get or initialize the LLM model (cached)"""
+    """Get or initialize the LLM model (cached)."""
     global _model_cache, _tokenizer_cache
     
     if not HF_AVAILABLE:
         return None, None
+    assert AutoTokenizer is not None and AutoModelForCausalLM is not None and torch is not None
+
+    # Default safety behavior: disabled, so no large model downloads happen unexpectedly.
+    # Enable only when needed: export LLM_ENABLE_MODEL_QUERY=1
+    llm_enabled = os.getenv("LLM_ENABLE_MODEL_QUERY", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not llm_enabled:
+        print("[LLM Service] LLM model loading disabled (LLM_ENABLE_MODEL_QUERY=0). Using template defaults.")
+        return None, None
+
+    # Default to local-only model loading (no network fetch).
+    # Allow downloads only if explicitly requested: export LLM_ALLOW_DOWNLOAD=1
+    allow_download = os.getenv("LLM_ALLOW_DOWNLOAD", "0").strip().lower() in {"1", "true", "yes", "on"}
+    local_files_only = not allow_download
     
     if _model_cache is None:
         try:
-            # Use a small, free model that can generate text
-            # Using GPT-2 as it's lightweight and free
-            model_name = "gpt2"
+            model_name = os.getenv("LLM_MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct").strip()
             print(f"[LLM Service] Loading LLM model: {model_name}...")
-            _tokenizer_cache = AutoTokenizer.from_pretrained(model_name)
-            _model_cache = AutoModelForCausalLM.from_pretrained(model_name)
+            _tokenizer_cache = AutoTokenizer.from_pretrained(model_name, local_files_only=local_files_only)
+
+            load_kwargs: Dict[str, object] = {"low_cpu_mem_usage": True}
+            # Respect both CUDA availability and the UI preference exposed via LLM_USE_CUDA
+            use_cuda_pref = os.getenv("LLM_USE_CUDA", "0").strip().lower() in {"1", "true", "yes", "on"}
+            if torch.cuda.is_available() and use_cuda_pref:
+                load_kwargs["device_map"] = "auto"
+                load_kwargs["torch_dtype"] = "auto"
+
+            _model_cache = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                local_files_only=local_files_only,
+                **load_kwargs,
+            )
             
             # Set pad token if not present
             if _tokenizer_cache.pad_token is None:
@@ -109,19 +190,24 @@ def get_default_dimensions(class_name: Optional[str]) -> Tuple[float, float, flo
         # Use Unknown template as generic default
         template = KITTI_CUBOID_TEMPLATES.get('Unknown', {'length': 2.0, 'width': 1.5, 'height': 1.5})
         return (float(template['length']), float(template['width']), float(template['height']))
-    
-    # First try direct lookup (case-sensitive)
-    template = KITTI_CUBOID_TEMPLATES.get(class_name)
-    if template is not None:
-        print(f"[LLM Service] Found exact match for '{class_name}' in templates")
+
+    # Special-case a few common non-KITTI classes so they don't fall back
+    # to the very generic Unknown template when the LLM is disabled.
+    normalized = _normalize_class_name(class_name)
+    if "chair" in normalized:
+        # Rough dimensions for a typical chair
+        print(f"[LLM Service] Using built-in defaults for '{class_name}' (chair)")
+        return 0.5, 0.5, 1.0
+    if "door handle" in normalized or "doorknob" in normalized or "door knob" in normalized:
+        # Very small object near a door
+        print(f"[LLM Service] Using built-in defaults for '{class_name}' (door handle)")
+        return 0.2, 0.05, 0.05
+
+    resolved_key = _resolve_template_match(class_name)
+    if resolved_key is not None:
+        template = KITTI_CUBOID_TEMPLATES[resolved_key]
+        print(f"[LLM Service] Found semantic/template match: '{class_name}' -> '{resolved_key}'")
         return (float(template['length']), float(template['width']), float(template['height']))
-    
-    # Try case-insensitive lookup
-    class_lower = class_name.lower()
-    for key, value in KITTI_CUBOID_TEMPLATES.items():
-        if key.lower() == class_lower:
-            print(f"[LLM Service] Found case-insensitive match: '{class_name}' -> '{key}'")
-            return (float(value['length']), float(value['width']), float(value['height']))
     
     # Fallback to Unknown template
     template = KITTI_CUBOID_TEMPLATES.get('Unknown', {'length': 2.0, 'width': 1.5, 'height': 1.5})
@@ -148,7 +234,8 @@ def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
         (length, width, height) tuple in meters
     """
     # Check cache first
-    cached_dims = _dimension_cache.get(class_name)
+    normalized_class_name = _normalize_class_name(class_name)
+    cached_dims = _dimension_cache.get(normalized_class_name)
     if cached_dims is not None:
         print(f"[LLM Service] Using cached dimensions for '{class_name}': {cached_dims}")
         return cached_dims
@@ -171,6 +258,7 @@ def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
         # Fallback to class-specific default dimensions
         print(f"[LLM Service] LLM not available, using default dimensions for {class_name}: {default_dims}")
         return default_dims
+    assert torch is not None
     
     model, tokenizer = _get_llm_model()
     if model is None or tokenizer is None:
@@ -182,38 +270,44 @@ def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
         # Few-shot prompt so GPT-2 continues with numbers (it repeats patterns)
         # End with " (" so the model is primed to output digits
         prompt = (
-            "Dimensions in meters (length, width, height):\n"
-            "Person: (0.5, 0.5, 1.7)\n"
-            "Car: (4.0, 1.8, 1.6)\n"
-            "Bicycle: (1.8, 0.6, 1.2)\n"
-            f"{class_name}: ("
+            "Return only three numbers for object dimensions in meters as: length, width, height\n"
+            "Examples:\n"
+            "Person: 0.5, 0.5, 1.7\n"
+            "Car: 4.0, 1.8, 1.6\n"
+            "Bicycle: 1.8, 0.6, 1.2\n"
+            f"{class_name}: "
         )
         
         print(f"[LLM Service] Querying LLM for '{class_name}'...")
         print(f"[LLM Service] Prompt: {prompt}")
         
         # Tokenize input
-        inputs = tokenizer.encode(prompt, return_tensors="pt")
-        print(f"[LLM Service] Input tokens: {inputs.shape[1]}")
+        tokenized = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        input_ids = tokenized["input_ids"].to(model.device)
+        attention_mask = tokenized["attention_mask"].to(model.device)
+        print(f"[LLM Service] Input tokens: {input_ids.shape[1]}")
         
         # Generate response: we need just a few more tokens for "X.X, Y.Y, Z.Z)"
         with torch.no_grad():
             outputs = model.generate(
-                inputs,
-                max_length=inputs.shape[1] + 25,  # Enough for "1.2, 0.8, 1.5)"
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=16,
                 num_return_sequences=1,
-                temperature=_llm_temperature,  # Use configurable temperature
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id
+                do_sample=False,
+                repetition_penalty=1.15,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
             )
         
         print(f"[LLM Service] Generated tokens: {outputs.shape[1]}")
         
         # Decode the generated text
         generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract the prompt part and the generated part
-        generated_part = generated_text[len(prompt):].strip()
+
+        # Decode only newly generated tokens
+        new_tokens = outputs[0][input_ids.shape[1]:]
+        generated_part = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         
         print(f"[LLM Service] Full generated text: {generated_text}")
         print(f"[LLM Service] Generated part: {generated_part}")
@@ -224,7 +318,7 @@ def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
         print(f"[LLM Service] Extracted dimensions: length={length:.2f}m, width={width:.2f}m, height={height:.2f}m")
         
         # Cache the result
-        _dimension_cache[class_name] = (length, width, height)
+        _dimension_cache[normalized_class_name] = (length, width, height)
         
         return length, width, height
         
@@ -247,6 +341,19 @@ def _extract_tuple_from_text(text: str, class_name: str) -> Tuple[float, float, 
     
     print(f"[LLM Service] Extracting tuple from text: '{text[:200]}'")
     
+    # Pattern 0: strict beginning of generated text (most reliable)
+    # Supports optional wrapping parentheses.
+    strict_start_pattern = r'^\s*[\(\[]?\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)'
+    match = re.search(strict_start_pattern, text)
+    if match:
+        try:
+            length, width, height = float(match.group(1)), float(match.group(2)), float(match.group(3))
+            if all(0.1 <= v <= 20.0 for v in [length, width, height]):
+                print(f"[LLM Service] Strict-start pattern matched: ({length}, {width}, {height})")
+                return length, width, height
+        except ValueError as e:
+            print(f"[LLM Service] Strict-start pattern matched but ValueError: {e}")
+
     # Pattern 1: Tuple format (X.XX, Y.YY, Z.ZZ) or [X.XX, Y.YY, Z.ZZ]
     pattern1 = r'[\(\[]\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*[\)\]]'
     match = re.search(pattern1, text)

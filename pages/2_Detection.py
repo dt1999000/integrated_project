@@ -17,11 +17,15 @@ import streamlit as st
 import torch
 
 from components.core.pointcloud_projection import PointCloud, Projection
-from components.core.depth_estimation import compute_sparse_depth_map
-from components.core.sam_integration import SAMIntegration, assign_points_to_masks, get_available_models
+from components.core.sam_integration import (
+    SAMIntegration,
+    assign_points_to_masks,
+    get_available_models,
+    get_bbox_from_mask,
+    calculate_iou,
+)
 from components.core.pose_estimation import fit_cuboid_to_points
 from components.core.clustering_manager import ClusteringManager, select_best_cluster_points
-from components.core.utils import get_bbox_from_mask, calculate_iou
 from components.core.tracking import ObjectTracker
 from components.dataset_loaders.utils import load_dataset_sample
 from components.utils.visualization_helper import (
@@ -36,7 +40,6 @@ from components.utils.visualization_helper import (
 # ============================================================================
 # Helper Functions
 # ============================================================================
-# Note: _get_bbox_from_mask and _calculate_iou are now imported from components.core.utils
 
 
 def save_sample_to_hard_drive_after_processing(
@@ -51,15 +54,15 @@ def save_sample_to_hard_drive_after_processing(
     - image as PNG
     - point cloud as PCD (XYZ)
     """
-    # If a batch of raw samples (e.g., extracted from a ROS bag) has already been
-    # saved, skip saving again here to avoid duplicate disk writes.
-    if st.session_state.get("batch_samples_saved", False):
+    # If user disabled saving or a batch of raw samples (e.g., extracted from a ROS bag)
+    # has already been saved, skip saving again here to avoid duplicate disk writes.
+    if not st.session_state.get("save_processed_samples", True):
         return
 
     output_root = st.session_state.get("output_root_dir", "")
     if not output_root:
         return
-
+    print(f'get sample {base_name}')
     root_path = Path(output_root).expanduser()
     images_dir = root_path / "images"
     lidar_dir = root_path / "lidar"
@@ -80,7 +83,7 @@ def save_sample_to_hard_drive_after_processing(
             img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(img_path), img_bgr)
         except Exception:
-            pass
+            print(f'failed to save image with error: {Exception}')
 
     # Save point cloud as PCD (XYZ)
     if point_cloud is not None and len(point_cloud) > 0:
@@ -90,7 +93,73 @@ def save_sample_to_hard_drive_after_processing(
             pcd.points = o3d.utility.Vector3dVector(point_cloud[:, :3])
             o3d.io.write_point_cloud(str(pcd_path), pcd, write_ascii=True)
         except Exception:
-            pass
+            print(f'failed to save point cloud with error: {Exception}')
+
+
+def default_detection_params() -> Dict:
+    """Default pipeline/session parameters (single source of truth for merges)."""
+    return {
+        "pipeline": {
+            "distance_threshold": 0.3,
+            "ransac_n": 3,
+            "num_iterations": 1000,
+            "filter_forward_only": False,
+        },
+        "clustering": {
+            "dbscan_eps": 0.5,
+            "dbscan_min_samples": 5,
+            "volume_factor": 1.5,
+        },
+        "cuboid_fitting": {
+            "w_distance": 1.0,
+            "w_geometric": 0.5,
+            "w_outlier": 2.0,
+            "step_center_search": 0.2,
+            "max_step_center": 10,
+            "d_theta": 0.05,
+        },
+        "bag_freq_hz": 45.0,
+        "class_max_speed_mps": {
+            "car": 40.0,
+            "truck": 35.0,
+            "bus": 35.0,
+            "bicycle": 15.0,
+            "bike": 15.0,
+            "motorcycle": 25.0,
+            "person": 5.0,
+            "pedestrian": 5.0,
+            "default": 50.0,
+        },
+        "sam_model_type": "sam2_t",
+        "image_track_mode": "appearance",
+        "class_names": ["car", "person", "bicycle"],
+        "yolo_model_path": None,
+        "yolo_conf_threshold": 0.25,
+        "use_gpu": True,
+    }
+
+
+def _copy_param_value(val):
+    if isinstance(val, dict):
+        return dict(val)
+    if isinstance(val, list):
+        return list(val)
+    return val
+
+
+def ensure_detection_params(params: Dict) -> None:
+    """Fill missing keys from defaults (e.g. batch path created params = {})."""
+    defaults = default_detection_params()
+    for key, default_val in defaults.items():
+        if key not in params:
+            params[key] = _copy_param_value(default_val)
+        elif isinstance(default_val, dict):
+            if not isinstance(params[key], dict):
+                params[key] = dict(default_val)
+            else:
+                for sk, sv in default_val.items():
+                    if sk not in params[key]:
+                        params[key][sk] = _copy_param_value(sv)
 
 
 # ============================================================================
@@ -102,7 +171,8 @@ def step_1_ground_plane_removal(
     distance_threshold: float = 0.3,
     ransac_n: int = 3,
     num_iterations: int = 1000,
-    filter_forward_only: bool = False
+    filter_forward_only: bool = False,
+    camera_to_lidar_transform: Optional[np.ndarray] = None,
 ) -> Dict:
     """
     Step 1: Remove ground plane from point cloud using RANSAC.
@@ -112,7 +182,11 @@ def step_1_ground_plane_removal(
         distance_threshold: RANSAC distance threshold
         ransac_n: RANSAC number of points
         num_iterations: RANSAC number of iterations
-        filter_forward_only: Whether to keep only forward-facing points (x > 0)
+        filter_forward_only: Whether to keep only forward-facing points. If
+            camera_to_lidar_transform is provided, this uses the camera z-axis in
+            LiDAR coordinates; otherwise it falls back to x > 0.
+        camera_to_lidar_transform: Optional 4x4 camera-to-LiDAR transform used
+            when filter_forward_only is True to define the forward direction.
     
     Returns:
         Dict with 'point_cloud_obj', 'ground_plane_model', 'ground_z'
@@ -127,7 +201,8 @@ def step_1_ground_plane_removal(
         distance_threshold=distance_threshold,
         ransac_n=ransac_n,
         num_iterations=num_iterations,
-        filter_forward_only=filter_forward_only
+        filter_forward_only=filter_forward_only,
+        camera_to_lidar_transform=camera_to_lidar_transform,
     )
     print(f"Ground plane removed with {len(point_cloud_obj.point_cloud_plane_removed)} points remaining")
     # Get ground_z at origin
@@ -164,23 +239,20 @@ def step_2_sparse_depth_backprojection(
     
     h, w = image.shape[:2]
     camera_intrinsic = sample_meta_data['camera_intrinsic']
+    camera_extrinsic = sample_meta_data.get('camera_extrinsic', np.eye(4))
     camera_to_lidar_transform = sample_meta_data['camera_to_lidar_transform']
     
-    # Create sparse depth map
-    sparse_depth_map = compute_sparse_depth_map(
-        point_cloud=point_cloud,
-        image_shape=(h, w),
-        camera_intrinsic=camera_intrinsic,
-        camera_to_lidar_transform=camera_to_lidar_transform
-    )
-    
-    # Backproject sparse depth map to 3D with colors
     projection = Projection(
         camera_intrinsic=camera_intrinsic,
-        camera_extrinsic=sample_meta_data.get('camera_extrinsic', np.eye(4)),
+        camera_extrinsic=camera_extrinsic,
         camera_to_lidar_transform=camera_to_lidar_transform,
         point_cloud=point_cloud
     )
+    
+    # Create sparse depth map using Projection's camera-frame convention (z_cam > 0)
+    sparse_depth_map = projection.compute_sparse_depth_map((h, w))
+    
+    # Backproject sparse depth map to 3D with colors
     
     colored_sparse_points, colored_sparse_colors = projection.backproject_sparse_depth_map_with_colors(
         sparse_depth_map=sparse_depth_map,
@@ -190,12 +262,28 @@ def step_2_sparse_depth_backprojection(
     elapsed_time = time.time() - start_time
     
     return {
+        'projection': projection,
         'sparse_depth_map': sparse_depth_map,
         'colored_sparse_points': colored_sparse_points,
         'colored_sparse_colors': colored_sparse_colors,
         'n_points': len(colored_sparse_points),
         'time': elapsed_time
     }
+
+
+def _ensure_projection(
+    projection: Optional[Projection],
+    sample_meta_data: Dict,
+    sparse_points: np.ndarray,
+) -> Projection:
+    if projection is not None:
+        return projection
+    return Projection(
+        camera_intrinsic=sample_meta_data['camera_intrinsic'],
+        camera_extrinsic=sample_meta_data.get('camera_extrinsic', np.eye(4)),
+        camera_to_lidar_transform=sample_meta_data['camera_to_lidar_transform'],
+        point_cloud=sparse_points,
+    )
 
 
 def step_3_sam_segmentation(
@@ -207,6 +295,7 @@ def step_3_sam_segmentation(
     yolo_model_path: Optional[str] = None,
     conf_threshold: float = 0.25,
     use_gpu: bool = True,
+    projection: Optional[Projection] = None,
 ) -> Dict:
     """
     Step 3: Generate SAM masks using open-vocabulary detection and assign original LiDAR points to masks.
@@ -276,13 +365,19 @@ def step_3_sam_segmentation(
         }
     
     try:
-        # Use the unified segment_by_class_names method
-        segment_results = sam_integration.segment_by_class_names(
-            image=image,
-            class_names=class_names,
-            yolo_model_path=yolo_model_path,
-            conf_threshold=conf_threshold
-        )
+        if sam_model_type == "sam3":
+            segment_results = sam_integration.track_by_class_names_video(
+                image=image,
+                class_names=class_names,
+            )
+        else:
+            # Use the unified segment_by_class_names method
+            segment_results = sam_integration.segment_by_class_names(
+                image=image,
+                class_names=class_names,
+                yolo_model_path=yolo_model_path,
+                conf_threshold=conf_threshold
+            )
         
         sam_masks = segment_results['masks']
         mask_bboxes = segment_results['bboxes']
@@ -303,14 +398,11 @@ def step_3_sam_segmentation(
     # Assign original LiDAR points to masks based on sparse depth map and mask overlap
     mask_assignments = None
     if sam_masks and len(sam_masks) > 0:
-        # Use the sparse points (already backprojected) and assign to masks
-        projection = Projection(
-            camera_intrinsic=sample_meta_data['camera_intrinsic'],
-            camera_extrinsic=sample_meta_data.get('camera_extrinsic', np.eye(4)),
-            camera_to_lidar_transform=sample_meta_data['camera_to_lidar_transform'],
-            point_cloud=sparse_points
+        projection = _ensure_projection(
+            projection=projection,
+            sample_meta_data=sample_meta_data,
+            sparse_points=sparse_points,
         )
-        
         mask_assignments = assign_points_to_masks(
             sparse_points, sam_masks, projection, (h, w)
         )
@@ -337,6 +429,7 @@ def step_4_clustering(
     dbscan_min_samples: int = 5,
     sparse_depth_map: Optional[np.ndarray] = None,
     volume_factor: float = 1.5,
+    projection: Optional[Projection] = None,
 ) -> Dict:
     """
     Step 4: Run DBSCAN clustering on points assigned to each mask.
@@ -371,12 +464,13 @@ def step_4_clustering(
     else:
         h, w = sample_meta_data.get('image_shape', (375, 1242))  # Default KITTI size
     
-    projection = Projection(
-        camera_intrinsic=sample_meta_data['camera_intrinsic'],
-        camera_extrinsic=sample_meta_data.get('camera_extrinsic', np.eye(4)),
-        camera_to_lidar_transform=sample_meta_data['camera_to_lidar_transform'],
-        point_cloud=sparse_points
-    )
+    if projection is None:
+        projection = Projection(
+            camera_intrinsic=sample_meta_data['camera_intrinsic'],
+            camera_extrinsic=sample_meta_data.get('camera_extrinsic', np.eye(4)),
+            camera_to_lidar_transform=sample_meta_data['camera_to_lidar_transform'],
+            point_cloud=sparse_points
+        )
     
     mask_cluster_labels = {}
     clustering_results = []
@@ -690,7 +784,8 @@ def run_full_pipeline(params: Dict) -> Dict:
         sam_model_type=params.get('sam_model_type', 'sam2_t'),
         yolo_model_path=params.get('yolo_model_path', None),
         conf_threshold=params.get('yolo_conf_threshold', 0.25),
-        use_gpu=params.get('use_gpu', True)
+        use_gpu=params.get('use_gpu', True),
+        projection=step_2_result['projection'],
     )
     results['step_3'] = {'completed': True, 'result': step_3_result}
     st.session_state.pipeline_state['step_3'] = results['step_3']
@@ -702,6 +797,7 @@ def run_full_pipeline(params: Dict) -> Dict:
         sam_masks=step_3_result['sam_masks'],
         mask_assignments=step_3_result['mask_assignments'],
         sparse_depth_map=step_2_result['sparse_depth_map'],
+        projection=step_2_result['projection'],
         **params['clustering']
     )
     results['step_4'] = {'completed': True, 'result': step_4_result}
@@ -769,6 +865,18 @@ def _run_pipeline_for_batch_sample(
         "step_4": {"completed": False, "result": None, "time": None, "error": None},
         "step_5": {"completed": False, "result": None, "time": None, "error": None},
     }
+    # If rosbag metadata exposes a measured frequency, keep bag_freq_hz in sync.
+    if dataset_type.lower() == "rosbag":
+        if meta is not None:
+            detected_freq = meta.get("bag_freq_hz")
+            if detected_freq is None:
+                detected_freq = meta.get("bag_frequency_hz")
+            if detected_freq is not None:
+                if "params" not in st.session_state:
+                    st.session_state.params = default_detection_params()
+                else:
+                    ensure_detection_params(st.session_state.params)
+                st.session_state.params["bag_freq_hz"] = float(detected_freq)
     try:
         print("[batch] running full pipeline")
         results = run_full_pipeline(st.session_state.params)
@@ -778,6 +886,12 @@ def _run_pipeline_for_batch_sample(
         import traceback
 
         traceback.print_exc()
+        save_sample_to_hard_drive_after_processing(
+            image=image,
+            point_cloud=point_cloud,
+            sample_meta_data=meta,
+            base_name=f"frame_{frame_index:06d}",
+        )
         return None
     step_5_result = results["step_5"]["result"]
     dataset_type_lower = meta.get("dataset_type", "unknown").lower()
@@ -822,18 +936,62 @@ def _run_pipeline_for_batch_sample(
         if step_3_result is None:
             print("[batch] step_3_result is None, skipping tracker update")
         else:
-            mask_bboxes = step_3_result.get("mask_bboxes", [])
+            sam_masks = step_3_result.get("sam_masks", [])
             class_names = step_3_result.get("class_names", [])
+            sam_integration = st.session_state.get("sam_integration")
+            sam_model_type = st.session_state.params.get("sam_model_type", "sam2_t")
             print(
                 f"[batch] step_3_result: "
-                f"n_bboxes={len(mask_bboxes)}, n_class_names={len(class_names)}"
+                f"n_masks={len(sam_masks)}, n_class_names={len(class_names)}"
             )
-            tracker.update_for_frame(
+            if sam_model_type == "sam3" and sam_integration is not None:
+                mask_to_track = sam_integration.track_masks_with_ids(
+                    masks=sam_masks,
+                    class_names=class_names,
+                )
+                tracker.apply_external_image_tracks(
+                    frame_index=frame_index,
+                    image=image,
+                    masks=sam_masks,
+                    class_names=class_names,
+                    meta=meta,
+                    mask_to_track=mask_to_track,
+                )
+            elif (
+                st.session_state.params.get("image_track_mode") == "sam2_bbox"
+                and sam_model_type.startswith("sam2")
+                and sam_integration is not None
+            ):
+                mask_to_track = tracker.track_on_image_sam2(
+                    frame_index=frame_index,
+                    image=image,
+                    masks=sam_masks,
+                    class_names=class_names,
+                    meta=meta,
+                    sam_integration=sam_integration,
+                )
+            else:
+                if (
+                    st.session_state.params.get("image_track_mode") == "sam2_bbox"
+                    and sam_model_type.startswith("sam2")
+                ):
+                    print(
+                        "[batch] image_track_mode=sam2_bbox but sam_integration is missing; "
+                        "falling back to appearance tracking"
+                    )
+                mask_to_track = tracker.track_on_image(
+                    frame_index=frame_index,
+                    image=image,
+                    masks=sam_masks,
+                    class_names=class_names,
+                    meta=meta,
+                )
+            tracker.match_tracks_with_3d_detections(
                 frame_index=frame_index,
-                image=image,
                 detected_cuboids=step_5_result["detected_cuboids"],
-                mask_bboxes=mask_bboxes,
+                masks=sam_masks,
                 class_names=class_names,
+                mask_to_track=mask_to_track,
                 meta=meta,
             )
 
@@ -875,33 +1033,11 @@ def main():
             'step_5': {'completed': False, 'result': None, 'time': None, 'error': None},
         }
     
-    # Initialize parameters if not set
-    if 'params' not in st.session_state:
-        st.session_state.params = {
-            'pipeline': {
-                'distance_threshold': 0.3,
-                'ransac_n': 3,
-                'num_iterations': 1000,
-                'filter_forward_only': False
-            },
-            'clustering': {
-                'dbscan_eps': 0.5,
-                'dbscan_min_samples': 5
-            },
-            'cuboid_fitting': {
-                'w_distance': 1.0,
-                'w_geometric': 0.5,
-                'w_outlier': 2.0,
-                'step_center_search': 0.2,
-                'max_step_center': 10,
-                'd_theta': 0.05
-            },
-            'sam_model_type': 'sam2_t',
-            'class_names': ['car', 'person', 'bicycle'],
-            'yolo_model_path': None,
-            'yolo_conf_threshold': 0.25,
-            'use_gpu': True
-        }
+    # Initialize parameters; merge defaults if session has partial params (e.g. from batch).
+    if "params" not in st.session_state:
+        st.session_state.params = default_detection_params()
+    else:
+        ensure_detection_params(st.session_state.params)
 
     # Discover available models (cheap; safe on rerun)
     available = get_available_models()
@@ -912,6 +1048,11 @@ def main():
 
     # Sidebar: Parameters
     st.sidebar.header("⚙️ Pipeline Parameters")
+
+    st.session_state["save_processed_samples"] = st.sidebar.checkbox(
+        "Save processed sample to disk",
+        value=st.session_state.get("save_processed_samples", True),
+    )
     
     with st.sidebar.expander("Ground Plane Removal", expanded=False):
         st.session_state.params['pipeline']['distance_threshold'] = st.slider(
@@ -988,7 +1129,7 @@ def main():
     st.sidebar.markdown("### Open Vocabulary Detection")
     class_names_input = st.sidebar.text_input(
         "Class Names (comma-separated)",
-        value="car, person, bicycle, bus, truck",
+        value="person",
         help="Enter class names separated by commas (e.g., 'car, person, bicycle')"
     )
     
@@ -1009,6 +1150,25 @@ def main():
         
         # Update LLM service temperature
         set_llm_temperature(st.session_state.llm_temperature)
+
+        # Toggle for enabling LLM model queries (may download a model on first use)
+        if "llm_enable_model_query" not in st.session_state:
+            st.session_state.llm_enable_model_query = True
+
+        st.session_state.llm_enable_model_query = st.checkbox(
+            "Enable LLM model (dimension lookup)",
+            value=st.session_state.llm_enable_model_query,
+            help="When enabled, a Hugging Face LLM is used for unseen classes. "
+                 "May download a model the first time it runs."
+        )
+
+        if st.session_state.llm_enable_model_query:
+            os.environ["LLM_ENABLE_MODEL_QUERY"] = "1"
+            os.environ["LLM_ALLOW_DOWNLOAD"] = "1"
+            st.sidebar.caption("LLM model queries enabled")
+        else:
+            os.environ["LLM_ENABLE_MODEL_QUERY"] = "0"
+            st.sidebar.caption("LLM model queries disabled (using template defaults only)")
         
         st.sidebar.caption("💡 LLM is used when semantic similarity doesn't find a match (similarity < 0.75)")
 
@@ -1066,8 +1226,28 @@ def main():
             help="Confidence threshold for YOLO-World detections (only used with SAM2)"
         )
         st.sidebar.info("💡 SAM2 uses YOLO-World for detection, then SAM2 for segmentation")
+
+        _itm = st.session_state.params.get("image_track_mode", "appearance")
+        _itm_idx = 0 if _itm == "appearance" else 1
+        st.session_state.params["image_track_mode"] = st.sidebar.radio(
+            "2D tracking (batch / cross-frame)",
+            options=["appearance", "sam2_bbox"],
+            index=_itm_idx,
+            format_func=lambda m: (
+                "Appearance (patch histogram + cosine)"
+                if m == "appearance"
+                else "SAM2 (bbox prompt from last box)"
+            ),
+            help=(
+                "Appearance matches masks to tracks by patch similarity. "
+                "SAM2 propagates each track's previous 2D box into the current image with SAM2, "
+                "then matches to pipeline masks by mask IoU."
+            ),
+            key="sidebar_image_track_mode",
+        )
     else:
         st.session_state.params['yolo_model_path'] = None
+        st.session_state.params["image_track_mode"] = "appearance"
         st.sidebar.info("💡 SAM3 uses direct text prompts for open-vocabulary segmentation")
     
     # Compute Device
@@ -1079,8 +1259,14 @@ def main():
         disabled=not gpu_available,
         help="Enable CUDA acceleration for SAM/YOLO when available."
     )
+    # Expose CUDA preference and availability to the LLM service as well
+    use_cuda_flag = gpu_available and st.session_state.params['use_gpu']
+    os.environ["LLM_USE_CUDA"] = "1" if use_cuda_flag else "0"
     if gpu_available:
-        st.sidebar.caption("CUDA available")
+        if use_cuda_flag:
+            st.sidebar.caption("CUDA available and enabled")
+        else:
+            st.sidebar.caption("CUDA available but disabled in settings")
     else:
         st.sidebar.caption("CUDA not available, using CPU")
     
@@ -1094,7 +1280,14 @@ def main():
         if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
             print(f"[batch] starting batch processing for {total} samples")
             results_list = []
-            tracker = ObjectTracker()
+            if 'sam_integration' in st.session_state and st.session_state.sam_integration is not None:
+                if st.session_state.params.get('sam_model_type') == 'sam3':
+                    st.session_state.sam_integration.reset_video_tracking_state()
+            tracker = ObjectTracker(
+                bag_freq_hz=st.session_state.params.get('bag_freq_hz', 45.0),
+                class_max_speed_mps=st.session_state.params.get('class_max_speed_mps'),
+            )
+            st.session_state.tracker = tracker
             progress = st.progress(0.0)
             for i, sample_desc in enumerate(batch_samples):
                 print(
@@ -1117,17 +1310,21 @@ def main():
             st.session_state.batch_export_results = {"samples": results_list}
             print(f"[batch] collected {len(results_list)} successful samples")
             datumaro_state = tracker.build_datumaro_state()
+            tracking_2d_history = tracker.build_2d_tracking_history()
             print(
                 "[batch] built datumaro_state: "
                 f"n_items={len(datumaro_state.get('items', []))}, "
                 f"categories={list(datumaro_state.get('categories', {}).keys())}"
             )
             st.session_state.datumaro_tracking = datumaro_state
+            st.session_state.tracking_2d_history = tracking_2d_history
             st.success(
                 f"✅ Processed **{len(results_list)}** / {total} samples. "
                 "Go to **4_Export** to save KITTI and Datumaro-style exports."
             )
             st.rerun()
+        if st.session_state.get("tracker") is not None:
+            st.caption("Tracker cached in session state for this run.")
         if st.session_state.get("batch_export_results"):
             br = st.session_state.batch_export_results
             n = len(br.get("samples", []))
@@ -1513,7 +1710,8 @@ def main():
                             sam_model_type=st.session_state.params['sam_model_type'],
                             yolo_model_path=st.session_state.params.get('yolo_model_path', None),
                             conf_threshold=st.session_state.params.get('yolo_conf_threshold', 0.25),
-                            use_gpu=st.session_state.params.get('use_gpu', True)
+                            use_gpu=st.session_state.params.get('use_gpu', True),
+                            projection=step_2_result['projection'],
                         )
                         st.session_state.pipeline_state['step_3'] = {
                             'completed': True,
@@ -1687,6 +1885,7 @@ def main():
                             sam_masks=step_3_result['sam_masks'],
                             mask_assignments=step_3_result['mask_assignments'],
                             sparse_depth_map=step_2_result['sparse_depth_map'],
+                            projection=step_2_result['projection'],
                             **st.session_state.params['clustering']
                         )
                         st.session_state.pipeline_state['step_4'] = {

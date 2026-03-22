@@ -5,12 +5,13 @@ Supports bounding box-based segmentation (SAM2 & SAM3) and text-based semantic s
 """
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union, Set, Any
 import torch
 import cv2
 import os
 
-from .utils import get_bbox_from_mask
+from components.utils.mask_utils import get_bbox_from_mask
+
 try:
     from ultralytics import ASSETS, SAM, YOLO, FastSAM
     ULTRALYTICS_AVAILABLE = True
@@ -66,6 +67,33 @@ def get_available_models() -> Dict[str, List[str]]:
     return discovered
 
 
+def calculate_iou(bbox1: List[float], bbox2: List[float]) -> float:
+    """
+    Calculate Intersection over Union (IoU) between two bounding boxes
+    in [x_min, y_min, x_max, y_max] format.
+    """
+    x1_min, y1_min, x1_max, y1_max = bbox1
+    x2_min, y2_min, x2_max, y2_max = bbox2
+
+    inter_x_min = max(x1_min, x2_min)
+    inter_y_min = max(y1_min, y2_min)
+    inter_x_max = min(x1_max, x2_max)
+    inter_y_max = min(y1_max, y2_max)
+
+    inter_w = max(0.0, inter_x_max - inter_x_min)
+    inter_h = max(0.0, inter_y_max - inter_y_min)
+    inter_area = inter_w * inter_h
+
+    area1 = max(0.0, x1_max - x1_min) * max(0.0, y1_max - y1_min)
+    area2 = max(0.0, x2_max - x2_min) * max(0.0, y2_max - y2_min)
+
+    union = area1 + area2 - inter_area
+    if union <= 0.0:
+        return 0.0
+
+    return inter_area / union
+
+
 class SAMIntegration:
     """
     Unified class for SAM model management and segmentation operations.
@@ -88,6 +116,9 @@ class SAMIntegration:
         self.device = torch.device("cuda" if self.use_gpu else "cpu")
         self.current_image = None
         self._yolo_integration = None  # Lazy initialization for SAM2 pipeline
+        self._sam3_prev_tracked: List[Dict[str, Union[str, np.ndarray, float]]] = []
+        self._sam3_prev_mask_tracks: List[Dict[str, Any]] = []
+        self._sam3_next_track_id: int = 0
         
         if not ULTRALYTICS_AVAILABLE:
             raise ImportError("Ultralytics not available. Install with: pip install ultralytics")
@@ -491,29 +522,7 @@ class SAMIntegration:
         
         return matches
     
-    def draw_bbox_around_mask(self, mask: np.ndarray) -> List[float]:
-        """
-        Draw bounding box around a segmented instance.
-        
-        Args:
-            mask: Segmentation mask as numpy array (H, W) with binary values (0 or 1)
-            
-        Returns:
-            Bounding box as [x1, y1, x2, y2]
-        """
-        return self._get_bbox_from_mask(mask)
-    
     def _get_bbox_from_mask(self, mask: np.ndarray) -> List[float]:
-        """
-        Get bounding box coordinates from a binary mask.
-        
-        Args:
-            mask: Binary mask as numpy array (H, W)
-            
-        Returns:
-            Bounding box as [x1, y1, x2, y2]
-        """
-        
         return get_bbox_from_mask(mask)
     
     def segment_everything(self, image: np.ndarray) -> List[np.ndarray]:
@@ -635,20 +644,6 @@ class SAMIntegration:
         
         return boundaries.astype(np.uint8)
     
-    def _calculate_iou(self, bbox1: List[float], bbox2: List[float]) -> float:
-        """
-        Calculate Intersection over Union (IoU) between two bounding boxes.
-        
-        Args:
-            bbox1: First bounding box [x1, y1, x2, y2]
-            bbox2: Second bounding box [x1, y1, x2, y2]
-            
-        Returns:
-            IoU value between 0 and 1
-        """
-        from .utils import calculate_iou
-        return calculate_iou(bbox1, bbox2)
-    
     def segment_by_class_names(self, image: np.ndarray, class_names: List[str],
                                yolo_model_path: Optional[str] = None,
                                conf_threshold: float = 0.25) -> Dict:
@@ -676,6 +671,129 @@ class SAMIntegration:
             return self._segment_by_class_names_sam2(image, class_names, yolo_model_path, conf_threshold)
         else:
             raise RuntimeError(f"segment_by_class_names not supported for model type: {self.model_type}")
+
+    def track_by_class_names_video(self, image: np.ndarray, class_names: List[str]) -> Dict:
+        """
+        For SAM3, treat incoming images as a temporal sequence.
+        Tracks previous-frame instances via SAM3 bbox prompting and then
+        supplements with current text-prompt detections for new objects.
+        For non-SAM3 models, falls back to normal per-frame segmentation.
+        """
+        if self.model_type != "sam3":
+            return self.segment_by_class_names(image=image, class_names=class_names)
+
+        # 1) Track previous instances forward using SAM3 bbox prompts.
+        tracked_masks: List[np.ndarray] = []
+        tracked_labels: List[str] = []
+        tracked_confidences: List[float] = []
+        for prev in self._sam3_prev_tracked:
+            prev_mask = prev["mask"]
+            prev_label = str(prev["label"])
+            prev_bbox = get_bbox_from_mask(prev_mask)
+            if prev_bbox == [0, 0, 0, 0]:
+                continue
+            mask = self.get_mask_from_bbox(image, prev_bbox)
+            if np.sum(mask > 0) == 0:
+                continue
+            tracked_masks.append(mask)
+            tracked_labels.append(prev_label)
+            tracked_confidences.append(float(prev.get("confidence", 0.5)))
+
+        # 2) Run fresh SAM3 text segmentation and add unmatched/new instances.
+        fresh = self._segment_by_class_names_sam3(image, class_names)
+        fresh_masks = fresh.get("masks", [])
+        fresh_labels = fresh.get("class_names", [])
+        fresh_confidences = fresh.get("confidences", [])
+
+        used_fresh: Set[int] = set()
+        for t_idx, t_mask in enumerate(tracked_masks):
+            t_bbox = get_bbox_from_mask(t_mask)
+            best_iou = 0.0
+            best_f_idx = -1
+            for f_idx, f_mask in enumerate(fresh_masks):
+                if f_idx in used_fresh:
+                    continue
+                iou = calculate_iou(t_bbox, get_bbox_from_mask(f_mask))
+                if iou > best_iou:
+                    best_iou = iou
+                    best_f_idx = f_idx
+            if best_f_idx >= 0 and best_iou >= 0.3:
+                tracked_masks[t_idx] = fresh_masks[best_f_idx]
+                if best_f_idx < len(fresh_confidences):
+                    tracked_confidences[t_idx] = float(fresh_confidences[best_f_idx])
+                used_fresh.add(best_f_idx)
+
+        for f_idx, f_mask in enumerate(fresh_masks):
+            if f_idx in used_fresh:
+                continue
+            tracked_masks.append(f_mask)
+            tracked_labels.append(fresh_labels[f_idx] if f_idx < len(fresh_labels) else "object")
+            if f_idx < len(fresh_confidences):
+                tracked_confidences.append(float(fresh_confidences[f_idx]))
+            else:
+                tracked_confidences.append(0.5)
+
+        tracked_bboxes = [get_bbox_from_mask(mask) for mask in tracked_masks]
+
+        self._sam3_prev_tracked = []
+        for i, mask in enumerate(tracked_masks):
+            self._sam3_prev_tracked.append(
+                {
+                    "mask": mask,
+                    "label": tracked_labels[i] if i < len(tracked_labels) else "object",
+                    "confidence": tracked_confidences[i] if i < len(tracked_confidences) else 0.5,
+                }
+            )
+
+        return {
+            "masks": tracked_masks,
+            "bboxes": tracked_bboxes,
+            "class_names": tracked_labels,
+            "confidences": tracked_confidences,
+        }
+
+    def reset_video_tracking_state(self) -> None:
+        self._sam3_prev_tracked = []
+        self._sam3_prev_mask_tracks = []
+        self._sam3_next_track_id = 0
+
+    def track_masks_with_ids(self, masks: List[np.ndarray], class_names: List[str]) -> Dict[int, int]:
+        """
+        Track current-frame masks against previous frame and return mask_idx -> track_id.
+        Intended for SAM3 sequence mode in batch processing.
+        """
+        mask_to_track: Dict[int, int] = {}
+        used_prev: Set[int] = set()
+        current_state: List[Dict[str, Any]] = []
+
+        for m_idx, mask in enumerate(masks):
+            label = class_names[m_idx] if m_idx < len(class_names) else "object"
+            curr_bbox = get_bbox_from_mask(mask)
+            best_iou = 0.0
+            best_prev_idx = -1
+            for p_idx, prev in enumerate(self._sam3_prev_mask_tracks):
+                if p_idx in used_prev:
+                    continue
+                if prev["label"] != label:
+                    continue
+                prev_bbox = get_bbox_from_mask(prev["mask"])
+                iou = calculate_iou(curr_bbox, prev_bbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_prev_idx = p_idx
+
+            if best_prev_idx >= 0 and best_iou >= 0.3:
+                track_id = int(self._sam3_prev_mask_tracks[best_prev_idx]["track_id"])
+                used_prev.add(best_prev_idx)
+            else:
+                track_id = int(self._sam3_next_track_id)
+                self._sam3_next_track_id += 1
+
+            mask_to_track[m_idx] = track_id
+            current_state.append({"track_id": track_id, "label": label, "mask": mask})
+
+        self._sam3_prev_mask_tracks = current_state
+        return mask_to_track
 
     def export_segmentation_results(
         self,

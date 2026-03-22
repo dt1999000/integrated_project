@@ -16,6 +16,7 @@ KITTI_CUBOID_TEMPLATES = {
     'Tram': {'length': 15.59, 'width': 3.66, 'height': 3.73},  # Using median width
     'Misc': {'length': 2.56, 'width': 1.91, 'height': 1.68},  # Using median values
     'Person_sitting': {'length': 0.72, 'width': 0.80, 'height': 1.29},  # Using median width
+    'Person': {'length': 0.72, 'width': 0.80, 'height': 1.78},  # Using median width
     # Default fallback template
     'Unknown': {'length': 2.0, 'width': 1.5, 'height': 1.5},
 }

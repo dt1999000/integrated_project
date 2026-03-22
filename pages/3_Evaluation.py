@@ -16,6 +16,52 @@ from components.utils.visualization_helper import (
 )
 
 
+def _normalize_gt_for_eval(raw_ground_truth: List[Dict]) -> List[Dict]:
+    """Normalize mixed GT formats to min/max cuboid format used by evaluation helpers."""
+    normalized = []
+    for gt in raw_ground_truth:
+        if all(k in gt for k in ["min_x", "min_y", "min_z", "max_x", "max_y", "max_z"]):
+            normalized.append(gt)
+            continue
+
+        translation = gt.get("translation")
+        size = gt.get("size")
+        if translation is None or size is None or len(translation) != 3 or len(size) != 3:
+            continue
+
+        center = np.asarray(translation, dtype=np.float64)
+        size_np = np.asarray(size, dtype=np.float64)
+        half_size = size_np / 2.0
+        bbox_min = center - half_size
+        bbox_max = center + half_size
+
+        norm_gt = dict(gt)
+        norm_gt["min_x"] = float(bbox_min[0])
+        norm_gt["min_y"] = float(bbox_min[1])
+        norm_gt["min_z"] = float(bbox_min[2])
+        norm_gt["max_x"] = float(bbox_max[0])
+        norm_gt["max_y"] = float(bbox_max[1])
+        norm_gt["max_z"] = float(bbox_max[2])
+        norm_gt["category"] = norm_gt.get("category", norm_gt.get("class", "Person"))
+        normalized.append(norm_gt)
+    return normalized
+
+
+def _to_gt_table_rows(ground_truth_boxes: List[Dict]) -> List[Dict]:
+    rows = []
+    for idx, gt in enumerate(ground_truth_boxes):
+        rows.append({
+            "GT Index": idx,
+            "Category": gt.get("category", gt.get("class", "Unknown")),
+            "Track ID": gt.get("track_id", ""),
+            "Center": gt.get("translation", ""),
+            "Size": gt.get("size", ""),
+            "Points in Box": gt.get("num_points", ""),
+            "Has 2D BBox": gt.get("bbox_2d") is not None,
+        })
+    return rows
+
+
 def main():
     """Main evaluation page function"""
     st.set_page_config(
@@ -43,19 +89,23 @@ def main():
     sample_meta_data = sample['sample_meta_data']
     detected_cuboids = st.session_state.cuboids
     
-    # Get ground truth from export_results if available (preferred), otherwise from sample_meta_data
+    # Get ground truth from export_results if available (preferred), otherwise from session/sample metadata.
     ground_truth_boxes = []
     if 'export_results' in st.session_state and 'ground_truth_cuboids' in st.session_state.export_results:
-        # Use ground truth cuboids from export_results (already in cuboid format)
         ground_truth_boxes = st.session_state.export_results['ground_truth_cuboids']
+    elif 'ground_truth_annotations' in st.session_state:
+        ground_truth_boxes = st.session_state.ground_truth_annotations
     else:
-        # Fallback to sample_meta_data
         ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
-    
+
+    ground_truth_boxes = _normalize_gt_for_eval(ground_truth_boxes)
     if not ground_truth_boxes:
         st.warning("⚠️ No ground truth boxes available for this sample.")
-        st.info("Evaluation requires ground truth annotations (typically available for KITTI dataset).")
+        st.info("Evaluation requires ground truth annotations from dataset extraction.")
         return
+
+    with st.expander("📦 Ground Truth Annotations", expanded=False):
+        st.dataframe(pd.DataFrame(_to_gt_table_rows(ground_truth_boxes)))
     
     # Get point cloud for visualization
     point_cloud_obj = None
@@ -135,14 +185,18 @@ def main():
     st.subheader("📷 2D Visualization")
     image = sample['image']
     
-    # Show image with ground truth boxes
-    img_with_gt = draw_2d_boxes_on_image(image.copy(), ground_truth_boxes)
-    st.image(img_with_gt, caption="Image with Ground Truth Boxes")
+    gt_boxes_2d = [box for box in ground_truth_boxes if box.get("bbox_2d") is not None]
+    if gt_boxes_2d:
+        img_with_gt = draw_2d_boxes_on_image(image.copy(), gt_boxes_2d)
+        st.image(img_with_gt, caption="Image with Ground Truth Boxes")
+    else:
+        st.info("No 2D GT bbox available for this sample.")
     
     # Show reprojected cuboid bboxes if available
-    if detected_cuboids:
+    cuboids_with_projection = [cuboid for cuboid in detected_cuboids if cuboid.get("projected_bbox_2d") is not None]
+    if cuboids_with_projection:
         st.subheader("📐 Reprojected Cuboid Bounding Boxes")
-        img_proj = draw_projected_cuboid_bboxes(image.copy(), detected_cuboids, ground_truth_boxes)
+        img_proj = draw_projected_cuboid_bboxes(image.copy(), cuboids_with_projection, gt_boxes_2d)
         st.image(img_proj, caption="Reprojected 3D Cuboids to 2D")
     
     # 3D Comparison Visualization

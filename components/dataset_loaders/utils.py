@@ -392,6 +392,57 @@ def _load_sim_sample(
         if camera_to_lidar_transform is None:
             print(f"Warning: Camera to LiDAR transform could not be computed")
         
+        # Build normalized GT boxes for downstream evaluation/visualization.
+        # Sim annotations are native 3D boxes (translation + size), so we derive:
+        # - axis-aligned min/max cuboid
+        # - projected 2D bbox from camera projection
+        lidar_annotations = link.get('samples', {}).get('lidar', {}).get('annotations', [])
+        normalized_ground_truth_boxes = []
+        image_height, image_width = image_rgb.shape[:2]
+        for annotation in lidar_annotations:
+            translation = annotation.get('translation')
+            size = annotation.get('size')
+            if translation is None or size is None or len(translation) != 3 or len(size) != 3:
+                continue
+
+            center = np.asarray(translation, dtype=np.float64)
+            size_np = np.asarray(size, dtype=np.float64)
+            half_size = size_np / 2.0
+            bbox_min = center - half_size
+            bbox_max = center + half_size
+
+            projected_points = handler.getAnnotationInCameraFrame(annotation, link, camera="rgb")
+            bbox_2d = None
+            if projected_points:
+                pts = np.asarray(projected_points, dtype=np.int32)
+                left = int(np.clip(np.min(pts[:, 0]), 0, image_width - 1))
+                right = int(np.clip(np.max(pts[:, 0]), 0, image_width - 1))
+                top = int(np.clip(np.min(pts[:, 1]), 0, image_height - 1))
+                bottom = int(np.clip(np.max(pts[:, 1]), 0, image_height - 1))
+                if right > left and bottom > top:
+                    bbox_2d = {
+                        "left": left,
+                        "top": top,
+                        "right": right,
+                        "bottom": bottom,
+                    }
+
+            normalized_ground_truth_boxes.append({
+                "token": annotation.get("token"),
+                "category": annotation.get("class", "Person"),
+                "track_id": annotation.get("track_id", -1),
+                "num_points": annotation.get("num_points", 0),
+                "translation": translation,
+                "size": size,
+                "min_x": float(bbox_min[0]),
+                "min_y": float(bbox_min[1]),
+                "min_z": float(bbox_min[2]),
+                "max_x": float(bbox_max[0]),
+                "max_y": float(bbox_max[1]),
+                "max_z": float(bbox_max[2]),
+                "bbox_2d": bbox_2d,
+            })
+
         # Create normalized sample_meta_data
         sample_meta_data = {
             'image_path': str(image_path) if image_path else None,
@@ -399,9 +450,10 @@ def _load_sim_sample(
             'camera_intrinsic': camera_intrinsic,
             'camera_extrinsic': np.eye(4),
             'camera_to_lidar_transform': camera_to_lidar_transform,
-            'ground_truth_boxes': link.get('samples', {}).get('lidar', {}).get('annotations', []),
+            'ground_truth_boxes': normalized_ground_truth_boxes,
             'sample_index': link_token,
-            'dataset_type': 'sim'
+            'dataset_type': 'sim',
+            'subset_name': found_subset_name,
         }
         
         return sample_meta_data, image_rgb, point_cloud

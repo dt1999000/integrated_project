@@ -226,7 +226,8 @@ def remove_boundary_points_from_sparse_depth(sparse_depth_map: np.ndarray,
 def compute_sparse_depth_map(point_cloud: np.ndarray,
                              image_shape: tuple,
                              camera_intrinsic: np.ndarray,
-                             camera_to_lidar_transform: np.ndarray) -> np.ndarray:
+                             camera_to_lidar_transform: np.ndarray,
+                             camera_extrinsic: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Create sparse depth map by back-projecting 3D LiDAR points onto 2D image.
 
@@ -242,13 +243,16 @@ def compute_sparse_depth_map(point_cloud: np.ndarray,
     if camera_intrinsic is None or camera_to_lidar_transform is None:
         raise ValueError("Camera parameters not set. camera_intrinsic and camera_to_lidar_transform are required.")
 
+    if camera_extrinsic is None:
+        camera_extrinsic = np.eye(4, dtype=np.float32)
+
     h, w = image_shape
 
     from .pointcloud_projection import Projection
 
     projection = Projection(
         camera_intrinsic=camera_intrinsic,
-        camera_extrinsic=np.eye(4, dtype=np.float32),
+        camera_extrinsic=camera_extrinsic,
         camera_to_lidar_transform=camera_to_lidar_transform,
         point_cloud=point_cloud
     )
@@ -473,7 +477,6 @@ class DepthEstimator:
         # Ensure depth_map is 2D (H, W)
         depth_map = np.asarray(depth_map)
         original_shape = depth_map.shape
-        print(f"DEBUG: reconstruct_points_from_depth received depth_map with shape: {original_shape}, ndim: {depth_map.ndim}")
         
         # Handle different possible shapes
         if depth_map.ndim == 1:
@@ -503,7 +506,6 @@ class DepthEstimator:
         if depth_map.ndim != 2:
             raise ValueError(f"After processing, depth map still has {depth_map.ndim} dimensions with shape {depth_map.shape} (original shape: {original_shape})")
         
-        print(f"DEBUG: After shape normalization, depth_map shape: {depth_map.shape}")
         height, width = depth_map.shape
         
         # Create pixel coordinate grid

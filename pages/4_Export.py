@@ -31,8 +31,123 @@ def _to_serializable(obj: Any) -> Any:
     return obj
 
 
-def _batch_to_tracklet_xml(samples: List[Dict]) -> str:
-    """Build tracklet-style XML from batch_export_results['samples']."""
+def _datumaro_to_tracklet_xml(tracking_state: Dict) -> str:
+    """
+    Build KITTI-style tracklet XML from datumaro_tracking state.
+    Uses 3D cuboid tracks (track_id) across frames instead of per-frame detections.
+    """
+    items = tracking_state.get("items", [])
+    categories = tracking_state.get("categories", {})
+    label_cat = categories.get("label", {})
+    labels = label_cat.get("labels", [])
+
+    def _label_name(label_id: int) -> str:
+        if 0 <= label_id < len(labels):
+            return labels[label_id].get("name", "Unknown")
+        return "Unknown"
+
+    # Aggregate per-track information
+    tracks: Dict[int, Dict[str, Any]] = {}
+    for item in items:
+        frame_id = int(item.get("attr", {}).get("frame", 0))
+        for ann in item.get("annotations", []):
+            if ann.get("type") != "cuboid_3d":
+                continue
+            attrs = ann.get("attributes", {})
+            track_id = int(attrs.get("track_id", -1))
+            if track_id < 0:
+                continue
+
+            label_id = int(ann.get("label_id", 0))
+            label = _label_name(label_id)
+
+            position = ann.get("position", [0.0, 0.0, 0.0])
+            rotation = ann.get("rotation", [0.0, 0.0, 0.0])
+            scale = ann.get("scale", [1.0, 1.0, 1.0])
+
+            # Datumaro uses (length, width, height) for scale
+            length = float(scale[0])
+            width = float(scale[1])
+            height = float(scale[2])
+
+            tx = float(position[0])
+            ty = float(position[1])
+            tz = float(position[2])
+            rz = float(rotation[2])
+
+            tr = tracks.get(track_id)
+            if tr is None:
+                tr = {
+                    "label": label,
+                    "length": length,
+                    "width": width,
+                    "height": height,
+                    "first_frame": frame_id,
+                    "poses": [],
+                }
+                tracks[track_id] = tr
+
+            # Keep earliest first_frame
+            if frame_id < tr["first_frame"]:
+                tr["first_frame"] = frame_id
+
+            tr["poses"].append(
+                {
+                    "frame": frame_id,
+                    "tx": tx,
+                    "ty": ty,
+                    "tz": tz,
+                    "rz": rz,
+                }
+            )
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        "<!DOCTYPE boost_serialization>",
+        '<boost_serialization version="9" signature="serialization::archive">',
+        '<tracklets version="0" tracking_level="0" class_id="0">',
+    ]
+
+    track_items = list(tracks.values())
+    lines.append(f"  <count>{len(track_items)}</count>")
+    lines.append("  <item_version>1</item_version>")
+
+    for tr in track_items:
+        poses = sorted(tr["poses"], key=lambda p: p["frame"])
+        lines.append('  <item version="1" tracking_level="0" class_id="1">')
+        lines.append(f"    <objectType>{tr['label']}</objectType>")
+        lines.append(f"    <h>{tr['height']:.2f}</h>")
+        lines.append(f"    <w>{tr['width']:.2f}</w>")
+        lines.append(f"    <l>{tr['length']:.2f}</l>")
+        lines.append(f"    <first_frame>{poses[0]['frame']}</first_frame>")
+        lines.append('    <poses version="0" tracking_level="0" class_id="2">')
+        lines.append(f"      <count>{len(poses)}</count>")
+        lines.append("      <item_version>0</item_version>")
+        for p in poses:
+            lines.append('      <item version="1" tracking_level="0" class_id="3">')
+            lines.append(f"        <tx>{p['tx']:.2f}</tx>")
+            lines.append(f"        <ty>{p['ty']:.2f}</ty>")
+            lines.append(f"        <tz>{p['tz']:.2f}</tz>")
+            lines.append("        <rx>0.0</rx>")
+            lines.append("        <ry>0.0</ry>")
+            lines.append(f"        <rz>{p['rz']:.2f}</rz>")
+            lines.append("        <state>2</state>")
+            lines.append("        <occlusion>0</occlusion>")
+            lines.append("        <occlusion_kf>0</occlusion_kf>")
+            lines.append("        <truncation>0</truncation>")
+            lines.append("        <amt_occlusion>-1</amt_occlusion>")
+            lines.append("        <amt_border_l>-1</amt_border_l>")
+            lines.append("        <amt_border_r>-1</amt_border_r>")
+            lines.append("        <amt_occlusion_kf>-1</amt_occlusion_kf>")
+            lines.append("        <amt_border_kf>-1</amt_border_kf>")
+            lines.append("      </item>")
+        lines.append("    </poses>")
+        lines.append("    <finished>1</finished>")
+        lines.append("  </item>")
+
+    lines.append("</tracklets>")
+    lines.append("</boost_serialization>")
+    return "\n".join(lines)
     lines = [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
         "<!DOCTYPE boost_serialization>",
@@ -40,8 +155,7 @@ def _batch_to_tracklet_xml(samples: List[Dict]) -> str:
         '<tracklets version="0" tracking_level="0" class_id="0">',
     ]
     all_items = []
-    ordered_samples = Export.reverse_frame_order(samples)
-    for frame_idx, export_res in enumerate(ordered_samples):
+    for frame_idx, export_res in enumerate(samples):
         cuboids = export_res.get("detected_cuboids", [])
         for c in cuboids:
             center = c.get("center", [0, 0, 0])
@@ -108,31 +222,47 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # 1) Batch tracklet XML export (from 2_Detection batch processing)
+    # 1) Tracklet XML export from tracking (Datumaro state)
     # ------------------------------------------------------------------
-    batch_results = st.session_state.get("batch_export_results")
-    if batch_results and batch_results.get("samples"):
-        samples = batch_results["samples"]
-        st.subheader("📦 Batch Tracklet XML Export")
-        st.metric("Samples in batch", len(samples))
-        total_detections = sum(len(s.get("detected_cuboids", [])) for s in samples)
-        st.metric("Total detections", total_detections)
+    tracking_state = st.session_state.get("datumaro_tracking")
+    if tracking_state and tracking_state.get("items"):
+        st.subheader("📦 Tracklet XML Export (KITTI-style from tracking)")
+        n_frames = len(tracking_state.get("items", []))
+        st.metric("Frames in batch", n_frames)
+
+        # Approximate number of tracklets as unique track_ids in annotations
+        track_ids = set()
+        for item in tracking_state.get("items", []):
+            for ann in item.get("annotations", []):
+                attrs = ann.get("attributes", {})
+                if "track_id" in attrs:
+                    track_ids.add(int(attrs["track_id"]))
+        st.metric("Tracklets", len(track_ids))
 
         output_root = st.session_state.get("output_root_dir", "")
         if not output_root:
             st.warning("Output folder is not set. Please open **1_Dataset_Extraction** and set the Output Directory.")
         else:
             st.info(f"Tracklet XML will be saved under: `{output_root}` as `tracklet_labels.xml`.")
-            if st.button("💾 Save batch as Tracklet XML", key="export_tracklet_xml_btn"):
-                try:
+            if st.button("💾 Save tracking as Tracklet XML", key="export_tracklet_xml_btn"):
+                out_dir = Path(output_root).expanduser()
+                out_dir.mkdir(parents=True, exist_ok=True)
+                xml_str = _datumaro_to_tracklet_xml(tracking_state)
+                out_file = out_dir / "tracklet_labels.xml"
+                out_file.write_text(xml_str, encoding="utf-8")
+                st.success(f"✅ Saved tracklet XML to **{out_file}**")
+
+            # Complete 2D tracking history JSON export from ObjectTracker state.
+            if st.button("💾 Save complete 2D tracking history (JSON)", key="export_tracking_2d_history_json"):
+                tracking_2d_json = st.session_state.get("tracking_2d_history")
+                if tracking_2d_json is None:
+                    st.warning("No cached 2D tracking history found. Run batch tracking first.")
+                else:
                     out_dir = Path(output_root).expanduser()
                     out_dir.mkdir(parents=True, exist_ok=True)
-                    xml_str = _batch_to_tracklet_xml(samples)
-                    out_file = out_dir / "tracklet_labels.xml"
-                    out_file.write_text(xml_str, encoding="utf-8")
-                    st.success(f"✅ Saved tracklet XML to **{out_file}**")
-                except Exception as e:
-                    st.error(f"Could not save tracklet XML: {e}")
+                    out_file = out_dir / "tracking_2d_history.json"
+                    out_file.write_text(json.dumps(tracking_2d_json, indent=2), encoding="utf-8")
+                    st.success(f"✅ Saved complete 2D tracking history to **{out_file}**")
 
         st.markdown("---")
         
@@ -146,7 +276,6 @@ def main():
         "Uses the tracking state built during batch processing on **2_Detection**."
     )
 
-    tracking_state = st.session_state.get("datumaro_tracking")
     batch_results_for_tracking = st.session_state.get("batch_export_results")
 
     if not tracking_state or not batch_results_for_tracking or not batch_results_for_tracking.get("samples"):

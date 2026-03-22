@@ -251,10 +251,29 @@ def _build_tf_adjacency(reader, tf_topics: Iterable[str]) -> Dict[str, Dict[str,
             child = t.child_frame_id or ""
             if not parent or not child:
                 continue
+            print(f'parent={parent}, child={child}')
             T_parent_child = _transform_to_matrix(t.transform)
+            # Store transforms so that adj[src][dst] always maps coordinates
+            # from src frame to dst frame.
             adj.setdefault(parent, {})[child] = np.linalg.inv(T_parent_child)
             adj.setdefault(child, {})[parent] = T_parent_child
     return adj
+
+
+def get_tf_frames(bag_path: Path, tf_topics: Optional[Iterable[str]] = None) -> List[str]:
+    """
+    Inspect TF topics in a ROS bag and return a sorted list of frame names.
+    """
+    if tf_topics is None:
+        tf_topics = ("/tf_static", "/tf")
+
+    if not HAS_ROSBAGS:
+        return []
+
+    bag_path = Path(bag_path)
+    with open_reader(bag_path) as reader:
+        adj = _build_tf_adjacency(reader, tf_topics)
+    return sorted(adj.keys())
 
 
 def _find_transform(
@@ -296,6 +315,8 @@ def compute_rosbag_calibration(
     pointcloud_topic: Optional[str],
     camera_info_topic: Optional[str],
     tf_topics: Optional[Iterable[str]] = None,
+    camera_frame_override: Optional[str] = None,
+    lidar_frame_override: Optional[str] = None,
 ) -> RosbagCalibration:
     """
     Compute camera intrinsics and camera→LiDAR transform from ROS bag.
@@ -309,16 +330,18 @@ def compute_rosbag_calibration(
 
     bag_path = Path(bag_path)
     camera_intrinsic: Optional[np.ndarray] = None
-    camera_frame: Optional[str] = None
-    lidar_frame: Optional[str] = None
+    # Respect explicit overrides; only infer frames when override is None.
+    camera_frame: Optional[str] = camera_frame_override
+    lidar_frame: Optional[str] = lidar_frame_override
 
     if not HAS_ROSBAGS:
         return RosbagCalibration(None, None, None, None)
 
     # First pass: CameraInfo + frame_ids
     with open_reader(bag_path) as reader:
-        # CameraInfo → intrinsic
-        if camera_info_topic:
+        # CameraInfo → intrinsic. Only derive camera_frame from header when
+        # caller did not provide an explicit override.
+        if camera_info_topic and camera_intrinsic is None:
             cam_conns = [c for c in reader.connections if c.topic == camera_info_topic]
             for conn, _ts, raw in reader.messages(connections=cam_conns):
                 msg = reader.deserialize(raw, conn.msgtype)
@@ -328,11 +351,11 @@ def compute_rosbag_calibration(
                 if K is not None and len(K) == 9:
                     camera_intrinsic = np.array(K, dtype=np.float64).reshape(3, 3)
                     header = getattr(msg, "header", None)
-                    if header is not None:
+                    if camera_frame is None and header is not None:
                         camera_frame = getattr(header, "frame_id", "")
                     break
 
-        # If no CameraInfo, derive camera_frame from image topic
+        # If no CameraInfo-derived frame override, derive camera_frame from image topic
         if camera_frame is None:
             img_conns = [c for c in reader.connections if c.topic == image_topic]
             for conn, _ts, raw in reader.messages(connections=img_conns):
@@ -342,8 +365,8 @@ def compute_rosbag_calibration(
                     camera_frame = header.frame_id
                     break
 
-        # LiDAR frame from PointCloud2
-        if pointcloud_topic:
+        # LiDAR frame from PointCloud2 (if not overridden)
+        if pointcloud_topic and lidar_frame is None:
             pc_conns = [c for c in reader.connections if c.topic == pointcloud_topic]
             for conn, _ts, raw in reader.messages(connections=pc_conns):
                 msg = reader.deserialize(raw, conn.msgtype)
@@ -465,6 +488,8 @@ def extract_bag_to_folder(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     camera_info_topic: Optional[str] = None,
     tf_topics: Optional[Iterable[str]] = None,
+    camera_frame_override: Optional[str] = None,
+    lidar_frame_override: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Extract images (and optionally point clouds) from a ROS bag.
@@ -506,6 +531,8 @@ def extract_bag_to_folder(
         pointcloud_topic=pointcloud_topic,
         camera_info_topic=camera_info_topic,
         tf_topics=tf_topics,
+        camera_frame_override=camera_frame_override,
+        lidar_frame_override=lidar_frame_override,
     )
     calib_path = out_dir / "calib.npz"
     try:
