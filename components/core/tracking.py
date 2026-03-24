@@ -342,7 +342,9 @@ class ObjectTracker:
             assigned_masks.add(m_idx)
             mask_to_track[m_idx] = tr.track_id
 
-        # Create new tracks for remaining masks that are not well-explained.
+        # Assign remaining masks either to an existing unassigned track (when
+        # similarity is high) or create a new track.
+        assigned_track_ids: Set[int] = {self._tracks[t_idx].track_id for t_idx in assigned_tracks}
         for m_idx, mask in enumerate(masks):
             if m_idx in assigned_masks:
                 continue
@@ -360,13 +362,24 @@ class ObjectTracker:
                 continue
             feat = _compute_patch_feature(patch)
             best_sim = 0.0
+            best_tr: Optional[TrackedObject] = None
             for tr in self._tracks:
                 if m_idx < len(class_names) and tr.label != class_names[m_idx]:
                     continue
                 s = _similarity(tr.feature, feat)
                 if s > best_sim:
                     best_sim = s
-            if best_sim >= self.similarity_threshold:
+                    best_tr = tr
+            if (
+                best_tr is not None
+                and best_sim >= self.similarity_threshold
+                and best_tr.track_id not in assigned_track_ids
+            ):
+                best_tr.feature = feat
+                best_tr.last_frame = frame_index
+                best_tr.bbox_history[frame_index] = (x1, y1, x2, y2)
+                mask_to_track[m_idx] = best_tr.track_id
+                assigned_track_ids.add(best_tr.track_id)
                 continue
             track_id = self._next_track_id
             self._next_track_id += 1
@@ -406,7 +419,7 @@ class ObjectTracker:
 
         return mask_to_track
 
-    def track_on_image_sam2(
+    def track_on_image_with_sam(
         self,
         frame_index: int,
         image: np.ndarray,
@@ -416,20 +429,20 @@ class ObjectTracker:
         sam_integration: SAMIntegration,
     ) -> Dict[int, int]:
         """
-        Associate per-frame pipeline masks to tracks using SAM2 with a bbox prompt
+        Associate per-frame pipeline masks to tracks using SAM bbox prompting
         from each track's last known box, then mask–mask IoU against current masks.
 
         Same return contract as ``track_on_image`` (mask index -> track_id) and
         the same ``_frame_tracking_2d`` / ``TrackedObject`` updates.
         """
-        if not sam_integration.model_type.startswith("sam2"):
+        if not sam_integration.model_type.startswith("sam"):
             raise ValueError(
-                "track_on_image_sam2 requires a SAM2 model on SAMIntegration, "
+                "track_on_image_with_sam requires a SAM model on SAMIntegration, "
                 f"got {sam_integration.model_type!r}"
             )
 
         print(
-            f"[tracking] track_on_image_sam2 frame_index={frame_index}, "
+            f"[tracking] track_on_image_with_sam frame_index={frame_index}, "
             f"n_masks={len(masks)}, n_class_names={len(class_names)}"
         )
 
@@ -495,6 +508,7 @@ class ObjectTracker:
             assigned_masks.add(m_idx)
             mask_to_track[m_idx] = tr.track_id
 
+        assigned_track_ids: Set[int] = {track_id for track_id in mask_to_track.values()}
         for m_idx, mask in enumerate(masks):
             if m_idx in assigned_masks:
                 continue
@@ -512,13 +526,24 @@ class ObjectTracker:
                 continue
             feat = _compute_patch_feature(patch)
             best_sim = 0.0
+            best_tr: Optional[TrackedObject] = None
             for tr in self._tracks:
                 if m_idx < len(class_names) and tr.label != class_names[m_idx]:
                     continue
                 s = _similarity(tr.feature, feat)
                 if s > best_sim:
                     best_sim = s
-            if best_sim >= self.similarity_threshold:
+                    best_tr = tr
+            if (
+                best_tr is not None
+                and best_sim >= self.similarity_threshold
+                and best_tr.track_id not in assigned_track_ids
+            ):
+                best_tr.feature = feat
+                best_tr.last_frame = frame_index
+                best_tr.bbox_history[frame_index] = (x1, y1, x2, y2)
+                mask_to_track[m_idx] = best_tr.track_id
+                assigned_track_ids.add(best_tr.track_id)
                 continue
             track_id = self._next_track_id
             self._next_track_id += 1
@@ -557,6 +582,27 @@ class ObjectTracker:
         }
 
         return mask_to_track
+
+    def track_on_image_sam2(
+        self,
+        frame_index: int,
+        image: np.ndarray,
+        masks: List[np.ndarray],
+        class_names: List[str],
+        meta: Dict[str, Any],
+        sam_integration: SAMIntegration,
+    ) -> Dict[int, int]:
+        """
+        Backward-compatible alias. Prefer ``track_on_image_with_sam``.
+        """
+        return self.track_on_image_with_sam(
+            frame_index=frame_index,
+            image=image,
+            masks=masks,
+            class_names=class_names,
+            meta=meta,
+            sam_integration=sam_integration,
+        )
 
     def match_tracks_with_3d_detections(
         self,
@@ -727,10 +773,10 @@ class ObjectTracker:
         image_track_mode: str = "appearance",
         sam_integration: Optional[SAMIntegration] = None,
     ) -> None:
-        if image_track_mode == "sam2_bbox":
+        if image_track_mode == "sam_bbox":
             if sam_integration is None:
-                raise ValueError("update_for_frame(sam2_bbox) requires sam_integration")
-            mask_to_track = self.track_on_image_sam2(
+                raise ValueError("update_for_frame(sam_bbox) requires sam_integration")
+            mask_to_track = self.track_on_image_with_sam(
                 frame_index=frame_index,
                 image=image,
                 masks=masks,

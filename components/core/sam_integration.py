@@ -683,6 +683,7 @@ class SAMIntegration:
             return self.segment_by_class_names(image=image, class_names=class_names)
 
         # 1) Track previous instances forward using SAM3 bbox prompts.
+        n_prev_input = len(self._sam3_prev_tracked)
         tracked_masks: List[np.ndarray] = []
         tracked_labels: List[str] = []
         tracked_confidences: List[float] = []
@@ -698,6 +699,8 @@ class SAMIntegration:
             tracked_masks.append(mask)
             tracked_labels.append(prev_label)
             tracked_confidences.append(float(prev.get("confidence", 0.5)))
+
+        n_prev_propagated = len(tracked_masks)
 
         # 2) Run fresh SAM3 text segmentation and add unmatched/new instances.
         fresh = self._segment_by_class_names_sam3(image, class_names)
@@ -745,11 +748,20 @@ class SAMIntegration:
                 }
             )
 
+        fresh_debug = fresh.get('debug', {}) if isinstance(fresh, dict) else {}
         return {
             "masks": tracked_masks,
             "bboxes": tracked_bboxes,
             "class_names": tracked_labels,
             "confidences": tracked_confidences,
+            "debug": {
+                "sam_model": "sam3_video",
+                "n_prev_tracked_input": n_prev_input,
+                "n_prev_propagated": n_prev_propagated,
+                "n_fresh_masks": len(fresh_masks),
+                "n_merged_masks": len(tracked_masks),
+                "fresh": fresh_debug,
+            },
         }
 
     def reset_video_tracking_state(self) -> None:
@@ -886,11 +898,21 @@ class SAMIntegration:
             
             confidences.append(confidence)
         
+        masks_per_class: Dict[str, int] = {}
+        for lbl in labels:
+            masks_per_class[str(lbl)] = masks_per_class.get(str(lbl), 0) + 1
+
         return {
             'masks': masks,
             'bboxes': bboxes,
             'class_names': labels,
-            'confidences': confidences
+            'confidences': confidences,
+            'debug': {
+                'sam_model': 'sam3',
+                'n_class_prompts': len(class_names),
+                'n_masks': len(masks),
+                'masks_per_class': masks_per_class,
+            },
         }
     
     def _segment_by_class_names_sam2(self, image: np.ndarray, class_names: List[str],
@@ -927,7 +949,15 @@ class SAMIntegration:
                 'masks': [],
                 'bboxes': [],
                 'class_names': [],
-                'confidences': []
+                'confidences': [],
+                'debug': {
+                    'sam_model': 'sam2',
+                    'n_class_prompts': len(class_names),
+                    'yolo_conf_threshold': float(conf_threshold),
+                    'n_yolo_detections': 0,
+                    'n_sam_masks': 0,
+                    'yolo_class_hist': {},
+                },
             }
         
         # Step 2: Segment each detection with SAM2
@@ -936,10 +966,12 @@ class SAMIntegration:
         class_names_list = []
         confidences = []
         
+        yolo_class_hist: Dict[str, int] = {}
         for detection in yolo_detections:
             bbox = detection['bbox']
             class_name = detection['class_name']
             confidence = detection['confidence']
+            yolo_class_hist[str(class_name)] = yolo_class_hist.get(str(class_name), 0) + 1
             
             # Get mask from SAM2 using bounding box
             mask = self.get_mask_from_bbox(image, bbox)
@@ -955,7 +987,15 @@ class SAMIntegration:
             'masks': masks,
             'bboxes': bboxes,
             'class_names': class_names_list,
-            'confidences': confidences
+            'confidences': confidences,
+            'debug': {
+                'sam_model': 'sam2',
+                'n_class_prompts': len(class_names),
+                'yolo_conf_threshold': float(conf_threshold),
+                'n_yolo_detections': len(yolo_detections),
+                'n_sam_masks': len(masks),
+                'yolo_class_hist': yolo_class_hist,
+            },
         }
 
 

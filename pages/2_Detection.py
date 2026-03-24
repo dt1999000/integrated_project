@@ -365,24 +365,19 @@ def step_3_sam_segmentation(
         }
     
     try:
-        if sam_model_type == "sam3":
-            segment_results = sam_integration.track_by_class_names_video(
-                image=image,
-                class_names=class_names,
-            )
-        else:
-            # Use the unified segment_by_class_names method
-            segment_results = sam_integration.segment_by_class_names(
-                image=image,
-                class_names=class_names,
-                yolo_model_path=yolo_model_path,
-                conf_threshold=conf_threshold
-            )
+        # Always run per-frame segmentation here; cross-frame association is done in ObjectTracker.
+        segment_results = sam_integration.segment_by_class_names(
+            image=image,
+            class_names=class_names,
+            yolo_model_path=yolo_model_path,
+            conf_threshold=conf_threshold
+        )
         
         sam_masks = segment_results['masks']
         mask_bboxes = segment_results['bboxes']
         detected_class_names = segment_results['class_names']
         confidences = segment_results['confidences']
+        segmentation_debug = segment_results.get('debug', {})
         
     except Exception as e:
         return {
@@ -415,6 +410,7 @@ def step_3_sam_segmentation(
         'mask_bboxes': mask_bboxes,
         'class_names': detected_class_names,
         'confidences': confidences,
+        'segmentation_debug': segmentation_debug,
         'n_masks': len(sam_masks),
         'time': elapsed_time
     }
@@ -944,25 +940,11 @@ def _run_pipeline_for_batch_sample(
                 f"[batch] step_3_result: "
                 f"n_masks={len(sam_masks)}, n_class_names={len(class_names)}"
             )
-            if sam_model_type == "sam3" and sam_integration is not None:
-                mask_to_track = sam_integration.track_masks_with_ids(
-                    masks=sam_masks,
-                    class_names=class_names,
-                )
-                tracker.apply_external_image_tracks(
-                    frame_index=frame_index,
-                    image=image,
-                    masks=sam_masks,
-                    class_names=class_names,
-                    meta=meta,
-                    mask_to_track=mask_to_track,
-                )
-            elif (
-                st.session_state.params.get("image_track_mode") == "sam2_bbox"
-                and sam_model_type.startswith("sam2")
+            if (
+                st.session_state.params.get("image_track_mode") == "sam_bbox"
                 and sam_integration is not None
             ):
-                mask_to_track = tracker.track_on_image_sam2(
+                mask_to_track = tracker.track_on_image_with_sam(
                     frame_index=frame_index,
                     image=image,
                     masks=sam_masks,
@@ -972,11 +954,10 @@ def _run_pipeline_for_batch_sample(
                 )
             else:
                 if (
-                    st.session_state.params.get("image_track_mode") == "sam2_bbox"
-                    and sam_model_type.startswith("sam2")
+                    st.session_state.params.get("image_track_mode") == "sam_bbox"
                 ):
                     print(
-                        "[batch] image_track_mode=sam2_bbox but sam_integration is missing; "
+                        "[batch] image_track_mode=sam_bbox but sam_integration is missing; "
                         "falling back to appearance tracking"
                     )
                 mask_to_track = tracker.track_on_image(
@@ -1231,23 +1212,22 @@ def main():
         _itm_idx = 0 if _itm == "appearance" else 1
         st.session_state.params["image_track_mode"] = st.sidebar.radio(
             "2D tracking (batch / cross-frame)",
-            options=["appearance", "sam2_bbox"],
+            options=["appearance", "sam_bbox"],
             index=_itm_idx,
             format_func=lambda m: (
                 "Appearance (patch histogram + cosine)"
                 if m == "appearance"
-                else "SAM2 (bbox prompt from last box)"
+                else "SAM prompt (bbox prompt from last box)"
             ),
             help=(
                 "Appearance matches masks to tracks by patch similarity. "
-                "SAM2 propagates each track's previous 2D box into the current image with SAM2, "
-                "then matches to pipeline masks by mask IoU."
+                "SAM mode propagates each track's previous 2D box into the current image "
+                "with the selected SAM model, then matches to pipeline masks by IoU."
             ),
             key="sidebar_image_track_mode",
         )
     else:
         st.session_state.params['yolo_model_path'] = None
-        st.session_state.params["image_track_mode"] = "appearance"
         st.sidebar.info("💡 SAM3 uses direct text prompts for open-vocabulary segmentation")
     
     # Compute Device
@@ -1280,9 +1260,6 @@ def main():
         if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
             print(f"[batch] starting batch processing for {total} samples")
             results_list = []
-            if 'sam_integration' in st.session_state and st.session_state.sam_integration is not None:
-                if st.session_state.params.get('sam_model_type') == 'sam3':
-                    st.session_state.sam_integration.reset_video_tracking_state()
             tracker = ObjectTracker(
                 bag_freq_hz=st.session_state.params.get('bag_freq_hz', 45.0),
                 class_max_speed_mps=st.session_state.params.get('class_max_speed_mps'),

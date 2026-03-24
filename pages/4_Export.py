@@ -432,6 +432,7 @@ def main():
             "class_names": _to_serializable(step_3_result.get("class_names", [])),
             "confidences": _to_serializable(step_3_result.get("confidences", [])),
             "n_masks": _to_serializable(step_3_result.get("n_masks", len(raw_masks))),
+            "segmentation_debug": _to_serializable(step_3_result.get("segmentation_debug", {})),
         }
 
         image_payload: Dict[str, Any] = {
