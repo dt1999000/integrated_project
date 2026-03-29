@@ -25,7 +25,7 @@ from components.core.sam_integration import (
     calculate_iou,
 )
 from components.core.pose_estimation import fit_cuboid_to_points
-from components.core.clustering_manager import ClusteringManager, select_best_cluster_points
+from components.core.clustering_manager import ClusteringManager, select_best_cluster_points, filter_clusters_by_max_volume
 from components.core.tracking import ObjectTracker
 from components.dataset_loaders.utils import load_dataset_sample
 from components.utils.visualization_helper import (
@@ -35,7 +35,8 @@ from components.utils.visualization_helper import (
     generate_distinct_colors,
     overlay_masks_on_image,
 )
-
+from components.core.llm_service import set_llm_temperature, get_llm_temperature, query_llm_for_dimensions
+from components.core.constants import KITTI_CUBOID_TEMPLATES
 
 # ============================================================================
 # Helper Functions
@@ -108,7 +109,7 @@ def default_detection_params() -> Dict:
         "clustering": {
             "dbscan_eps": 0.5,
             "dbscan_min_samples": 5,
-            "volume_factor": 1.5,
+            "volume_factor": 1.2,
         },
         "cuboid_fitting": {
             "w_distance": 1.0,
@@ -133,6 +134,8 @@ def default_detection_params() -> Dict:
         "sam_model_type": "sam2_t",
         "image_track_mode": "appearance",
         "class_names": ["car", "person", "bicycle"],
+        "open_vocab_detector": "yolo",
+        "grounding_dino_model_id": "IDEA-Research/grounding-dino-base",
         "yolo_model_path": None,
         "yolo_conf_threshold": 0.25,
         "use_gpu": True,
@@ -294,6 +297,8 @@ def step_3_sam_segmentation(
     sam_model_type: str = 'sam2_t',
     yolo_model_path: Optional[str] = None,
     conf_threshold: float = 0.25,
+    open_vocab_detector: str = "yolo",
+    grounding_dino_model_id: Optional[str] = None,
     use_gpu: bool = True,
     projection: Optional[Projection] = None,
 ) -> Dict:
@@ -306,8 +311,10 @@ def step_3_sam_segmentation(
         sparse_points: Nx3 array of backprojected sparse depth points
         class_names: List of class names to detect (e.g., ["car", "person", "bicycle"])
         sam_model_type: 'sam2_t' or 'sam3'
-        yolo_model_path: Optional path to YOLO-World model (only used for SAM2)
-        conf_threshold: Confidence threshold for YOLO detections (default: 0.25)
+        yolo_model_path: Optional path to YOLO-World model (SAM2 + YOLO detector)
+        conf_threshold: Confidence threshold for open-vocab detections (default: 0.25)
+        open_vocab_detector: ``yolo`` or ``grounding_dino`` (SAM2 only)
+        grounding_dino_model_id: Hugging Face model id when using Grounding DINO
         use_gpu: Whether to use GPU for inference (default: True)
     
     Returns:
@@ -370,7 +377,9 @@ def step_3_sam_segmentation(
             image=image,
             class_names=class_names,
             yolo_model_path=yolo_model_path,
-            conf_threshold=conf_threshold
+            conf_threshold=conf_threshold,
+            open_vocab_detector=open_vocab_detector,
+            grounding_dino_model_id=grounding_dino_model_id,
         )
         
         sam_masks = segment_results['masks']
@@ -424,7 +433,7 @@ def step_4_clustering(
     dbscan_eps: float = 0.5,
     dbscan_min_samples: int = 5,
     sparse_depth_map: Optional[np.ndarray] = None,
-    volume_factor: float = 1.5,
+    volume_factor: float = 1.2,
     projection: Optional[Projection] = None,
 ) -> Dict:
     """
@@ -490,7 +499,6 @@ def step_4_clustering(
 
         dims = dimensions_by_class.get(category)
         if dims is None:
-            from components.core.constants import KITTI_CUBOID_TEMPLATES
             t = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
             dims = (float(t['length']), float(t['width']), float(t['height']))
 
@@ -504,7 +512,6 @@ def step_4_clustering(
         )
 
         # Remove clusters that are significantly larger than expected dimensions
-        from components.core.clustering_manager import filter_clusters_by_max_volume
         keep_mask = filter_clusters_by_max_volume(
             points=mask_points,
             labels=cluster_labels,
@@ -632,7 +639,6 @@ def step_5_detection_pose_estimation(
         dimensions_by_class = st.session_state.params.get('dimensions_by_class', {})
         dimensions = dimensions_by_class.get(category)
         if dimensions is None:
-            from components.core.constants import KITTI_CUBOID_TEMPLATES
             t = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
             dimensions = (float(t['length']), float(t['width']), float(t['height']))
         
@@ -771,7 +777,7 @@ def run_full_pipeline(params: Dict) -> Dict:
     class_names = params.get('class_names', [])
     if not class_names:
         class_names = ['car', 'person', 'bicycle']  # Default classes
-    
+    print(f'class_names: {class_names}')
     step_3_result = step_3_sam_segmentation(
         sample_meta_data=st.session_state.sample['sample_meta_data'],
         image=st.session_state.sample['image'],
@@ -780,6 +786,8 @@ def run_full_pipeline(params: Dict) -> Dict:
         sam_model_type=params.get('sam_model_type', 'sam2_t'),
         yolo_model_path=params.get('yolo_model_path', None),
         conf_threshold=params.get('yolo_conf_threshold', 0.25),
+        open_vocab_detector=params.get('open_vocab_detector', 'yolo'),
+        grounding_dino_model_id=params.get('grounding_dino_model_id'),
         use_gpu=params.get('use_gpu', True),
         projection=step_2_result['projection'],
     )
@@ -823,6 +831,7 @@ def _run_pipeline_for_batch_sample(
     sample_index,
     tracker: Optional[ObjectTracker],
     frame_index: int,
+    prev_image: Optional[np.ndarray] = None,
 ) -> Optional[Dict]:
     """Load one sample, run full pipeline, update tracker, return export_results for Export page."""
     print(
@@ -902,26 +911,28 @@ def _run_pipeline_for_batch_sample(
             "pipeline_params": st.session_state.params.copy() if "params" in st.session_state else {},
         },
     }
-    if dataset_type_lower == "kitti":
+    if dataset_type_lower in ("kitti", "sim"):
+        # Always write ground_truth_cuboids (even empty list) for annotated dataset types.
+        # An absent key means "no GT available"; an empty list means "GT available, empty scene".
+        # This ensures filtered frames with zero annotations still contribute FPs to AP.
         ground_truth_boxes = meta.get("ground_truth_boxes", [])
-        if ground_truth_boxes:
-            ground_truth_cuboids = []
-            for gt_box in ground_truth_boxes:
-                gt_cuboid = {
-                    "category": gt_box.get("category", "Unknown"),
-                    "corners": gt_box.get("corners"),
-                    "bbox_2d": gt_box.get("bbox_2d"),
-                    "min_x": gt_box.get("min_x"),
-                    "max_x": gt_box.get("max_x"),
-                    "min_y": gt_box.get("min_y"),
-                    "max_y": gt_box.get("max_y"),
-                    "min_z": gt_box.get("min_z"),
-                    "max_z": gt_box.get("max_z"),
-                    "format": "kitti_gt",
-                }
-                ground_truth_cuboids.append(gt_cuboid)
-            export_results["ground_truth_cuboids"] = ground_truth_cuboids
-            export_results["metadata"]["n_ground_truth"] = len(ground_truth_cuboids)
+        ground_truth_cuboids = []
+        for gt_box in ground_truth_boxes:
+            gt_cuboid = {
+                "category": gt_box.get("category", gt_box.get("class", "Unknown")),
+                "corners": gt_box.get("corners"),
+                "bbox_2d": gt_box.get("bbox_2d"),
+                "min_x": gt_box.get("min_x"),
+                "max_x": gt_box.get("max_x"),
+                "min_y": gt_box.get("min_y"),
+                "max_y": gt_box.get("max_y"),
+                "min_z": gt_box.get("min_z"),
+                "max_z": gt_box.get("max_z"),
+                "format": f"{dataset_type_lower}_gt",
+            }
+            ground_truth_cuboids.append(gt_cuboid)
+        export_results["ground_truth_cuboids"] = ground_truth_cuboids
+        export_results["metadata"]["n_ground_truth"] = len(ground_truth_cuboids)
 
     if tracker is not None:
         print(
@@ -934,32 +945,28 @@ def _run_pipeline_for_batch_sample(
         else:
             sam_masks = step_3_result.get("sam_masks", [])
             class_names = step_3_result.get("class_names", [])
-            sam_integration = st.session_state.get("sam_integration")
-            sam_model_type = st.session_state.params.get("sam_model_type", "sam2_t")
             print(
                 f"[batch] step_3_result: "
                 f"n_masks={len(sam_masks)}, n_class_names={len(class_names)}"
             )
-            if (
-                st.session_state.params.get("image_track_mode") == "sam_bbox"
-                and sam_integration is not None
-            ):
-                mask_to_track = tracker.track_on_image_with_sam(
+            image_track_mode = st.session_state.params.get("image_track_mode", "appearance")
+            if image_track_mode == "deepsort":
+                mask_to_track = tracker.track_on_image_deepsort(
                     frame_index=frame_index,
                     image=image,
                     masks=sam_masks,
                     class_names=class_names,
                     meta=meta,
-                    sam_integration=sam_integration,
+                )
+            elif image_track_mode == "bytetrack":
+                mask_to_track = tracker.track_on_image_bytetrack(
+                    frame_index=frame_index,
+                    image=image,
+                    masks=sam_masks,
+                    class_names=class_names,
+                    meta=meta,
                 )
             else:
-                if (
-                    st.session_state.params.get("image_track_mode") == "sam_bbox"
-                ):
-                    print(
-                        "[batch] image_track_mode=sam_bbox but sam_integration is missing; "
-                        "falling back to appearance tracking"
-                    )
                 mask_to_track = tracker.track_on_image(
                     frame_index=frame_index,
                     image=image,
@@ -1116,7 +1123,6 @@ def main():
     
     # LLM Settings
     with st.sidebar.expander("LLM Settings", expanded=False):
-        from components.core.llm_service import set_llm_temperature, get_llm_temperature
         
         # Initialize temperature in session state if not present
         if 'llm_temperature' not in st.session_state:
@@ -1159,10 +1165,7 @@ def main():
         
         # Check if class names have changed
         previous_class_names = st.session_state.get('previous_class_names', [])
-        if set(class_names) != set(previous_class_names):
-            # Pre-compute dimensions for new class names and store in session_state
-            from components.core.llm_service import query_llm_for_dimensions
-            
+        if set(class_names) != set(previous_class_names):            
             with st.sidebar.spinner("Pre-computing dimensions for class names..."):
                 dims_by_class = {}
                 for class_name in class_names:
@@ -1187,47 +1190,57 @@ def main():
     
     is_sam2 = st.session_state.params['sam_model_type'].startswith('sam2')
     if is_sam2:
-        st.sidebar.markdown("### YOLO (Open-Vocab) Model")
-        if yolo_models:
-            current_yolo = st.session_state.params.get('yolo_model_path')
-            yolo_index = yolo_models.index(current_yolo) if current_yolo in yolo_models else 0
-            st.session_state.params['yolo_model_path'] = st.sidebar.selectbox(
-                "YOLO Model",
-                options=yolo_models,
-                index=yolo_index,
-                help="Discovered from models directory."
+        st.sidebar.markdown("### Open-vocabulary detection (SAM2)")
+        det_options = {"YOLO-World": "yolo", "Grounding DINO (HF)": "grounding_dino"}
+        det_labels = list(det_options.keys())
+        current_det = st.session_state.params.get('open_vocab_detector', 'yolo')
+        det_index = 0
+        for i, lbl in enumerate(det_labels):
+            if det_options[lbl] == current_det:
+                det_index = i
+                break
+        picked = st.sidebar.radio(
+            "Detector",
+            options=det_labels,
+            index=det_index,
+            help="Bounding boxes for SAM2: YOLO-World from local weights, or Grounding DINO via Hugging Face.",
+        )
+        st.session_state.params['open_vocab_detector'] = det_options[picked]
+
+        if st.session_state.params['open_vocab_detector'] == 'grounding_dino':
+            st.session_state.params['grounding_dino_model_id'] = st.sidebar.text_input(
+                "Grounding DINO model id",
+                value=st.session_state.params.get(
+                    'grounding_dino_model_id', 'IDEA-Research/grounding-dino-base'
+                ),
+                help="Hugging Face model id for transformers zero-shot-object-detection.",
             )
-        else:
             st.session_state.params['yolo_model_path'] = None
-            st.sidebar.warning("⚠️ No YOLO models found in models directory.")
+        else:
+            st.sidebar.markdown("#### YOLO-World weights")
+            if yolo_models:
+                current_yolo = st.session_state.params.get('yolo_model_path')
+                yolo_index = yolo_models.index(current_yolo) if current_yolo in yolo_models else 0
+                st.session_state.params['yolo_model_path'] = st.sidebar.selectbox(
+                    "YOLO Model",
+                    options=yolo_models,
+                    index=yolo_index,
+                    help="Discovered from models directory."
+                )
+            else:
+                st.session_state.params['yolo_model_path'] = None
+                st.sidebar.warning("⚠️ No YOLO models found in models directory.")
 
         st.session_state.params['yolo_conf_threshold'] = st.sidebar.slider(
-            "YOLO Confidence Threshold",
+            "Detector confidence threshold",
             0.0, 1.0, 0.25, 0.05,
-            help="Confidence threshold for YOLO-World detections (only used with SAM2)"
+            help="Confidence threshold for open-vocabulary detections (SAM2)"
         )
-        st.sidebar.info("💡 SAM2 uses YOLO-World for detection, then SAM2 for segmentation")
+        st.sidebar.info("💡 SAM2 uses the chosen detector for boxes, then SAM2 for masks")
 
-        _itm = st.session_state.params.get("image_track_mode", "appearance")
-        _itm_idx = 0 if _itm == "appearance" else 1
-        st.session_state.params["image_track_mode"] = st.sidebar.radio(
-            "2D tracking (batch / cross-frame)",
-            options=["appearance", "sam_bbox"],
-            index=_itm_idx,
-            format_func=lambda m: (
-                "Appearance (patch histogram + cosine)"
-                if m == "appearance"
-                else "SAM prompt (bbox prompt from last box)"
-            ),
-            help=(
-                "Appearance matches masks to tracks by patch similarity. "
-                "SAM mode propagates each track's previous 2D box into the current image "
-                "with the selected SAM model, then matches to pipeline masks by IoU."
-            ),
-            key="sidebar_image_track_mode",
-        )
     else:
         st.session_state.params['yolo_model_path'] = None
+        st.session_state.params['open_vocab_detector'] = 'yolo'
         st.sidebar.info("💡 SAM3 uses direct text prompts for open-vocabulary segmentation")
     
     # Compute Device
@@ -1253,19 +1266,58 @@ def main():
     #batch processing
     batch_samples = st.session_state.get("batch_samples", [])
     process_all_samples = st.session_state.get("process_all_samples", False)
+    if batch_samples:
+        _itm = st.session_state.params.get("image_track_mode", "appearance")
+        _itm_options = ["appearance", "deepsort", "bytetrack"]
+        _itm_idx = _itm_options.index(_itm) if _itm in _itm_options else 0
+        st.session_state.params["image_track_mode"] = st.sidebar.radio(
+            "2D tracking (batch / cross-frame)",
+            options=_itm_options,
+            index=_itm_idx,
+            format_func=lambda m: (
+                "Appearance (patch histogram + cosine)"
+                if m == "appearance"
+                else ("DeepSORT (Kalman + ReID)" if m == "deepsort" else "ByteTrack (two-stage assoc)")
+            ),
+            help=(
+                "Appearance matches masks by patch similarity. "
+                "DeepSORT combines Kalman motion gating + ReID embedding distance. "
+                "ByteTrack uses two-stage high/low confidence association."
+            ),
+            key="sidebar_image_track_mode",
+        )
+        st.session_state.batch_process_enabled_tracking = st.sidebar.checkbox(
+            "Run cross-frame tracking on the batch (2D/3D association; enables tracklet & Datumaro exports)",
+            key="batch_process_enable_tracking",
+            help=(
+                "When enabled, an ObjectTracker runs across all frames and builds datumaro_tracking. "
+                "Disable for detection-only batch runs (faster; Export page hides tracking exports)."
+            ),
+        )
+        
     if batch_samples and process_all_samples:
         st.subheader("📚 Batch Processing")
         total = len(batch_samples)
         st.info(f"Batch loaded: **{total}** samples. Process the entire batch to run detection on all samples.")
         if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
-            print(f"[batch] starting batch processing for {total} samples")
-            results_list = []
-            tracker = ObjectTracker(
-                bag_freq_hz=st.session_state.params.get('bag_freq_hz', 45.0),
-                class_max_speed_mps=st.session_state.params.get('class_max_speed_mps'),
+            do_batch_tracking = st.session_state.get("batch_process_enable_tracking", True)
+            print(
+                f"[batch] starting batch processing for {total} samples "
+                f"(tracking={'on' if do_batch_tracking else 'off'})"
             )
-            st.session_state.tracker = tracker
+            results_list = []
+            st.session_state.datumaro_tracking = None
+            st.session_state.tracking_2d_history = None
+            st.session_state.tracker = None
+            tracker = None
+            if do_batch_tracking:
+                tracker = ObjectTracker(
+                    bag_freq_hz=st.session_state.params.get('bag_freq_hz', 45.0),
+                    class_max_speed_mps=st.session_state.params.get('class_max_speed_mps'),
+                )
+                st.session_state.tracker = tracker
             progress = st.progress(0.0)
+            prev_image: Optional[np.ndarray] = None
             for i, sample_desc in enumerate(batch_samples):
                 print(
                     f"[batch] processing index {i} / {total - 1}, "
@@ -1279,22 +1331,31 @@ def main():
                     sample_index=sample_desc["sample_index"],
                     tracker=tracker,
                     frame_index=i,
+                    prev_image=prev_image,
                 )
+                prev_image = st.session_state.sample.get("image") if "sample" in st.session_state else None
                 if export_res is not None:
                     results_list.append(export_res)
                 else:
                     print(f"[batch] sample {i} returned no export_res")
-            st.session_state.batch_export_results = {"samples": results_list}
+            st.session_state.batch_export_results = {
+                "samples": results_list,
+                "batch_tracking_enabled": do_batch_tracking,
+            }
             print(f"[batch] collected {len(results_list)} successful samples")
-            datumaro_state = tracker.build_datumaro_state()
-            tracking_2d_history = tracker.build_2d_tracking_history()
-            print(
-                "[batch] built datumaro_state: "
-                f"n_items={len(datumaro_state.get('items', []))}, "
-                f"categories={list(datumaro_state.get('categories', {}).keys())}"
-            )
-            st.session_state.datumaro_tracking = datumaro_state
-            st.session_state.tracking_2d_history = tracking_2d_history
+            if do_batch_tracking:
+                datumaro_state = tracker.build_datumaro_state()
+                tracking_2d_history = tracker.build_2d_tracking_history()
+                print(
+                    "[batch] built datumaro_state: "
+                    f"n_items={len(datumaro_state.get('items', []))}, "
+                    f"categories={list(datumaro_state.get('categories', {}).keys())}"
+                )
+                st.session_state.datumaro_tracking = datumaro_state
+                st.session_state.tracking_2d_history = tracking_2d_history
+            else:
+                st.session_state.datumaro_tracking = None
+                st.session_state.tracking_2d_history = None
             st.success(
                 f"✅ Processed **{len(results_list)}** / {total} samples. "
                 "Go to **4_Export** to save KITTI and Datumaro-style exports."
@@ -1355,26 +1416,25 @@ def main():
                         'pipeline_params': st.session_state.params.copy() if 'params' in st.session_state else {}
                     }
                 }
-                if dataset_type == 'kitti':
+                if dataset_type in ('kitti', 'sim'):
                     ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
-                    if ground_truth_boxes:
-                        ground_truth_cuboids = []
-                        for gt_box in ground_truth_boxes:
-                            gt_cuboid = {
-                                'category': gt_box.get('category', 'Unknown'),
-                                'corners': gt_box.get('corners'),
-                                'bbox_2d': gt_box.get('bbox_2d'),
-                                'min_x': gt_box.get('min_x'),
-                                'max_x': gt_box.get('max_x'),
-                                'min_y': gt_box.get('min_y'),
-                                'max_y': gt_box.get('max_y'),
-                                'min_z': gt_box.get('min_z'),
-                                'max_z': gt_box.get('max_z'),
-                                'format': 'kitti_gt'
-                            }
-                            ground_truth_cuboids.append(gt_cuboid)
-                        export_results['ground_truth_cuboids'] = ground_truth_cuboids
-                        export_results['metadata']['n_ground_truth'] = len(ground_truth_cuboids)
+                    ground_truth_cuboids = []
+                    for gt_box in ground_truth_boxes:
+                        gt_cuboid = {
+                            'category': gt_box.get('category', gt_box.get('class', 'Unknown')),
+                            'corners': gt_box.get('corners'),
+                            'bbox_2d': gt_box.get('bbox_2d'),
+                            'min_x': gt_box.get('min_x'),
+                            'max_x': gt_box.get('max_x'),
+                            'min_y': gt_box.get('min_y'),
+                            'max_y': gt_box.get('max_y'),
+                            'min_z': gt_box.get('min_z'),
+                            'max_z': gt_box.get('max_z'),
+                            'format': f'{dataset_type}_gt'
+                        }
+                        ground_truth_cuboids.append(gt_cuboid)
+                    export_results['ground_truth_cuboids'] = ground_truth_cuboids
+                    export_results['metadata']['n_ground_truth'] = len(ground_truth_cuboids)
                 st.session_state.export_results = export_results
 
                 # Explore and display what the pipeline returns
@@ -1687,6 +1747,8 @@ def main():
                             sam_model_type=st.session_state.params['sam_model_type'],
                             yolo_model_path=st.session_state.params.get('yolo_model_path', None),
                             conf_threshold=st.session_state.params.get('yolo_conf_threshold', 0.25),
+                            open_vocab_detector=st.session_state.params.get('open_vocab_detector', 'yolo'),
+                            grounding_dino_model_id=st.session_state.params.get('grounding_dino_model_id'),
                             use_gpu=st.session_state.params.get('use_gpu', True),
                             projection=step_2_result['projection'],
                         )
@@ -2067,31 +2129,26 @@ def main():
                             }
                         }
                         
-                        # Add ground truth cuboids if available (for KITTI dataset)
-                        if dataset_type == 'kitti':
+                        # Add ground truth cuboids for annotated dataset types (KITTI and sim).
+                        if dataset_type in ('kitti', 'sim'):
                             ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
-                            if ground_truth_boxes:
-                                # Convert ground truth boxes to cuboid format for export/visualization
-                                ground_truth_cuboids = []
-                                for gt_box in ground_truth_boxes:
-                                    # Ground truth boxes from KITTI already have corners and other fields
-                                    # Ensure they're in the right format for export
-                                    gt_cuboid = {
-                                        'category': gt_box.get('category', 'Unknown'),
-                                        'corners': gt_box.get('corners'),
-                                        'bbox_2d': gt_box.get('bbox_2d'),
-                                        'min_x': gt_box.get('min_x'),
-                                        'max_x': gt_box.get('max_x'),
-                                        'min_y': gt_box.get('min_y'),
-                                        'max_y': gt_box.get('max_y'),
-                                        'min_z': gt_box.get('min_z'),
-                                        'max_z': gt_box.get('max_z'),
-                                        'format': 'kitti_gt'
-                                    }
-                                    ground_truth_cuboids.append(gt_cuboid)
-                                
-                                export_results['ground_truth_cuboids'] = ground_truth_cuboids
-                                export_results['metadata']['n_ground_truth'] = len(ground_truth_cuboids)
+                            ground_truth_cuboids = []
+                            for gt_box in ground_truth_boxes:
+                                gt_cuboid = {
+                                    'category': gt_box.get('category', gt_box.get('class', 'Unknown')),
+                                    'corners': gt_box.get('corners'),
+                                    'bbox_2d': gt_box.get('bbox_2d'),
+                                    'min_x': gt_box.get('min_x'),
+                                    'max_x': gt_box.get('max_x'),
+                                    'min_y': gt_box.get('min_y'),
+                                    'max_y': gt_box.get('max_y'),
+                                    'min_z': gt_box.get('min_z'),
+                                    'max_z': gt_box.get('max_z'),
+                                    'format': f'{dataset_type}_gt'
+                                }
+                                ground_truth_cuboids.append(gt_cuboid)
+                            export_results['ground_truth_cuboids'] = ground_truth_cuboids
+                            export_results['metadata']['n_ground_truth'] = len(ground_truth_cuboids)
                         
                         # Store export-ready results
                         st.session_state.export_results = export_results

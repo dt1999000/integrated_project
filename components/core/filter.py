@@ -1,9 +1,10 @@
 """
-Common image quality filtering utilities used across datasets (KITTI, nuScenes, sim).
+Common image quality filtering utilities used across datasets (KITTI, nuScenes, sim),
+plus ROS bag frame subsampling helpers.
 """
 
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import Any, List, Dict, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -311,3 +312,46 @@ def filter_sim_images(
 
     return filtered_samples
 
+
+def sample_rosbag_frames_every_nth(
+    bag_path: Path,
+    image_topic: str,
+    stride: int,
+    max_frames: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Sample frames from a ROS bag image topic by taking every n-th message.
+
+    Ignores quality filters; uses message index only.
+    Returns dicts compatible with rosbag_filtered_frames.
+
+    Imports open_reader lazily to avoid circular import with rosbag_extractor.
+    """
+    from components.dataset_loaders.rosbag_extractor import open_reader
+
+    bag_path = Path(bag_path)
+    frames: List[Dict[str, Any]] = []
+
+    with open_reader(bag_path) as reader:
+        img_conns = [c for c in reader.connections if c.topic == image_topic]
+        if not img_conns:
+            return []
+
+        msg_index = 0
+        accepted_index = 0
+
+        for conn, ts, _raw in reader.messages(connections=img_conns):
+            if msg_index % stride == 0:
+                if max_frames is not None and accepted_index >= max_frames:
+                    break
+                frames.append(
+                    {
+                        "frame_index": accepted_index,
+                        "timestamp_ns": int(ts),
+                        "metrics": {},
+                    }
+                )
+                accepted_index += 1
+            msg_index += 1
+
+    return frames

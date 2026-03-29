@@ -475,3 +475,304 @@ class CuboidMatcher:
             stats['Recall'] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
         return category_stats
+
+
+# =============================================================================
+# Batch Evaluation: AP_50 / AP_25
+# =============================================================================
+
+def _normalize_gt_cuboids(cuboids: List[Dict]) -> List[Dict]:
+    """
+    Normalize a list of GT cuboid dicts to the min/max corner format
+    required by the IoU functions.
+
+    Handles both the already-normalized min/max format and the
+    translation+size format used by nuScenes-style annotations.
+    """
+    normalized = []
+    for gt in cuboids:
+        if all(
+            k in gt and gt[k] is not None
+            for k in ("min_x", "min_y", "min_z", "max_x", "max_y", "max_z")
+        ):
+            normalized.append(gt)
+            continue
+
+        translation = gt.get("translation")
+        size = gt.get("size")
+        if translation is None or size is None or len(translation) != 3 or len(size) != 3:
+            continue
+
+        center = np.asarray(translation, dtype=np.float64)
+        half = np.asarray(size, dtype=np.float64) / 2.0
+        norm_gt = dict(gt)
+        norm_gt["min_x"] = float(center[0] - half[0])
+        norm_gt["min_y"] = float(center[1] - half[1])
+        norm_gt["min_z"] = float(center[2] - half[2])
+        norm_gt["max_x"] = float(center[0] + half[0])
+        norm_gt["max_y"] = float(center[1] + half[1])
+        norm_gt["max_z"] = float(center[2] + half[2])
+        norm_gt["category"] = norm_gt.get("category", norm_gt.get("class", "Unknown"))
+        normalized.append(norm_gt)
+    return normalized
+
+
+def compute_frame_metrics_at_iou(
+    gt_cuboids: List[Dict],
+    detected_cuboids: List[Dict],
+    iou_threshold: float = 0.5,
+    match_by_category: bool = False,
+) -> Dict:
+    """
+    Compute per-frame TP, FP, FN counts at a given 3D IoU threshold.
+
+    Uses greedy matching: all (GT, detection) pairs whose IoU meets the
+    threshold are sorted by IoU descending and greedily assigned so that
+    each GT and each detection is used at most once.
+
+    Args:
+        gt_cuboids: Ground truth cuboid dicts (already normalized to min/max).
+        detected_cuboids: Detected cuboid dicts.
+        iou_threshold: IoU value a pair must meet to count as a TP.
+        match_by_category: When True, a detection may only match a GT of the
+            same category.
+
+    Returns:
+        Dict with keys TP, FP, FN, precision, recall, f1, n_gt, n_det,
+        and per_class (dict mapping category -> {TP, FP, FN}).
+    """
+    n_gt = len(gt_cuboids)
+    n_det = len(detected_cuboids)
+
+    per_class_tp: Dict[str, int] = {}
+    per_class_fp: Dict[str, int] = {}
+    per_class_fn: Dict[str, int] = {}
+
+    if n_gt == 0 and n_det == 0:
+        return {
+            "TP": 0, "FP": 0, "FN": 0,
+            "precision": 1.0, "recall": 1.0, "f1": 1.0,
+            "n_gt": 0, "n_det": 0, "per_class": {},
+        }
+
+    if n_gt == 0:
+        for det in detected_cuboids:
+            cat = det.get("category", "Unknown")
+            per_class_fp[cat] = per_class_fp.get(cat, 0) + 1
+        per_class = {c: {"TP": 0, "FP": per_class_fp[c], "FN": 0} for c in per_class_fp}
+        return {
+            "TP": 0, "FP": n_det, "FN": 0,
+            "precision": 0.0, "recall": 1.0, "f1": 0.0,
+            "n_gt": 0, "n_det": n_det, "per_class": per_class,
+        }
+
+    if n_det == 0:
+        for gt in gt_cuboids:
+            cat = gt.get("category", "Unknown")
+            per_class_fn[cat] = per_class_fn.get(cat, 0) + 1
+        per_class = {c: {"TP": 0, "FP": 0, "FN": per_class_fn[c]} for c in per_class_fn}
+        return {
+            "TP": 0, "FP": 0, "FN": n_gt,
+            "precision": 1.0, "recall": 0.0, "f1": 0.0,
+            "n_gt": n_gt, "n_det": 0, "per_class": per_class,
+        }
+
+    # Build IoU matrix
+    iou_matrix = np.zeros((n_gt, n_det), dtype=np.float64)
+    for gi, gt in enumerate(gt_cuboids):
+        gt_cat = gt.get("category", "Unknown")
+        for di, det in enumerate(detected_cuboids):
+            if match_by_category and gt_cat != det.get("category", "Unknown"):
+                continue
+            iou_matrix[gi, di] = compute_3d_iou(gt, det)
+
+    # Greedy matching sorted by IoU descending
+    pairs = [
+        (iou_matrix[gi, di], gi, di)
+        for gi in range(n_gt)
+        for di in range(n_det)
+        if iou_matrix[gi, di] >= iou_threshold
+    ]
+    pairs.sort(reverse=True)
+
+    matched_gt: Set[int] = set()
+    matched_det: Set[int] = set()
+    for _, gi, di in pairs:
+        if gi not in matched_gt and di not in matched_det:
+            matched_gt.add(gi)
+            matched_det.add(di)
+            cat = gt_cuboids[gi].get("category", "Unknown")
+            per_class_tp[cat] = per_class_tp.get(cat, 0) + 1
+
+    for di, det in enumerate(detected_cuboids):
+        if di not in matched_det:
+            cat = det.get("category", "Unknown")
+            per_class_fp[cat] = per_class_fp.get(cat, 0) + 1
+
+    for gi, gt in enumerate(gt_cuboids):
+        if gi not in matched_gt:
+            cat = gt.get("category", "Unknown")
+            per_class_fn[cat] = per_class_fn.get(cat, 0) + 1
+
+    tp = len(matched_gt)
+    fp = n_det - tp
+    fn = n_gt - tp
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    all_cats = set(list(per_class_tp) + list(per_class_fp) + list(per_class_fn))
+    per_class = {
+        cat: {
+            "TP": per_class_tp.get(cat, 0),
+            "FP": per_class_fp.get(cat, 0),
+            "FN": per_class_fn.get(cat, 0),
+        }
+        for cat in all_cats
+    }
+
+    return {
+        "TP": tp, "FP": fp, "FN": fn,
+        "precision": precision, "recall": recall, "f1": f1,
+        "n_gt": n_gt, "n_det": n_det,
+        "per_class": per_class,
+    }
+
+
+def compute_batch_ap(
+    batch_results: List[Dict],
+    iou_threshold: float = 0.5,
+    match_by_category: bool = False,
+) -> Dict:
+    """
+    Compute batch-level AP at a given IoU threshold.
+
+    Since per-detection confidence scores are not available, AP is estimated
+    as the F1 score (harmonic mean of precision and recall) computed globally
+    over all frames.  A per-class breakdown and per-frame metrics are also
+    returned.
+
+    Args:
+        batch_results: List of sample dicts from
+            ``batch_export_results['samples']``.  Each dict must contain
+            ``detected_cuboids`` and optionally ``ground_truth_cuboids``.
+        iou_threshold: IoU threshold used to decide TP vs FP/FN.
+        match_by_category: Whether to restrict GT↔detection matching to
+            pairs with the same category label.
+
+    Returns:
+        Dict with ap, precision, recall, f1, total_tp/fp/fn,
+        per_frame_metrics (list), per_class (dict), and iou_threshold.
+    """
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    per_frame_metrics: List[Dict] = []
+
+    class_tp: Dict[str, int] = {}
+    class_fp: Dict[str, int] = {}
+    class_fn: Dict[str, int] = {}
+
+    for i, sample in enumerate(batch_results):
+        gt = _normalize_gt_cuboids(sample.get("ground_truth_cuboids", []))
+        det = sample.get("detected_cuboids", [])
+
+        frame_m = compute_frame_metrics_at_iou(gt, det, iou_threshold, match_by_category)
+        frame_m["frame_index"] = i
+        frame_m["sample_index"] = sample.get("metadata", {}).get("sample_index", str(i))
+        per_frame_metrics.append(frame_m)
+
+        total_tp += frame_m["TP"]
+        total_fp += frame_m["FP"]
+        total_fn += frame_m["FN"]
+
+        for cat, stats in frame_m["per_class"].items():
+            class_tp[cat] = class_tp.get(cat, 0) + stats["TP"]
+            class_fp[cat] = class_fp.get(cat, 0) + stats["FP"]
+            class_fn[cat] = class_fn.get(cat, 0) + stats["FN"]
+
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    all_cats = set(list(class_tp) + list(class_fp) + list(class_fn))
+    per_class: Dict[str, Dict] = {}
+    ap_per_class: List[float] = []
+    for cat in all_cats:
+        tp_c = class_tp.get(cat, 0)
+        fp_c = class_fp.get(cat, 0)
+        fn_c = class_fn.get(cat, 0)
+        p_c = tp_c / (tp_c + fp_c) if (tp_c + fp_c) > 0 else 0.0
+        r_c = tp_c / (tp_c + fn_c) if (tp_c + fn_c) > 0 else 0.0
+        f1_c = 2 * p_c * r_c / (p_c + r_c) if (p_c + r_c) > 0 else 0.0
+        per_class[cat] = {
+            "TP": tp_c, "FP": fp_c, "FN": fn_c,
+            "precision": p_c, "recall": r_c, "ap": f1_c,
+        }
+        ap_per_class.append(f1_c)
+
+    # Mean AP is the mean F1 per class; falls back to global F1 if no classes found
+    mean_ap = float(np.mean(ap_per_class)) if ap_per_class else f1
+
+    return {
+        "ap": mean_ap,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "total_tp": total_tp,
+        "total_fp": total_fp,
+        "total_fn": total_fn,
+        "per_frame_metrics": per_frame_metrics,
+        "per_class": per_class,
+        "iou_threshold": iou_threshold,
+    }
+
+
+def compute_batch_statistics(
+    batch_results: List[Dict],
+    total_queued: int = 0,
+    match_by_category: bool = False,
+) -> Dict:
+    """
+    Compute comprehensive batch evaluation statistics including AP_50 and AP_25.
+
+    AP_50 (AP at IoU ≥ 0.5) is the standard benchmark metric used by KITTI
+    and ScanNet.  AP_25 (AP at IoU ≥ 0.25) is a looser threshold used in
+    indoor benchmarks (e.g. ScanRefer).  Both are computed as the mean F1
+    score per category across all evaluable frames.
+
+    Args:
+        batch_results: List of sample dicts from
+            ``batch_export_results['samples']``.
+        total_queued: Number of samples originally queued for processing
+            (from ``batch_samples``).  Used to compute failure count.
+        match_by_category: Forwarded to the underlying AP computation.
+
+    Returns:
+        Dict with:
+            n_total_samples, n_evaluable_samples, n_skipped_no_gt,
+            n_failed_pipeline, total_detections, total_ground_truth,
+            ap_50 (full result dict), ap_25 (full result dict).
+    """
+    n_total = len(batch_results)
+    results_with_gt = [r for r in batch_results if r.get("ground_truth_cuboids")]
+    n_with_gt = len(results_with_gt)
+    n_failed = max(0, total_queued - n_total)
+
+    total_detections = sum(len(r.get("detected_cuboids", [])) for r in batch_results)
+    total_gt = sum(len(r.get("ground_truth_cuboids", [])) for r in results_with_gt)
+
+    ap_50 = compute_batch_ap(results_with_gt, iou_threshold=0.5, match_by_category=match_by_category)
+    ap_25 = compute_batch_ap(results_with_gt, iou_threshold=0.25, match_by_category=match_by_category)
+
+    return {
+        "n_total_samples": n_total,
+        "n_evaluable_samples": n_with_gt,
+        "n_skipped_no_gt": n_total - n_with_gt,
+        "n_failed_pipeline": n_failed,
+        "total_detections": total_detections,
+        "total_ground_truth": total_gt,
+        "ap_50": ap_50,
+        "ap_25": ap_25,
+    }

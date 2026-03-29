@@ -214,18 +214,31 @@ def main():
     
     st.header("💾 Export Results")
 
+    output_root = st.session_state.get("output_root_dir", "")
+    batch_export_results = st.session_state.get("batch_export_results") or {}
+    batch_samples_list = batch_export_results.get("samples") or []
+    _bte = batch_export_results.get("batch_tracking_enabled")
+    _ts_legacy = st.session_state.get("datumaro_tracking")
+    if _bte is None:
+        batch_tracking_enabled = bool(_ts_legacy and _ts_legacy.get("items"))
+    else:
+        batch_tracking_enabled = bool(_bte)
+    tracking_state = st.session_state.get("datumaro_tracking")
+    show_batch_tracking_exports = batch_tracking_enabled and bool(
+        tracking_state and tracking_state.get("items")
+    )
+
     st.subheader("🚗 KITTI format exports")
     st.caption(
         "Exports in this section follow KITTI-style conventions. "
         "Note: **CVAT's KITTI-compatible import currently does not support tracking**; "
-        "for tracked exports use the *Datumaro-style* section below."
+        "for tracked batch exports use the Datumaro-style block (shown when batch tracking was enabled on **2_Detection**)."
     )
 
     # ------------------------------------------------------------------
     # 1) Tracklet XML export from tracking (Datumaro state)
     # ------------------------------------------------------------------
-    tracking_state = st.session_state.get("datumaro_tracking")
-    if tracking_state and tracking_state.get("items"):
+    if show_batch_tracking_exports:
         st.subheader("📦 Tracklet XML Export (KITTI-style from tracking)")
         n_frames = len(tracking_state.get("items", []))
         st.metric("Frames in batch", n_frames)
@@ -239,7 +252,6 @@ def main():
                     track_ids.add(int(attrs["track_id"]))
         st.metric("Tracklets", len(track_ids))
 
-        output_root = st.session_state.get("output_root_dir", "")
         if not output_root:
             st.warning("Output folder is not set. Please open **1_Dataset_Extraction** and set the Output Directory.")
         else:
@@ -265,36 +277,53 @@ def main():
                     st.success(f"✅ Saved complete 2D tracking history to **{out_file}**")
 
         st.markdown("---")
-        
+
     # ------------------------------------------------------------------
     # 4) Datumaro-style export with tracking
     # ------------------------------------------------------------------
-    st.subheader("📦 Datumaro-style export (with tracking)")
-    st.caption(
-        "Exports batch detections in a Datumaro/CVAT-compatible JSON format that "
-        "includes 3D cuboid tracks (track_id, keyframes, occlusion flags). "
-        "Uses the tracking state built during batch processing on **2_Detection**."
-    )
+    if show_batch_tracking_exports:
+        st.subheader("📦 Datumaro-style export (with tracking)")
+        st.caption(
+            "Exports batch detections in a Datumaro/CVAT-compatible JSON format that "
+            "includes 3D cuboid tracks (track_id, keyframes, occlusion flags). "
+            "Uses the tracking state built during batch processing on **2_Detection**."
+        )
 
-    batch_results_for_tracking = st.session_state.get("batch_export_results")
+        if not output_root:
+            st.warning(
+                "Output folder is not set. Please open **1_Dataset_Extraction** and set the Output Directory."
+            )
+        elif st.button("💾 Save Datumaro-style tracking JSON", key="export_datumaro_tracking_json"):
+            export_root = Path(output_root).expanduser()
+            export_root.mkdir(parents=True, exist_ok=True)
 
-    if not tracking_state or not batch_results_for_tracking or not batch_results_for_tracking.get("samples"):
+            datumaro_json = tracking_state
+            out_file = export_root / "detections_datumaro_tracking.json"
+            out_file.write_text(json.dumps(datumaro_json, indent=2), encoding="utf-8")
+            st.success(f"✅ Saved Datumaro-style tracking annotations to **{out_file}**")
+
+        st.markdown("---")
+    elif batch_samples_list and batch_export_results.get("batch_tracking_enabled") is False:
+        st.markdown("---")
+    elif batch_samples_list and not show_batch_tracking_exports:
+        st.subheader("📦 Datumaro-style export (with tracking)")
         st.info(
-            "No tracking information found. Run batch processing on **2_Detection** "
+            "No tracking state in session. Run batch processing on **2_Detection** "
             "with tracking enabled before exporting in Datumaro style."
         )
-        return
-
-    if st.button("💾 Save Datumaro-style tracking JSON", key="export_datumaro_tracking_json"):
-        export_root = Path(output_root).expanduser()
-        export_root.mkdir(parents=True, exist_ok=True)
-
-        datumaro_json = tracking_state
-        out_file = export_root / "detections_datumaro_tracking.json"
-        out_file.write_text(json.dumps(datumaro_json, indent=2), encoding="utf-8")
-        st.success(f"✅ Saved Datumaro-style tracking annotations to **{out_file}**")
-
-    st.markdown("---")
+        st.markdown("---")
+    elif not batch_samples_list:
+        st.subheader("📦 Datumaro-style export (with tracking)")
+        st.caption(
+            "Exports batch detections in a Datumaro/CVAT-compatible JSON format that "
+            "includes 3D cuboid tracks (track_id, keyframes, occlusion flags). "
+            "Uses the tracking state built during batch processing on **2_Detection**."
+        )
+        st.info(
+            "No batch results yet. Run batch processing on **2_Detection** "
+            "(with tracking enabled if you need track-based exports)."
+        )
+        st.markdown("---")
 
     # ------------------------------------------------------------------
     # 2) Dataset annotations (CVAT) using LinkedDataHandler

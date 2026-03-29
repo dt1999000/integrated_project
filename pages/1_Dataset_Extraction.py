@@ -29,8 +29,8 @@ from components.core.filter import (
     filter_kitti_images,
     filter_nuscenes_images,
     filter_sim_images,
+    sample_rosbag_frames_every_nth,
 )
-
 
 DEFAULT_FILTER_PARAMS = {
     "blur_gate": 120,
@@ -46,6 +46,34 @@ DEFAULT_FILTER_PARAMS = {
     "enable_contrast": True,
 }
 
+OUTDOOR_SCENE_PRESET = {
+    "motion_thresh": 8,
+    "blur_gate": 140,
+    "hash_thresh": 8,
+    "min_bright": 30,
+    "max_bright": 245,
+    "min_contrast": 0.12,
+    "enable_blur": True,
+    "enable_dedup": True,
+    "enable_motion": True,
+    "enable_brightness": True,
+    "enable_contrast": True,
+}
+
+INDOOR_SCENE_PRESET = {
+    "motion_thresh": 4,
+    "blur_gate": 110,
+    "hash_thresh": 6,
+    "min_bright": 40,
+    "max_bright": 235,
+    "min_contrast": 0.10,
+    "enable_blur": True,
+    "enable_dedup": True,
+    "enable_motion": True,
+    "enable_brightness": True,
+    "enable_contrast": True,
+}
+
 
 def _every_nth_indices(total_count: int, stride: int, start: int = 0) -> np.ndarray:
     """
@@ -57,6 +85,21 @@ def _every_nth_indices(total_count: int, stride: int, start: int = 0) -> np.ndar
         return np.array([], dtype=int)
     start = max(0, min(start, total_count - 1))
     return np.arange(start, total_count, stride, dtype=int)
+
+
+def _sim_rgb_path_for_link(dataset_path: str, subset_name: str, link: Dict) -> Optional[Path]:
+    """Resolve on-disk path for a sim link's RGB sample (same rules as filter_sim_images)."""
+    rgb_sample = link.get("samples", {}).get("rgb", {})
+    if not rgb_sample or "filename" not in rgb_sample:
+        return None
+    filename = rgb_sample["filename"]
+    filename = filename.lstrip("/").lstrip("\\")
+    if len(filename) > 1 and filename[1] == ":":
+        parts = filename.split("\\", 2)
+        filename = parts[2] if len(parts) > 2 else parts[-1]
+    subset_path = Path(dataset_path) / subset_name
+    return subset_path / "samples" / filename
+
 
 def ensure_filter_state(prefix: str) -> None:
     """Ensure st.session_state[f'{prefix}_filter_params'] exists with defaults."""
@@ -170,6 +213,21 @@ def render_filter_controls(prefix: str, title: str, expanded: bool = False) -> D
     return params
 
 
+def render_scene_preset_buttons(prefix: str) -> None:
+    """Quick outdoor/indoor presets for image filter params (shared across dataset types)."""
+    ensure_filter_state(prefix)
+    state_key = f"{prefix}_filter_params"
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("🌳 Outdoor Scenes", key=f"{prefix}_outdoor_preset"):
+            st.session_state[state_key].update(OUTDOOR_SCENE_PRESET)
+            st.rerun()
+    with col_b:
+        if st.button("🏠 Indoor Scenes", key=f"{prefix}_indoor_preset"):
+            st.session_state[state_key].update(INDOOR_SCENE_PRESET)
+            st.rerun()
+
+
 def _resolve_current_calibration(dataset_flag: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[Any]]:
     """
     Resolve calibration for the current session based on a dataset flag.
@@ -220,7 +278,6 @@ def _resolve_current_calibration(dataset_flag: Optional[str]) -> Tuple[Optional[
                 }
 
     return calib, dataset_type, sample_index
-
 
 def main():
     """Main extraction page function"""
@@ -295,6 +352,12 @@ def main():
     # Sample selection based on dataset type
     if dataset_type:
         st.subheader("Sample Selection")
+        _filtered_scope = (dataset_type, str(dataset_path))
+        if st.session_state.get("_filtered_batch_scope") != _filtered_scope:
+            st.session_state.filtered_batch = None
+            st.session_state._filtered_batch_scope = _filtered_scope
+        elif "filtered_batch" not in st.session_state:
+            st.session_state.filtered_batch = None
         
         if dataset_type == "kitti":
             # KITTI: Use numeric indices
@@ -346,67 +409,14 @@ def main():
                                     st.error("❌ Failed to load sample")
 
                         # KITTI: random batch filtering + send to detection
-                        if 'kitti_filter_params' not in st.session_state:
-                            st.session_state.kitti_filter_params = {
-                                'blur_gate': 120,
-                                'hash_thresh': 6,
-                                'motion_thresh': 5,
-                                'min_contrast': 0.10,
-                                'min_bright': 30,
-                                'max_bright': 235,
-                                'enable_blur': True,
-                                'enable_dedup': True,
-                                'enable_motion': False,
-                                'enable_brightness': True,
-                                'enable_contrast': True
-                            }
-                        if 'kitti_filtered_batch' not in st.session_state:
-                            st.session_state.kitti_filtered_batch = None
-
+                        ensure_filter_state("kitti")
                         st.markdown("---")
                         st.subheader("🖼️ Image Filtering (KITTI Dataset)")
                         st.markdown("""
                         Sample a random batch of KITTI images, filter them by quality, and send the filtered batch to the detection page.
                         """)
 
-                        # Quick presets for indoor / outdoor scenes
-                        col_kitti_preset1, col_kitti_preset2 = st.columns(2)
-                        with col_kitti_preset1:
-                            if st.button("🌳 Outdoor Scenes", key="kitti_outdoor_preset"):
-                                st.session_state.kitti_filter_params.update(
-                                    {
-                                        "motion_thresh": 8,
-                                        "blur_gate": 140,
-                                        "hash_thresh": 8,
-                                        "min_bright": 30,
-                                        "max_bright": 245,
-                                        "min_contrast": 0.12,
-                                        "enable_blur": True,
-                                        "enable_dedup": True,
-                                        "enable_motion": True,
-                                        "enable_brightness": True,
-                                        "enable_contrast": True,
-                                    }
-                                )
-                                st.rerun()
-                        with col_kitti_preset2:
-                            if st.button("🏠 Indoor Scenes", key="kitti_indoor_preset"):
-                                st.session_state.kitti_filter_params.update(
-                                    {
-                                        "motion_thresh": 4,
-                                        "blur_gate": 110,
-                                        "hash_thresh": 6,
-                                        "min_bright": 40,
-                                        "max_bright": 235,
-                                        "min_contrast": 0.10,
-                                        "enable_blur": True,
-                                        "enable_dedup": True,
-                                        "enable_motion": True,
-                                        "enable_brightness": True,
-                                        "enable_contrast": True,
-                                    }
-                                )
-                                st.rerun()
+                        render_scene_preset_buttons("kitti")
 
                         # Filter configuration (shared UI)
                         render_filter_controls(prefix="kitti", title="KITTI")
@@ -446,16 +456,16 @@ def main():
                                                 "image_path": str(image_files[int(idx)]),
                                             }
                                         )
-                                st.session_state.kitti_filtered_batch = filtered_batch
+                                st.session_state.filtered_batch = filtered_batch
                             st.success(
-                                f"✅ Selected {len(st.session_state.kitti_filtered_batch)} KITTI frames "
+                                f"✅ Selected {len(st.session_state.filtered_batch)} KITTI frames "
                                 f"using start={start_idx}, step={step}."
                             )
                             st.rerun()
 
                         # Display filtered batch summary and allow sending to detection
-                        if st.session_state.kitti_filtered_batch:
-                            filtered_batch = st.session_state.kitti_filtered_batch
+                        if st.session_state.filtered_batch:
+                            filtered_batch = st.session_state.filtered_batch
                             st.markdown("---")
                             st.subheader("📋 Subsampled Sample Batch (KITTI)")
                             st.info(f"Prepared {len(filtered_batch)} KITTI samples (every n-th frame)")
@@ -521,67 +531,14 @@ def main():
 
             # nuScenes: simple subsampling (every n-th sample) + send to detection
 
-            if 'nuscenes_filter_params' not in st.session_state:
-                st.session_state.nuscenes_filter_params = {
-                    'blur_gate': 120,
-                    'hash_thresh': 6,
-                    'motion_thresh': 5,
-                    'min_contrast': 0.10,
-                    'min_bright': 30,
-                    'max_bright': 235,
-                    'enable_blur': True,
-                    'enable_dedup': True,
-                    'enable_motion': False,
-                    'enable_brightness': True,
-                    'enable_contrast': True
-                }
-            if 'nuscenes_filtered_batch' not in st.session_state:
-                st.session_state.nuscenes_filtered_batch = None
-
+            ensure_filter_state("nuscenes")
             st.markdown("---")
             st.subheader("🖼️ Image Filtering (nuScenes Dataset)")
             st.markdown("""
             Sample a random batch of nuScenes images (CAM_FRONT), filter them by quality, and send the filtered batch to the detection page.
             """)
 
-            # Quick presets for indoor / outdoor scenes
-            col_nusc_preset1, col_nusc_preset2 = st.columns(2)
-            with col_nusc_preset1:
-                if st.button("🌳 Outdoor Scenes", key="nuscenes_outdoor_preset"):
-                    st.session_state.nuscenes_filter_params.update(
-                        {
-                            "motion_thresh": 8,
-                            "blur_gate": 140,
-                            "hash_thresh": 8,
-                            "min_bright": 30,
-                            "max_bright": 245,
-                            "min_contrast": 0.12,
-                            "enable_blur": True,
-                            "enable_dedup": True,
-                            "enable_motion": True,
-                            "enable_brightness": True,
-                            "enable_contrast": True,
-                        }
-                    )
-                    st.rerun()
-            with col_nusc_preset2:
-                if st.button("🏠 Indoor Scenes", key="nuscenes_indoor_preset"):
-                    st.session_state.nuscenes_filter_params.update(
-                        {
-                            "motion_thresh": 4,
-                            "blur_gate": 110,
-                            "hash_thresh": 6,
-                            "min_bright": 40,
-                            "max_bright": 235,
-                            "min_contrast": 0.10,
-                            "enable_blur": True,
-                            "enable_dedup": True,
-                            "enable_motion": True,
-                            "enable_brightness": True,
-                            "enable_contrast": True,
-                        }
-                    )
-                    st.rerun()
+            render_scene_preset_buttons("nuscenes")
 
             # Filter configuration (shared UI)
             render_filter_controls(prefix="nuscenes", title="nuScenes")
@@ -635,15 +592,15 @@ def main():
                                     samples=selected,
                                     filter_params=st.session_state.nuscenes_filter_params
                                 )
-                                st.session_state.nuscenes_filtered_batch = filtered_batch
+                                st.session_state.filtered_batch = filtered_batch
                                 st.success(f"✅ Filtered {len(filtered_batch)} samples from {total_samples} total nuScenes samples")
                                 st.rerun()
                 except Exception as e:
                     st.error(f"Error during nuScenes batch filtering: {str(e)}")
 
             # Display filtered batch summary and allow sending to detection
-            if st.session_state.nuscenes_filtered_batch:
-                filtered_batch = st.session_state.nuscenes_filtered_batch
+            if st.session_state.filtered_batch:
+                filtered_batch = st.session_state.filtered_batch
                 st.markdown("---")
                 st.subheader("📋 Filtered Sample Batch (nuScenes)")
                 st.info(f"Found {len(filtered_batch)} nuScenes samples that passed all filters")
@@ -822,21 +779,7 @@ def main():
                             "lidar_frame": calib.lidar_frame,
                         }
 
-            # Initialize ROS bag filter params (reuse KITTI defaults)
-            if "rosbag_filter_params" not in st.session_state:
-                st.session_state.rosbag_filter_params = {
-                    "blur_gate": 120,
-                    "hash_thresh": 6,
-                    "motion_thresh": 5,
-                    "min_contrast": 0.10,
-                    "min_bright": 30,
-                    "max_bright": 235,
-                    "enable_blur": True,
-                    "enable_dedup": True,
-                    "enable_motion": False,
-                    "enable_brightness": True,
-                    "enable_contrast": True,
-                }
+            ensure_filter_state("rosbag")
             if "rosbag_filtered_frames" not in st.session_state:
                 st.session_state.rosbag_filtered_frames = None
 
@@ -845,6 +788,8 @@ def main():
             st.markdown(
                 "Apply the same quality filters as for KITTI/nuScenes, but directly on the ROS bag frames."
             )
+
+            render_scene_preset_buttons("rosbag")
 
             # Filter configuration (shared UI) plus ROS bag–specific limit
             render_filter_controls(prefix="rosbag", title="ROS bag")
@@ -883,7 +828,7 @@ def main():
                 with st.spinner("Sampling ROS bag frames (every n-th)..."):
                     stride = int(rosbag_stride)
                     max_simple = int(rosbag_simple_max) if rosbag_simple_max > 0 else None
-                    sampled_frames = _sample_rosbag_frames_every_nth(
+                    sampled_frames = sample_rosbag_frames_every_nth(
                         bag_path=bag_path_obj,
                         image_topic=image_topic,
                         stride=stride,
@@ -1071,27 +1016,15 @@ def main():
                     )
                     
                     if selected_subset:
+                        if st.session_state.get("_sim_batch_subset") != selected_subset:
+                            st.session_state.filtered_batch = None
+                            st.session_state._sim_batch_subset = selected_subset
+
                         subset = handler.subsets[selected_subset]
                         links = subset['links']
                         
-                        # Initialize session state for filtered batch
-                        if 'sim_filtered_batch' not in st.session_state:
-                            st.session_state.sim_filtered_batch = None
-                        if 'sim_filter_params' not in st.session_state:
-                            st.session_state.sim_filter_params = {
-                                'blur_gate': 120,
-                                'hash_thresh': 6,
-                                'motion_thresh': 5,
-                                'min_contrast': 0.10,
-                                'min_bright': 30,
-                                'max_bright': 235,
-                                'enable_blur': True,
-                                'enable_dedup': True,
-                                'enable_motion': False,
-                                'enable_brightness': True,
-                                'enable_contrast': True
-                            }
-                        
+                        ensure_filter_state("sim")
+
                         st.markdown("---")
                         st.subheader("🖼️ Image Filtering (Sim Dataset)")
                         st.markdown("""
@@ -1110,72 +1043,46 @@ def main():
                             key=f"sim_stride_every_nth_{selected_subset}",
                         )
                         if st.button(
-                            "📚 Load every n-th sim sample for detection",
-                            key=f"load_every_nth_sim_for_detection_{selected_subset}",
+                            "📚 Prepare every n-th sim batch",
+                            key=f"prepare_every_nth_sim_batch_{selected_subset}",
                         ):
-                            with st.spinner("Preparing every n-th sim sample for detection..."):
+                            with st.spinner("Preparing every n-th sim batch..."):
                                 step = int(sim_stride)
                                 indices_every_nth = _every_nth_indices(len(links), step)
-                                batch_samples = []
+                                subsample_batch: List[Dict] = []
                                 for idx in indices_every_nth:
                                     link = links[int(idx)]
-                                    batch_samples.append(
+                                    image_path = _sim_rgb_path_for_link(dataset_path, selected_subset, link)
+                                    if image_path is None or not image_path.exists():
+                                        continue
+                                    image_bgr = cv2.imread(str(image_path))
+                                    if image_bgr is None:
+                                        continue
+                                    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+                                    subsample_batch.append(
                                         {
-                                            "dataset_type": "sim",
-                                            "dataset_path": dataset_path,
-                                            "sample_index": link["token"],
-                                            "image_path": "",
-                                            # Sim LiDAR path is resolved in the sim dataset loader.
-                                            "point_cloud_path": "",
+                                            "link_token": link["token"],
+                                            "link": link,
+                                            "image": image_rgb,
+                                            "image_path": str(image_path),
+                                            "metrics": {
+                                                "blur": 0.0,
+                                                "contrast": 0.0,
+                                                "brightness": 0.0,
+                                            },
+                                            "subsample_only": True,
                                         }
                                     )
-                                st.session_state.batch_samples = batch_samples
-                                st.session_state.process_all_samples = True
+                                st.session_state.filtered_batch = subsample_batch
+                                st.session_state._sim_batch_is_subsample = True
                                 st.success(
-                                    f"✅ Prepared {len(batch_samples)} sim samples by taking every {step}-th element. "
-                                    "Go to **2_Detection** and click **Process entire batch**."
+                                    f"✅ Prepared {len(subsample_batch)} sim samples by taking every {step}-th link "
+                                    "(no quality filters). Use the batch below to load one sample or the full batch."
                                 )
                                 st.rerun()
 
-                        # Quick presets for indoor / outdoor scenes
-                        col_sim_preset1, col_sim_preset2 = st.columns(2)
-                        with col_sim_preset1:
-                            if st.button("🌳 Outdoor Scenes", key="sim_outdoor_preset"):
-                                st.session_state.sim_filter_params.update(
-                                    {
-                                        "motion_thresh": 8,
-                                        "blur_gate": 140,
-                                        "hash_thresh": 8,
-                                        "min_bright": 30,
-                                        "max_bright": 245,
-                                        "min_contrast": 0.12,
-                                        "enable_blur": True,
-                                        "enable_dedup": True,
-                                        "enable_motion": True,
-                                        "enable_brightness": True,
-                                        "enable_contrast": True,
-                                    }
-                                )
-                                st.rerun()
-                        with col_sim_preset2:
-                            if st.button("🏠 Indoor Scenes", key="sim_indoor_preset"):
-                                st.session_state.sim_filter_params.update(
-                                    {
-                                        "motion_thresh": 4,
-                                        "blur_gate": 110,
-                                        "hash_thresh": 6,
-                                        "min_bright": 40,
-                                        "max_bright": 235,
-                                        "min_contrast": 0.10,
-                                        "enable_blur": True,
-                                        "enable_dedup": True,
-                                        "enable_motion": True,
-                                        "enable_brightness": True,
-                                        "enable_contrast": True,
-                                    }
-                                )
-                                st.rerun()
-                        
+                        render_scene_preset_buttons("sim")
+
                         # Filter configuration (shared UI)
                         render_filter_controls(prefix="sim", title="Sim Dataset", expanded=True)
                         
@@ -1190,39 +1097,41 @@ def main():
                                     dataset_path=dataset_path,
                                     filter_params=st.session_state.sim_filter_params,
                                 )
-                                st.session_state.sim_filtered_batch = filtered_batch
+                                st.session_state.filtered_batch = filtered_batch
+                                st.session_state._sim_batch_is_subsample = False
                                 st.success(f"✅ Filtered {len(filtered_batch)} samples from {len(links)} total links")
                                 st.rerun()
                         
                         # Display filtered batch and allow selection
-                        if st.session_state.sim_filtered_batch is not None:
-                            filtered_batch = st.session_state.sim_filtered_batch
+                        if st.session_state.filtered_batch is not None:
+                            filtered_batch = st.session_state.filtered_batch
                             
                             st.markdown("---")
                             st.subheader("📋 Filtered Sample Batch")
-                            st.info(f"Found {len(filtered_batch)} samples that passed all filters")
+                            batch_is_subsample = st.session_state.get("_sim_batch_is_subsample") is True
+                            if batch_is_subsample:
+                                st.info(
+                                    f"Prepared {len(filtered_batch)} samples (every n-th link, no quality filters)"
+                                )
+                            else:
+                                st.info(f"Found {len(filtered_batch)} samples that passed all filters")
                             
                             if len(filtered_batch) > 0:
-                                # Display batch as grid with thumbnails
-                                st.markdown("**Select a sample from the filtered batch:**")
-                                # Persist selected index so it survives reruns (button click triggers new run)
-                                sim_batch_key = f"sim_selected_idx_{selected_subset}"
-                                if sim_batch_key not in st.session_state:
-                                    st.session_state[sim_batch_key] = None
+                                st.markdown(
+                                    "**Load a sample for detection:** use the button under a thumbnail, "
+                                    "or load the full batch below for **2_Detection → Process entire batch**."
+                                )
 
-                                # Create selection interface
                                 num_cols = 3
                                 cols = st.columns(num_cols)
 
                                 for idx, sample_info in enumerate(filtered_batch):
                                     col_idx = idx % num_cols
                                     with cols[col_idx]:
-                                        # Display thumbnail
                                         image = sample_info['image']
                                         link_token = sample_info['link_token']
                                         metrics = sample_info['metrics']
 
-                                        # Resize for thumbnail
                                         h, w = image.shape[:2]
                                         max_size = 200
                                         if w > max_size or h > max_size:
@@ -1234,47 +1143,37 @@ def main():
 
                                         st.image(thumbnail)
 
-                                        # Display metrics
                                         st.caption(f"**Token:** {link_token[:12]}...")
-                                        st.caption(f"Blur: {metrics.get('blur', 0):.1f}")
-                                        st.caption(f"Contrast: {metrics.get('contrast', 0):.3f}")
-                                        st.caption(f"Brightness: {metrics.get('brightness', 0):.1f}")
+                                        if sample_info.get("subsample_only"):
+                                            st.caption("Quality metrics: not computed (subsample)")
+                                        else:
+                                            st.caption(f"Blur: {metrics.get('blur', 0):.1f}")
+                                            st.caption(f"Contrast: {metrics.get('contrast', 0):.3f}")
+                                            st.caption(f"Brightness: {metrics.get('brightness', 0):.1f}")
 
-                                        # Selection button: persist index in session state
-                                        if st.button(f"Select", key=f"select_sample_{idx}"):
-                                            st.session_state[sim_batch_key] = idx
-                                            st.rerun()
+                                        if st.button(
+                                            "Load for detection",
+                                            key=f"load_sim_sample_{selected_subset}_{idx}",
+                                        ):
+                                            st.session_state.process_all_samples = False
+                                            with st.spinner(f"Loading sample {link_token}..."):
+                                                sample_meta_data, image, point_cloud = load_dataset_sample(
+                                                    dataset_path=dataset_path,
+                                                    sample_index=sample_info['link_token'],
+                                                    dataset_type=dataset_type,
+                                                )
 
-                                selected_sample_idx = st.session_state[sim_batch_key]
-                                if selected_sample_idx is not None and selected_sample_idx >= len(filtered_batch):
-                                    st.session_state[sim_batch_key] = None
-                                    selected_sample_idx = None
+                                                if sample_meta_data and image is not None and point_cloud is not None:
+                                                    st.session_state.sample = {
+                                                        'sample_meta_data': sample_meta_data,
+                                                        'image': image,
+                                                        'point_cloud': point_cloud
+                                                    }
+                                                    st.success(f"✅ Sample {link_token} loaded successfully!")
+                                                    st.rerun()
+                                                else:
+                                                    st.error("❌ Failed to load sample")
 
-                                # Handle selection
-                                if selected_sample_idx is not None:
-                                    if st.button('Load selected sample for detection', key='load_selected_sample_for_detection'):
-                                        st.session_state.process_all_samples = False
-                                        selected_sample = filtered_batch[selected_sample_idx]
-                                        
-                                        # Load the full sample data
-                                        with st.spinner(f"Loading sample {selected_sample['link_token']}..."):
-                                            sample_meta_data, image, point_cloud = load_dataset_sample(
-                                                dataset_path=dataset_path,
-                                                sample_index=selected_sample['link_token'],
-                                                dataset_type=dataset_type
-                                            )
-                                            
-                                            if sample_meta_data and image is not None and point_cloud is not None:
-                                                st.session_state.sample = {
-                                                    'sample_meta_data': sample_meta_data,
-                                                    'image': image,
-                                                    'point_cloud': point_cloud
-                                                }
-                                                st.success(f"✅ Sample {selected_sample['link_token']} loaded successfully!")
-                                                st.rerun()
-                                            else:
-                                                st.error("❌ Failed to load selected sample")
-                                        
                                 # Load entire batch for detection (process all on 2_Detection)
                                 if st.button("📚 Load all filtered samples for detection", key="load_all_sim_for_detection"):
                                     batch_samples = []
@@ -1294,7 +1193,10 @@ def main():
                             else:
                                 st.warning("⚠️ No samples passed the filters. Try adjusting filter settings.")
                         else:
-                            st.info("👆 Click 'Filter Images' to process the dataset and create a filtered batch")
+                            st.info(
+                                "👆 Use **Prepare every n-th sim batch** or **Filter Images** to build a batch, "
+                                "then load one sample or the full batch for detection."
+                            )
                 else:
                     st.warning("No subsets found in dataset")
             except Exception as e:
@@ -1366,62 +1268,6 @@ def main():
                 "Load a sample on this page (KITTI / nuScenes / sim / ROS bag) to populate calibration "
                 "used by the Projection object in **2_Detection**."
             )
-
-
-def _sample_rosbag_frames_every_nth(
-    bag_path: Path,
-    image_topic: str,
-    stride: int,
-    max_frames: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Sample frames from a ROS bag image topic by taking every n-th message.
-
-    This intentionally ignores quality filters and only uses message index.
-    Returns a list of dicts compatible with rosbag_filtered_frames.
-    """
-    from components.dataset_loaders.rosbag_extractor import open_reader
-
-    bag_path = Path(bag_path)
-    frames: List[Dict[str, Any]] = []
-
-    with open_reader(bag_path) as reader:
-        img_conns = [c for c in reader.connections if c.topic == image_topic]
-        if not img_conns:
-            return []
-
-        msg_index = 0
-        accepted_index = 0
-
-        for conn, ts, _raw in reader.messages(connections=img_conns):
-            if msg_index % stride == 0:
-                if max_frames is not None and accepted_index >= max_frames:
-                    break
-                frames.append(
-                    {
-                        "frame_index": accepted_index,
-                        "timestamp_ns": int(ts),
-                        "metrics": {},
-                    }
-                )
-                accepted_index += 1
-            msg_index += 1
-
-    return frames
-
-def _filter_kitti_images(*args, **kwargs):
-    """Backward-compat wrapper (deprecated). Use components.core.filter.filter_kitti_images instead."""
-    return filter_kitti_images(*args, **kwargs)
-
-
-def _filter_nuscenes_images(*args, **kwargs):
-    """Backward-compat wrapper (deprecated). Use components.core.filter.filter_nuscenes_images instead."""
-    return filter_nuscenes_images(*args, **kwargs)
-
-
-def _filter_sim_images(*args, **kwargs):
-    """Backward-compat wrapper (deprecated). Use components.core.filter.filter_sim_images instead."""
-    return filter_sim_images(*args, **kwargs)
 
 
 if __name__ == "__main__":
