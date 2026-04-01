@@ -41,6 +41,7 @@ except ImportError:
 # Global model cache to avoid reloading
 _model_cache = None
 _tokenizer_cache = None
+_loaded_model_name = ""
 
 # Global LLM temperature setting (default: 0.3)
 _llm_temperature = 0.3
@@ -122,7 +123,7 @@ def get_llm_temperature() -> float:
 
 def _get_llm_model():
     """Get or initialize the LLM model (cached)."""
-    global _model_cache, _tokenizer_cache
+    global _model_cache, _tokenizer_cache, _loaded_model_name
     
     if not HF_AVAILABLE:
         return None, None
@@ -140,9 +141,13 @@ def _get_llm_model():
     allow_download = os.getenv("LLM_ALLOW_DOWNLOAD", "0").strip().lower() in {"1", "true", "yes", "on"}
     local_files_only = not allow_download
     
+    model_name = get_current_llm_model_name()
+    if _model_cache is not None and _loaded_model_name != model_name:
+        _model_cache = None
+        _tokenizer_cache = None
+
     if _model_cache is None:
         try:
-            model_name = os.getenv("LLM_MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct").strip()
             print(f"[LLM Service] Loading LLM model: {model_name}...")
             _tokenizer_cache = AutoTokenizer.from_pretrained(model_name, local_files_only=local_files_only)
 
@@ -162,6 +167,7 @@ def _get_llm_model():
             # Set pad token if not present
             if _tokenizer_cache.pad_token is None:
                 _tokenizer_cache.pad_token = _tokenizer_cache.eos_token
+            _loaded_model_name = model_name
             
             print(f"[LLM Service] LLM model loaded successfully")
             print(f"[LLM Service] Model device: {next(_model_cache.parameters()).device}")
@@ -172,6 +178,66 @@ def _get_llm_model():
             return None, None
     
     return _model_cache, _tokenizer_cache
+
+
+def _get_project_root() -> str:
+    """Get project root directory."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def get_llm_models_dir() -> str:
+    """
+    Preferred local LLM model directory.
+    Expected structure: <project_root>/models/llm/<model_dir>/...
+    """
+    return os.path.abspath(os.path.join(_get_project_root(), "models/llm"))
+
+def get_available_llm_models() -> List[str]:
+    """
+    Discover local model directories in ./models/llm.
+
+    Returns absolute directory paths using subfolder presence only.
+    """
+    llm_dir = get_llm_models_dir()
+    if not os.path.isdir(llm_dir):
+        return []
+
+    discovered: List[str] = []
+    for entry in sorted(os.listdir(llm_dir)):
+        entry_path = os.path.join(llm_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        discovered.append(entry_path)
+
+    return discovered
+
+
+def get_current_llm_model_name() -> str:
+    """
+    Resolve current model name/path.
+    Priority:
+      1) First discovered local model subfolder in ./models/llm
+      2) Fallback model id
+    """
+    available_local = get_available_llm_models()
+    if available_local:
+        return available_local[0]
+    #fallback to gpt2 a light weight model
+    return "gpt2"
+
+
+def set_llm_model_name(model_name: str):
+    """Set active LLM model and clear in-memory model cache."""
+    global _model_cache, _tokenizer_cache, _loaded_model_name
+    selected = model_name.strip()
+    if not selected:
+        return
+    if os.getenv("LLM_MODEL_NAME", "").strip() == selected and _loaded_model_name == selected:
+        return
+    os.environ["LLM_MODEL_NAME"] = selected
+    _model_cache = None
+    _tokenizer_cache = None
+    _loaded_model_name = ""
+    print(f"[LLM Service] Selected model: {selected}")
 
 
 def get_default_dimensions(class_name: Optional[str]) -> Tuple[float, float, float]:
@@ -221,10 +287,7 @@ def query_llm_for_dimensions(class_name: str) -> Tuple[float, float, float]:
     
     Uses Hugging Face transformers with a free model to generate a response
     about typical dimensions for the given class name, then parses the output.
-    
-    Note: GPT-2 is not very good at following instructions, so this function
-    should only be used as a last resort when semantic similarity fails.
-    
+
     This function checks the cache first to avoid repeated queries.
     
     Args:

@@ -251,7 +251,6 @@ def _build_tf_adjacency(reader, tf_topics: Iterable[str]) -> Dict[str, Dict[str,
             child = t.child_frame_id or ""
             if not parent or not child:
                 continue
-            print(f'parent={parent}, child={child}')
             T_parent_child = _transform_to_matrix(t.transform)
             # Store transforms so that adj[src][dst] always maps coordinates
             # from src frame to dst frame.
@@ -284,7 +283,6 @@ def _find_transform(
     Returns 4x4 matrix T such that X_target = T @ X_source.
     """
     from collections import deque
-    print(f'source_frame={source_frame}, target_frame={target_frame}')
     if source_frame == target_frame:
         return np.eye(4, dtype=np.float64)
 
@@ -374,19 +372,16 @@ def compute_rosbag_calibration(
                 if header is not None and getattr(header, "frame_id", ""):
                     lidar_frame = header.frame_id
                     break
-    print(f'camera_frame={camera_frame}, lidar_frame={lidar_frame}')
     if camera_frame is None or lidar_frame is None:
         return RosbagCalibration(camera_intrinsic, None, camera_frame, lidar_frame)
 
     # Second pass: TF tree for extrinsics
     with open_reader(bag_path) as reader:
         adj = _build_tf_adjacency(reader, tf_topics)
-    print(f'adj={adj}')
     if not adj:
         return RosbagCalibration(camera_intrinsic, None, camera_frame, lidar_frame)
 
     T_cam_lidar = _find_transform(adj, camera_frame, lidar_frame)
-    print(f'T_cam_lidar={T_cam_lidar}')
     return RosbagCalibration(camera_intrinsic, T_cam_lidar, camera_frame, lidar_frame)
 
 # -----------------------------------------------------------------------------
@@ -516,7 +511,6 @@ def extract_bag_to_folder(
     if not HAS_ROSBAGS:
         raise RuntimeError("rosbags is required. Install with: pip install rosbags")
 
-    print(f'image_topic={image_topic}, pointcloud_topic={pointcloud_topic}')
     bag_path = Path(bag_path)
     out_dir = Path(out_dir)
     out_images = out_dir / "image_2"
@@ -555,17 +549,9 @@ def extract_bag_to_folder(
     accepted_ts_set: Optional[set[int]] = None
     if accepted_timestamps_ns is not None:
         accepted_ts_set = {int(ts) for ts in accepted_timestamps_ns}
-        print(
-            "[rosbag_extractor] accepted_timestamps_ns provided: count=",
-            len(accepted_ts_set),
-        )
         if accepted_ts_set:
             # Show a few sample timestamps for debugging
             sample_ts = list(sorted(accepted_ts_set))[:5]
-            print(
-                "[rosbag_extractor] accepted_timestamps_ns sample=",
-                sample_ts,
-            )
 
     stats = {
         "total_images": 0,
@@ -597,12 +583,6 @@ def extract_bag_to_folder(
             if debug_ts_checks < 5:
                 in_set = (
                     accepted_ts_set is not None and int(ts) in accepted_ts_set
-                )
-                print(
-                    "[rosbag_extractor] image msg ts=",
-                    int(ts),
-                    "in accepted_ts_set=",
-                    in_set,
                 )
                 debug_ts_checks += 1
 

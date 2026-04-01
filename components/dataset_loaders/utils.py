@@ -177,7 +177,7 @@ def _load_kitti_sample(
             'camera_to_lidar_transform': sample_data['camera_to_lidar_transform'],
             'ground_truth_boxes': sample_data.get('ground_truth_boxes', []),
             'sample_index': sample_index,
-            'dataset_type': 'kitti'
+            'dataset_type': 'kitti',
         }
         
         return sample_meta_data, image_rgb, point_cloud
@@ -243,7 +243,7 @@ def _load_nuscenes_sample(
             'camera_to_lidar_transform': sample_data.get('camera_to_lidar_transform'),
             'ground_truth_boxes': sample_data.get('ground_truth_boxes', []),
             'sample_index': sample_token,
-            'dataset_type': 'nuscenes'
+            'dataset_type': 'nuscenes',
         }
         
         return sample_meta_data, image_rgb, point_cloud
@@ -555,4 +555,3 @@ def _load_rosbag_sample(
 
         traceback.print_exc()
         return None, None, None
-

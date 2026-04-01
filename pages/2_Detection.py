@@ -24,8 +24,13 @@ from components.core.sam_integration import (
     get_bbox_from_mask,
     calculate_iou,
 )
-from components.core.pose_estimation import fit_cuboid_to_points
-from components.core.clustering_manager import ClusteringManager, select_best_cluster_points, filter_clusters_by_max_volume
+from components.core.pose_estimation import fit_cuboid_to_points_outdoor, fit_cuboid_to_points_indoor
+from components.core.clustering_manager import (
+    ClusteringManager,
+    select_best_cluster_points,
+    filter_clusters_by_max_volume,
+    scene_is_indoor_from_point_cloud,
+)
 from components.core.tracking import ObjectTracker
 from components.dataset_loaders.utils import load_dataset_sample
 from components.utils.visualization_helper import (
@@ -35,7 +40,14 @@ from components.utils.visualization_helper import (
     generate_distinct_colors,
     overlay_masks_on_image,
 )
-from components.core.llm_service import set_llm_temperature, get_llm_temperature, query_llm_for_dimensions
+from components.core.llm_service import (
+    set_llm_temperature,
+    get_llm_temperature,
+    query_llm_for_dimensions,
+    get_available_llm_models,
+    get_current_llm_model_name,
+    set_llm_model_name,
+)
 from components.core.constants import KITTI_CUBOID_TEMPLATES
 
 # ============================================================================
@@ -106,6 +118,12 @@ def default_detection_params() -> Dict:
             "num_iterations": 1000,
             "filter_forward_only": False,
         },
+        "pipeline_indoor": {
+            "distance_threshold": 0.12,
+            "ransac_n": 3,
+            "num_iterations": 1500,
+            "filter_forward_only": False,
+        },
         "clustering": {
             "dbscan_eps": 0.5,
             "dbscan_min_samples": 5,
@@ -118,6 +136,21 @@ def default_detection_params() -> Dict:
             "step_center_search": 0.2,
             "max_step_center": 10,
             "d_theta": 0.05,
+        },
+        "cuboid_fitting_indoor": {
+            "margin": 0.05,
+            "min_extent": 0.05,
+            "d_theta": 0.05,
+        },
+        "scene_from_pointcloud": {
+            "max_horizontal_span_m": 52.0,
+            "min_points_per_m3": 1.0,
+            "min_points": 400,
+            "max_aabb_volume_m3": 22000.0,
+            "max_vertical_span_m": 14.0,
+            "near_xy_radius_m": 14.0,
+            "min_near_xy_fraction": 0.16,
+            "density_relax_factor": 0.42,
         },
         "bag_freq_hz": 45.0,
         "class_max_speed_mps": {
@@ -163,6 +196,31 @@ def ensure_detection_params(params: Dict) -> None:
                 for sk, sv in default_val.items():
                     if sk not in params[key]:
                         params[key][sk] = _copy_param_value(sv)
+
+
+_SCENE_FROM_POINTCLOUD_KEYS = (
+    "max_horizontal_span_m",
+    "min_points_per_m3",
+    "min_points",
+    "max_aabb_volume_m3",
+    "max_vertical_span_m",
+    "near_xy_radius_m",
+    "min_near_xy_fraction",
+    "density_relax_factor",
+)
+
+
+def _pipeline_scene_is_indoor(params: Dict, point_cloud: np.ndarray) -> bool:
+    """Indoor vs outdoor from LiDAR: AABB, density, ceiling height, near-field fraction."""
+    raw = params.get("scene_from_pointcloud") or {}
+    kw = {k: raw[k] for k in _SCENE_FROM_POINTCLOUD_KEYS if k in raw}
+    return scene_is_indoor_from_point_cloud(point_cloud, **kw)
+
+
+def _ground_removal_kwargs(params: Dict, point_cloud: np.ndarray) -> Dict:
+    if _pipeline_scene_is_indoor(params, point_cloud):
+        return dict(params["pipeline_indoor"])
+    return dict(params["pipeline"])
 
 
 # ============================================================================
@@ -448,12 +506,23 @@ def step_4_clustering(
         dbscan_min_samples: DBSCAN min_samples parameter
         sparse_depth_map: Optional HxW sparse depth map from step 2. When provided,
                           best cluster per mask is selected by highest 2D IoU with the mask.
-    
+
+    Outdoor scans (from point-cloud span + density): clusters larger than LLM/template volume are
+    filtered. Indoor scans skip that filter.
+
     Returns:
         Dict with 'mask_cluster_labels', 'clustering_results', 'best_cluster_points'
     """
     start_time = time.time()
-    
+
+    raw_pc = st.session_state.sample.get("point_cloud")
+    if raw_pc is not None and len(raw_pc) > 0:
+        filter_by_template_volume = not _pipeline_scene_is_indoor(
+            st.session_state.params, raw_pc
+        )
+    else:
+        filter_by_template_volume = True
+
     # Get per-class dimensions estimated via LLM or templates (stored in session_state)
     dimensions_by_class = st.session_state.params.get('dimensions_by_class', {})
 
@@ -511,15 +580,18 @@ def step_4_clustering(
             eps=dbscan_eps, min_samples=dbscan_min_samples
         )
 
-        # Remove clusters that are significantly larger than expected dimensions
-        keep_mask = filter_clusters_by_max_volume(
-            points=mask_points,
-            labels=cluster_labels,
-            template_volume=reference_volume,
-            volume_factor=volume_factor,
-        )
-        mask_points_filtered = mask_points[keep_mask]
-        cluster_labels = cluster_labels[keep_mask]
+        if filter_by_template_volume:
+            keep_mask = filter_clusters_by_max_volume(
+                points=mask_points,
+                labels=cluster_labels,
+                template_volume=reference_volume,
+                volume_factor=volume_factor,
+            )
+            mask_points_filtered = mask_points[keep_mask]
+            cluster_labels = cluster_labels[keep_mask]
+        else:
+            mask_points_filtered = mask_points
+            cluster_labels = cluster_labels.copy()
 
         filtered_mask_points_dict[mask_idx] = mask_points_filtered
 
@@ -607,7 +679,14 @@ def step_5_detection_pose_estimation(
         detected_class_names = step_3_result.get('class_names', [])
     
     detected_cuboids = []
-    
+    _pc = st.session_state.sample.get("point_cloud")
+    indoor_scene = (
+        _pipeline_scene_is_indoor(st.session_state.params, _pc)
+        if _pc is not None and len(_pc) > 0
+        else False
+    )
+    indoor_params = st.session_state.params.get("cuboid_fitting_indoor", {})
+
     # Fit cuboid to each mask's best cluster
     for mask_idx, cluster_points in best_cluster_points.items():
         if len(cluster_points) < 5:
@@ -635,23 +714,26 @@ def step_5_detection_pose_estimation(
                         best_category = gt_box.get('category', 'Unknown')
                 category = best_category
         
-        # Get dimensions for this category from session_state (pre-computed when class names change)
-        dimensions_by_class = st.session_state.params.get('dimensions_by_class', {})
-        dimensions = dimensions_by_class.get(category)
-        if dimensions is None:
-            t = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
-            dimensions = (float(t['length']), float(t['width']), float(t['height']))
-        
-        # Get cuboid fitting parameters
-        score_weights = (
-            cuboid_params['w_distance'],
-            cuboid_params['w_geometric'],
-            cuboid_params['w_outlier']
-        )
-        
-        # Fit cuboid
-        try:
-            fit_result = fit_cuboid_to_points(
+        if indoor_scene:
+            d_theta_in = float(indoor_params.get("d_theta", cuboid_params["d_theta"]))
+            fit_result = fit_cuboid_to_points_indoor(
+                points=cluster_points,
+                d_theta=d_theta_in,
+                margin=float(indoor_params.get("margin", 0.05)),
+                min_extent=float(indoor_params.get("min_extent", 0.05)),
+            )
+        else:
+            dimensions_by_class = st.session_state.params.get('dimensions_by_class', {})
+            dimensions = dimensions_by_class.get(category)
+            if dimensions is None:
+                t = KITTI_CUBOID_TEMPLATES.get(category, KITTI_CUBOID_TEMPLATES['Unknown'])
+                dimensions = (float(t['length']), float(t['width']), float(t['height']))
+            score_weights = (
+                cuboid_params['w_distance'],
+                cuboid_params['w_geometric'],
+                cuboid_params['w_outlier']
+            )
+            fit_result = fit_cuboid_to_points_outdoor(
                 points=cluster_points,
                 dimensions=dimensions,
                 step_center_search=cuboid_params['step_center_search'],
@@ -661,75 +743,69 @@ def step_5_detection_pose_estimation(
                 score_weights=score_weights,
                 ground_z=ground_z
             )
-            
-            # Convert fit_result to cuboid format
-            center = fit_result['center']
-            yaw = fit_result['yaw']
-            length = fit_result['length']
-            width = fit_result['width']
-            height = fit_result['height']
-            
-            # Create cuboid corners
-            l_half = length / 2.0
-            w_half = width / 2.0
-            h_half = height / 2.0
-            
-            corners_local = np.array([
-                [-l_half, -w_half, -h_half],
-                [ l_half, -w_half, -h_half],
-                [ l_half,  w_half, -h_half],
-                [-l_half,  w_half, -h_half],
-                [-l_half, -w_half,  h_half],
-                [ l_half, -w_half,  h_half],
-                [ l_half,  w_half,  h_half],
-                [-l_half,  w_half,  h_half],
-            ])
-            
-            # Adjust z to use ground_z
-            base_z = ground_z if ground_z is not None else np.min(cluster_points[:, 2])
-            corners_local[:, 2] += (base_z + h_half) - center[2]
-            
-            # Rotation matrix around Z-axis
-            cos_yaw = np.cos(yaw)
-            sin_yaw = np.sin(yaw)
-            R_z = np.array([
-                [cos_yaw, -sin_yaw, 0],
-                [sin_yaw,  cos_yaw, 0],
-                [0,        0,       1]
-            ])
-            
-            # Rotate and translate
+
+        center = fit_result['center']
+        yaw = fit_result['yaw']
+        length = fit_result['length']
+        width = fit_result['width']
+        height = fit_result['height']
+
+        l_half = length / 2.0
+        w_half = width / 2.0
+        h_half = height / 2.0
+
+        corners_local = np.array([
+            [-l_half, -w_half, -h_half],
+            [ l_half, -w_half, -h_half],
+            [ l_half,  w_half, -h_half],
+            [-l_half,  w_half, -h_half],
+            [-l_half, -w_half,  h_half],
+            [ l_half, -w_half,  h_half],
+            [ l_half,  w_half,  h_half],
+            [-l_half,  w_half,  h_half],
+        ])
+
+        cos_yaw = np.cos(yaw)
+        sin_yaw = np.sin(yaw)
+        R_z = np.array([
+            [cos_yaw, -sin_yaw, 0],
+            [sin_yaw,  cos_yaw, 0],
+            [0,        0,       1]
+        ])
+
+        if indoor_scene:
             corners_rotated = (R_z @ corners_local.T).T
             corners = corners_rotated + center
-            
-            cuboid = {
-                'center': center,
-                'yaw': yaw,
-                'length': length,
-                'width': width,
-                'height': height,
-                'category': category,
-                'corners': corners,
-                'min_x': float(np.min(corners[:, 0])),
-                'max_x': float(np.max(corners[:, 0])),
-                'min_y': float(np.min(corners[:, 1])),
-                'max_y': float(np.max(corners[:, 1])),
-                'min_z': float(np.min(corners[:, 2])),
-                'max_z': float(np.max(corners[:, 2])),
-                'format': 'kitti',
-                'method': fit_result.get('method', 'cuboid_fit'),
-                'score': fit_result.get('score', float('inf')),
-                'source_bbox_idx': None,  # Not using ground truth matching anymore
-                'mask_idx': mask_idx,
-                'n_points': len(cluster_points),
-            }
-            
-            detected_cuboids.append(cuboid)
-            
-        except Exception as e:
-            print(f"Error fitting cuboid for mask {mask_idx}: {str(e)}")
-            continue
-    
+        else:
+            base_z = ground_z if ground_z is not None else float(np.min(cluster_points[:, 2]))
+            corners_local[:, 2] += (base_z + h_half) - center[2]
+            corners_rotated = (R_z @ corners_local.T).T
+            corners = corners_rotated + center
+
+        cuboid = {
+            'center': center,
+            'yaw': yaw,
+            'length': length,
+            'width': width,
+            'height': height,
+            'category': category,
+            'corners': corners,
+            'min_x': float(np.min(corners[:, 0])),
+            'max_x': float(np.max(corners[:, 0])),
+            'min_y': float(np.min(corners[:, 1])),
+            'max_y': float(np.max(corners[:, 1])),
+            'min_z': float(np.min(corners[:, 2])),
+            'max_z': float(np.max(corners[:, 2])),
+            'format': 'kitti',
+            'method': fit_result.get('method', 'cuboid_fit'),
+            'score': fit_result.get('score', float('inf')),
+            'source_bbox_idx': None,
+            'mask_idx': mask_idx,
+            'n_points': len(cluster_points),
+        }
+
+        detected_cuboids.append(cuboid)
+
     elapsed_time = time.time() - start_time
     
     return {
@@ -754,12 +830,14 @@ def run_full_pipeline(params: Dict) -> Dict:
         Dict with results from all steps
     """
     results = {}
-    
+    raw_pc = st.session_state.sample["point_cloud"]
+    ground_kw = _ground_removal_kwargs(params, raw_pc)
+
     # Step 1: Ground plane removal
     if 'step_1' not in results or not results['step_1'].get('completed', False):
         step_1_result = step_1_ground_plane_removal(
             point_cloud=st.session_state.sample['point_cloud'],
-            **params['pipeline']
+            **ground_kw
         )
         results['step_1'] = {'completed': True, 'result': step_1_result}
         st.session_state.pipeline_state['step_1'] = results['step_1']
@@ -1039,33 +1117,120 @@ def main():
 
     st.session_state["save_processed_samples"] = st.sidebar.checkbox(
         "Save processed sample to disk",
-        value=st.session_state.get("save_processed_samples", True),
+        value=st.session_state.get("save_processed_samples", False),
     )
     
-    with st.sidebar.expander("Ground Plane Removal", expanded=False):
+    with st.sidebar.expander("Ground Plane Removal (outdoor)", expanded=False):
         st.session_state.params['pipeline']['distance_threshold'] = st.slider(
-            "Distance Threshold", 0.1, 1.0, 0.3, 0.01
+            "Distance Threshold", 0.1, 1.0, 0.3, 0.01, key="pipe_out_dt"
         )
         st.session_state.params['pipeline']['ransac_n'] = st.slider(
-            "RANSAC N", 3, 10, 3, 1
+            "RANSAC N", 3, 10, 3, 1, key="pipe_out_rn"
         )
         st.session_state.params['pipeline']['num_iterations'] = st.slider(
-            "Iterations", 100, 1000, 1000, 100
+            "Iterations", 100, 2000, 1000, 100, key="pipe_out_ni"
         )
         st.session_state.params['pipeline']['filter_forward_only'] = st.checkbox(
-            "Forward-Facing Only", False
+            "Forward-Facing Only", False, key="pipe_out_ff"
+        )
+
+    with st.sidebar.expander("Ground Plane Removal (indoor)", expanded=False):
+        st.session_state.params['pipeline_indoor']['distance_threshold'] = st.slider(
+            "Distance Threshold", 0.05, 0.5, 0.12, 0.01, key="pipe_in_dt"
+        )
+        st.session_state.params['pipeline_indoor']['ransac_n'] = st.slider(
+            "RANSAC N", 3, 10, 3, 1, key="pipe_in_rn"
+        )
+        st.session_state.params['pipeline_indoor']['num_iterations'] = st.slider(
+            "Iterations", 100, 3000, 1500, 100, key="pipe_in_ni"
+        )
+        st.session_state.params['pipeline_indoor']['filter_forward_only'] = st.checkbox(
+            "Forward-Facing Only", False, key="pipe_in_ff"
+        )
+
+    with st.sidebar.expander("Scene from LiDAR (indoor vs outdoor)", expanded=False):
+        st.caption(
+            "Outdoor: huge AABB volume or wide horizontal span. Indoor: strong N/V density, "
+            "or low ceiling with relaxed density, or many points within near_xy_radius (walls/room)."
+        )
+        _s = st.session_state.params["scene_from_pointcloud"]
+        _s["max_aabb_volume_m3"] = st.slider(
+            "Max AABB volume (m³); above → outdoor",
+            1000.0,
+            80000.0,
+            float(_s.get("max_aabb_volume_m3", 22000.0)),
+            500.0,
+            key="sc_pc_vol",
+        )
+        _s["max_horizontal_span_m"] = st.slider(
+            "Max horizontal span (m) for indoor",
+            10.0,
+            120.0,
+            float(_s.get("max_horizontal_span_m", 52.0)),
+            1.0,
+            key="sc_pc_span",
+        )
+        _s["min_points_per_m3"] = st.slider(
+            "Min points / m³ (primary indoor rule)",
+            0.2,
+            30.0,
+            float(_s.get("min_points_per_m3", 1.0)),
+            0.1,
+            key="sc_pc_den",
+        )
+        _s["min_points"] = int(
+            st.number_input(
+                "Min points to classify",
+                min_value=100,
+                max_value=50000,
+                value=int(_s.get("min_points", 400)),
+                step=50,
+                key="sc_pc_min",
+            )
+        )
+        _s["max_vertical_span_m"] = st.slider(
+            "Max Δz (m) for low-ceiling indoor path",
+            4.0,
+            30.0,
+            float(_s.get("max_vertical_span_m", 14.0)),
+            0.5,
+            key="sc_pc_dz",
+        )
+        _s["density_relax_factor"] = st.slider(
+            "Density relax (× min pts/m³) for low-ceiling path",
+            0.15,
+            0.95,
+            float(_s.get("density_relax_factor", 0.42)),
+            0.01,
+            key="sc_pc_relax",
+        )
+        _s["near_xy_radius_m"] = st.slider(
+            "Near-field xy radius (m)",
+            4.0,
+            40.0,
+            float(_s.get("near_xy_radius_m", 14.0)),
+            0.5,
+            key="sc_pc_near_r",
+        )
+        _s["min_near_xy_fraction"] = st.slider(
+            "Min fraction of points inside near cylinder",
+            0.05,
+            0.55,
+            float(_s.get("min_near_xy_fraction", 0.16)),
+            0.01,
+            key="sc_pc_near_f",
         )
     
     with st.sidebar.expander("Clustering (Step 4)", expanded=False):
         st.session_state.params['clustering']['dbscan_eps'] = st.slider(
-            "DBSCAN Eps", 0.1, 2.0, 0.5, 0.1
+            "DBSCAN Eps", 0.1, 2.0, 0.1, 0.1
         )
         st.session_state.params['clustering']['dbscan_min_samples'] = st.slider(
             "Min Samples", 3, 20, 5, 1
         )
         st.session_state.params['clustering']['volume_factor'] = st.slider(
             "Max Cluster Volume Factor",
-            0.5, 5.0, 1.5, 0.1,
+            0.5, 5.0, 1.1, 0.1,
             help="Multiplier on the template volume used to discard clusters that are too large."
         )
     
@@ -1087,6 +1252,17 @@ def main():
         )
         st.session_state.params['cuboid_fitting']['d_theta'] = st.slider(
             "Yaw Search Step", 0.01, 0.2, 0.05, 0.01
+        )
+
+    with st.sidebar.expander("Indoor cuboid (Step 5)", expanded=False):
+        st.session_state.params['cuboid_fitting_indoor']['margin'] = st.slider(
+            "Padding (m)", 0.01, 0.3, 0.05, 0.01, key="cub_in_margin"
+        )
+        st.session_state.params['cuboid_fitting_indoor']['min_extent'] = st.slider(
+            "Min L/W/H (m)", 0.02, 0.3, 0.05, 0.01, key="cub_in_minex"
+        )
+        st.session_state.params['cuboid_fitting_indoor']['d_theta'] = st.slider(
+            "Yaw step (rad)", 0.02, 0.2, 0.05, 0.01, key="cub_in_dth"
         )
     
     st.sidebar.markdown("### SAM Model")
@@ -1137,6 +1313,38 @@ def main():
         
         # Update LLM service temperature
         set_llm_temperature(st.session_state.llm_temperature)
+
+        # Local/remote model selection
+        available_llm_models = get_available_llm_models()
+        current_llm_model = get_current_llm_model_name()
+        llm_model_options = available_llm_models.copy()
+        if current_llm_model not in llm_model_options:
+            llm_model_options.insert(0, current_llm_model)
+
+        llm_model_labels = {}
+        for m in llm_model_options:
+            if os.path.isabs(m):
+                llm_model_labels[m] = f"{os.path.basename(m)} (local)"
+            else:
+                llm_model_labels[m] = m
+
+        llm_model_index = 0
+        if current_llm_model in llm_model_options:
+            llm_model_index = llm_model_options.index(current_llm_model)
+
+        selected_llm_model = st.selectbox(
+            "LLM Model",
+            options=llm_model_options,
+            index=llm_model_index,
+            format_func=lambda m: llm_model_labels.get(m, m),
+            help="Pick a stronger instruction model from ./llm for better dimension estimates."
+        )
+        set_llm_model_name(selected_llm_model)
+
+        if available_llm_models:
+            st.caption(f"Discovered {len(available_llm_models)} local model(s) in ./llm")
+        else:
+            st.caption("No local models found in ./llm; using LLM_MODEL_NAME or default model id.")
 
         # Toggle for enabling LLM model queries (may download a model on first use)
         if "llm_enable_model_query" not in st.session_state:
@@ -1526,6 +1734,12 @@ def main():
     st.sidebar.markdown("### 📊 Sample Info")
     st.sidebar.info(f"Dataset: {sample_meta_data.get('dataset_type', 'unknown').upper()}")
     st.sidebar.info(f"Sample: {sample_meta_data.get('sample_index', 'N/A')}")
+    _lbl = (
+        "indoor (LiDAR span + density)"
+        if _pipeline_scene_is_indoor(st.session_state.params, point_cloud)
+        else "outdoor (LiDAR span + density)"
+    )
+    st.sidebar.info(f"Scene: {_lbl}")
     st.sidebar.info(f"Image: {image.shape}")
     st.sidebar.info(f"Point Cloud: {len(point_cloud):,} points")
     
@@ -1550,7 +1764,7 @@ def main():
                     try:
                         result = step_1_ground_plane_removal(
                             point_cloud=point_cloud,
-                            **st.session_state.params['pipeline']
+                            **_ground_removal_kwargs(st.session_state.params, point_cloud)
                         )
                         st.session_state.pipeline_state['step_1'] = {
                             'completed': True,
@@ -2088,7 +2302,13 @@ def main():
         with col1:
             status_icon = "✅" if step_5_state['completed'] else "⏸️"
             st.markdown(f"### {status_icon} Step 5: Detection & Pose Estimation")
-            st.caption("Fit cuboids to best cluster points using scoring-based method")
+            _cap = (
+                "Indoor: deformable minimum-volume cuboid per cluster. "
+                "Outdoor: fixed LLM/template dimensions + BEV scoring fit."
+                if _pipeline_scene_is_indoor(st.session_state.params, point_cloud)
+                else "Outdoor: fit fixed-size cuboids (LLM/template dims) with BEV scoring."
+            )
+            st.caption(_cap)
             if not step_4_completed:
                 st.warning("⚠️ Requires Step 4")
         

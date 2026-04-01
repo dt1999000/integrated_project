@@ -358,16 +358,18 @@ def cuboid_from_pose(pose_result: Dict,
     }
 
 
-def fit_cuboid_to_points(points: np.ndarray,
-                         dimensions: Tuple[float, float, float],
-                         step_center_search: float,
-                         max_step_center: int = 10,
-                         d_theta: float = 0.05,
-                         normals: Optional[np.ndarray] = None,
-                         score_weights: Tuple[float, float, float] = (1.0, 0.5, 2.0),
-                         ground_z: Optional[float] = None) -> Dict:
+def fit_cuboid_to_points_outdoor(points: np.ndarray,
+                                 dimensions: Tuple[float, float, float],
+                                 step_center_search: float,
+                                 max_step_center: int = 10,
+                                 d_theta: float = 0.05,
+                                 normals: Optional[np.ndarray] = None,
+                                 score_weights: Tuple[float, float, float] = (1.0, 0.5, 2.0),
+                                 ground_z: Optional[float] = None) -> Dict:
     """
-    Cuboid fitting using center line-search and yaw search.
+    Outdoor / automotive-style cuboid fitting with fixed template dimensions (e.g. from LLM).
+
+    Uses center line-search and yaw search over known length, width, height.
 
     Search is performed along a ray starting at the mean point and going in the
     direction of the mean (towards / away from the origin), and over yaw
@@ -596,6 +598,91 @@ def fit_cuboid_to_points(points: np.ndarray,
         'width': width,
         'height': height,
         'score': best_score,
-        'method': 'cuboid_fit',
+        'method': 'cuboid_fit_outdoor',
     }
+
+
+def fit_cuboid_to_points_indoor(
+    points: np.ndarray,
+    d_theta: float = 0.05,
+    margin: float = 0.05,
+    min_extent: float = 0.05,
+) -> Dict:
+    """
+    Indoor-oriented cuboid: deformable axis-aligned box in yaw, minimizing volume so that
+    (with margin) all cluster points lie inside — equivalent to maximizing point density N/V.
+
+    For each yaw, points are expressed in a horizontal frame (length along u(yaw), width along v).
+    Extents are the minimal L, W, H containing the projected coordinates plus margin.
+
+    Args:
+        points: (N, 3) LiDAR points for one cluster.
+        d_theta: Yaw sampling step (radians), 0..pi (rectangle symmetry).
+        margin: Extra half-padding (meters) on each axis in the local frame.
+        min_extent: Minimum L, W, H (meters) to avoid degenerate boxes.
+
+    Returns:
+        Same keys as outdoor fit: center, yaw, length, width, height, score (volume), method.
+    """
+    if points.size == 0:
+        raise ValueError("Cannot fit cuboid to empty point cloud")
+
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Expected points shape (N, 3), got {points.shape}")
+
+    margin = float(margin)
+    min_extent = float(min_extent)
+    d_theta = float(d_theta)
+
+    mu = np.mean(points, axis=0)
+    rel = points - mu[None, :]
+
+    best_volume = float("inf")
+    best_yaw = 0.0
+    best_center = mu.copy()
+    best_l = best_w = best_h = min_extent
+
+    thetas = np.arange(0.0, np.pi, d_theta, dtype=float)
+    if thetas.size == 0:
+        thetas = np.array([0.0], dtype=float)
+
+    for yaw in thetas:
+        cos_y = float(np.cos(yaw))
+        sin_y = float(np.sin(yaw))
+        u = np.array([cos_y, sin_y, 0.0], dtype=float)
+        v = np.array([-sin_y, cos_y, 0.0], dtype=float)
+        w_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+        qx = rel @ u
+        qy = rel @ v
+        qz = rel @ w_axis
+        xmin, xmax = float(np.min(qx)), float(np.max(qx))
+        ymin, ymax = float(np.min(qy)), float(np.max(qy))
+        zmin, zmax = float(np.min(qz)), float(np.max(qz))
+        length = max(min_extent, xmax - xmin + 2.0 * margin)
+        width = max(min_extent, ymax - ymin + 2.0 * margin)
+        height = max(min_extent, zmax - zmin + 2.0 * margin)
+        cx = 0.5 * (xmin + xmax)
+        cy = 0.5 * (ymin + ymax)
+        cz = 0.5 * (zmin + zmax)
+        c_world = mu + u * cx + v * cy + w_axis * cz
+        volume = length * width * height
+        if volume < best_volume:
+            best_volume = volume
+            best_yaw = float(yaw)
+            best_center = c_world
+            best_l, best_w, best_h = length, width, height
+
+    return {
+        "center": best_center,
+        "yaw": best_yaw,
+        "length": float(best_l),
+        "width": float(best_w),
+        "height": float(best_h),
+        "score": float(best_volume),
+        "method": "cuboid_fit_indoor_mvo",
+    }
+
+
+# Backward-compatible name: outdoor / fixed-dimension pipeline.
+fit_cuboid_to_points = fit_cuboid_to_points_outdoor
 

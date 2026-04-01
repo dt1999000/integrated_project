@@ -124,11 +124,7 @@ class TrackedObject:
     last_center_3d: np.ndarray
     velocity_3d: np.ndarray
     prev_velocity_3d: np.ndarray
-    # Last known segmentation mask in image space (H, W) binary.
-    last_mask: Optional[np.ndarray] = None
     velocity_history: List[np.ndarray] = field(default_factory=list)
-    # Per-frame 2D bbox history: frame_index -> (x1, y1, x2, y2)
-    bbox_history: Dict[int, Tuple[int, int, int, int]] = field(default_factory=dict)
     occluded_history: List[bool] = field(default_factory=list)
     detections: List[Dict[str, Any]] = field(default_factory=list)
     kf_state: Optional[np.ndarray] = None
@@ -209,6 +205,10 @@ class ObjectTracker:
         # frame_index -> per-scene tracking snapshot. This is the canonical 2D
         # export source so scene-wise "appears + bbox" is explicit.
         self._frame_tracking_2d: Dict[int, Dict[str, Any]] = {}
+        # Patches/features from the previous frame, keyed by track_id.
+        # Used to match detections in the current frame against previously
+        # visible objects and to end tracks when objects disappear.
+        self._prev_patches: Dict[int, Dict[str, Any]] = {}
         self._kf_H = np.array(
             [[1, 0, 0, 0], [0, 1, 0, 0]],
             dtype=np.float32,
@@ -310,7 +310,6 @@ class ObjectTracker:
                     "confidence": conf,
                 }
             )
-            #print(f'entries: {entries}')
         return entries
 
     def _kf_init(self, center: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -386,8 +385,7 @@ class ObjectTracker:
             used_d.add(c)
         return matches, set(range(len(tracks))) - used_t, set(range(len(detections))) - used_d
 
-    def _create_track_from_detection(self, det: Dict[str, Any], frame_index: int, masks: List[np.ndarray]) -> int:
-        x1, y1, x2, y2 = det["bbox"]
+    def _create_track_from_detection(self, det: Dict[str, Any], frame_index: int) -> int:
         track_id = self._next_track_id
         self._next_track_id += 1
         vel0 = np.zeros(3, dtype=np.float32)
@@ -401,8 +399,6 @@ class ObjectTracker:
             last_center_3d=np.asarray([np.nan, np.nan, np.nan], dtype=np.float32),
             velocity_3d=vel0,
             prev_velocity_3d=vel0.copy(),
-            bbox_history={frame_index: (x1, y1, x2, y2)},
-            last_mask=(masks[int(det["mask_idx"])] > 0).astype(np.uint8).copy(),
             kf_state=x,
             kf_cov=P,
             confidence=float(det["confidence"]),
@@ -410,11 +406,16 @@ class ObjectTracker:
         self._tracks.append(new_tr)
         return track_id
 
-    def _write_scene_snapshot(self, frame_index: int, meta: Dict[str, Any]) -> None:
+    def _write_scene_snapshot(
+        self,
+        frame_index: int,
+        meta: Dict[str, Any],
+        frame_bboxes: Dict[int, Tuple[int, int, int, int]],
+    ) -> None:
         sample_index = meta.get("sample_index", frame_index)
         scene_objects: List[Dict[str, Any]] = []
         for tr in self._tracks:
-            bbox = tr.bbox_history.get(frame_index)
+            bbox = frame_bboxes.get(tr.track_id)
             scene_objects.append(
                 {
                     "track_id": tr.track_id,
@@ -429,6 +430,22 @@ class ObjectTracker:
             "objects": scene_objects,
         }
 
+    def _update_prev_patches(
+        self,
+        detections: List[Dict[str, Any]],
+        mask_to_track: Dict[int, int],
+    ) -> None:
+        """Replace _prev_patches with features from the current frame's matched/new tracks."""
+        self._prev_patches = {}
+        for det in detections:
+            track_id = mask_to_track.get(int(det["mask_idx"]))
+            if track_id is None:
+                continue
+            self._prev_patches[track_id] = {
+                "feature": det["feature"],
+                "bbox": det["bbox"],
+                "label": det["label"],
+            }
 
     def track_on_image(
         self,
@@ -440,6 +457,10 @@ class ObjectTracker:
     ) -> Dict[int, int]:
         """
         Track objects on image/masks only and return mask_idx -> track_id.
+
+        Matches current detections against patches stored from the previous
+        frame.  Unmatched previous tracks are ended; unmatched detections
+        create new tracks.
         """
         print(
             f"[tracking] track_on_image frame_index={frame_index}, "
@@ -455,157 +476,92 @@ class ObjectTracker:
             }
             self._frames[frame_index] = frame_entry
 
-        # Build per-mask appearance features and 2D centers.
-        mask_bboxes: List[Optional[Tuple[int, int, int, int]]] = []
-        mask_centers: List[Tuple[float, float]] = []
-        for mask in masks:
-            bbox = _clamped_bbox_from_mask(mask, image.shape)
-            mask_bboxes.append(bbox)
-            if bbox is None:
-                mask_centers.append((-1.0, -1.0))
-                continue
-            x1, y1, x2, y2 = bbox
-            cx = 0.5 * (x1 + x2)
-            cy = 0.5 * (y1 + y2)
-            mask_centers.append((cx, cy))
-
-        # Build similarity candidates (sim, track_index, mask_index, feature).
-        candidates: List[Tuple[float, int, int, np.ndarray]] = []
-        for t_idx, tr in enumerate(self._tracks):
-            prev_bbox = tr.bbox_history.get(tr.last_frame)
-            if prev_bbox is None:
-                continue
-            plx1, ply1, plx2, ply2 = prev_bbox
-            ref_w = max(1, int(plx2 - plx1))
-            ref_h = max(1, int(ply2 - ply1))
-            for m_idx, _ in enumerate(masks):
-                curr_bbox = mask_bboxes[m_idx]
-                if curr_bbox is None:
-                    continue
-                if m_idx < len(class_names) and tr.label != class_names[m_idx]:
-                    continue
-                lcx = 0.5 * (plx1 + plx2)
-                lcy = 0.5 * (ply1 + ply2)
-                cx, cy = mask_centers[m_idx]
-                dx = cx - lcx
-                dy = cy - lcy
-                dist = (dx * dx + dy * dy) ** 0.5
-                if dist > self.max_center_distance:
-                    continue
-                patch = self._masked_patch_for_feature(
-                    image=image,
-                    mask=masks[m_idx],
-                    bbox=curr_bbox,
-                    reference_size=(ref_w, ref_h),
-                )
-                if patch is None:
-                    continue
-                feat = _compute_patch_feature(patch)
-                sim = _similarity(tr.feature, feat)
-                if sim <= 0.0:
-                    continue
-                candidates.append((sim, t_idx, m_idx, feat))
-
-        candidates.sort(key=lambda t: t[0], reverse=True)
-        assigned_tracks: Set[int] = set()
-        assigned_masks: Set[int] = set()
-        mask_to_track: Dict[int, int] = {}
-
-        for sim, t_idx, m_idx, feat in candidates:
-            if sim < self.similarity_threshold:
-                break
-            if t_idx in assigned_tracks or m_idx in assigned_masks:
-                continue
-            tr = self._tracks[t_idx]
-            bbox = mask_bboxes[m_idx]
-            if bbox is None:
-                continue
-            x1, y1, x2, y2 = bbox
-            tr.feature = feat
-            tr.last_frame = frame_index
-            tr.bbox_history[frame_index] = (x1, y1, x2, y2)
-            tr.last_mask = (masks[m_idx] > 0).astype(np.uint8).copy()
-            assigned_tracks.add(t_idx)
-            assigned_masks.add(m_idx)
-            mask_to_track[m_idx] = tr.track_id
-
-        # Assign remaining masks either to an existing unassigned track (when
-        # similarity is high) or create a new track.
-        assigned_track_ids: Set[int] = {self._tracks[t_idx].track_id for t_idx in assigned_tracks}
+        detections: List[Dict[str, Any]] = []
         for m_idx, mask in enumerate(masks):
-            if m_idx in assigned_masks:
-                continue
-            bbox = mask_bboxes[m_idx]
+            bbox = _clamped_bbox_from_mask(mask, image.shape)
             if bbox is None:
                 continue
-            x1, y1, x2, y2 = bbox
             patch = self._masked_patch_for_feature(
-                image=image,
-                mask=mask,
-                bbox=bbox,
-                reference_size=None,
+                image=image, mask=mask, bbox=bbox, reference_size=None,
             )
             if patch is None:
                 continue
             feat = _compute_patch_feature(patch)
-            best_sim = 0.0
-            best_tr: Optional[TrackedObject] = None
-            for tr in self._tracks:
-                if m_idx < len(class_names) and tr.label != class_names[m_idx]:
+            x1, y1, x2, y2 = bbox
+            label = class_names[m_idx] if m_idx < len(class_names) else "Unknown"
+            detections.append({
+                "mask_idx": m_idx,
+                "bbox": bbox,
+                "feature": feat,
+                "label": label,
+                "center": np.asarray([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32),
+            })
+
+        track_by_id: Dict[int, TrackedObject] = {tr.track_id: tr for tr in self._tracks}
+        prev_track_ids = list(self._prev_patches.keys())
+
+        candidates: List[Tuple[float, int, int]] = []
+        for p_idx, track_id in enumerate(prev_track_ids):
+            prev_info = self._prev_patches[track_id]
+            prev_feat = prev_info["feature"]
+            prev_label = prev_info["label"]
+            prev_bbox = prev_info["bbox"]
+            prev_cx = 0.5 * (prev_bbox[0] + prev_bbox[2])
+            prev_cy = 0.5 * (prev_bbox[1] + prev_bbox[3])
+            for d_idx, det in enumerate(detections):
+                if det["label"] != prev_label:
                     continue
-                s = _similarity(tr.feature, feat)
-                if s > best_sim:
-                    best_sim = s
-                    best_tr = tr
-            if (
-                best_tr is not None
-                and best_sim >= self.similarity_threshold
-                and best_tr.track_id not in assigned_track_ids
-            ):
-                best_tr.feature = feat
-                best_tr.last_frame = frame_index
-                best_tr.bbox_history[frame_index] = (x1, y1, x2, y2)
-                best_tr.last_mask = (mask > 0).astype(np.uint8).copy()
-                mask_to_track[m_idx] = best_tr.track_id
-                assigned_track_ids.add(best_tr.track_id)
+                cx, cy = float(det["center"][0]), float(det["center"][1])
+                dist = ((cx - prev_cx) ** 2 + (cy - prev_cy) ** 2) ** 0.5
+                if dist > self.max_center_distance:
+                    continue
+                sim = _similarity(prev_feat, det["feature"])
+                if sim > 0.0:
+                    candidates.append((sim, p_idx, d_idx))
+
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        assigned_prev: Set[int] = set()
+        assigned_dets: Set[int] = set()
+        mask_to_track: Dict[int, int] = {}
+        frame_bboxes: Dict[int, Tuple[int, int, int, int]] = {}
+
+        for sim, p_idx, d_idx in candidates:
+            if sim < self.similarity_threshold:
+                break
+            if p_idx in assigned_prev or d_idx in assigned_dets:
+                continue
+            track_id = prev_track_ids[p_idx]
+            det = detections[d_idx]
+            tr = track_by_id[track_id]
+            tr.feature = det["feature"]
+            tr.last_frame = frame_index
+            assigned_prev.add(p_idx)
+            assigned_dets.add(d_idx)
+            mask_to_track[det["mask_idx"]] = track_id
+            frame_bboxes[track_id] = det["bbox"]
+
+        for d_idx, det in enumerate(detections):
+            if d_idx in assigned_dets:
                 continue
             track_id = self._next_track_id
             self._next_track_id += 1
             vel0 = np.zeros(3, dtype=np.float32)
-            label = class_names[m_idx] if m_idx < len(class_names) else "Unknown"
             new_tr = TrackedObject(
                 track_id=track_id,
-                label=label,
-                feature=feat,
+                label=det["label"],
+                feature=det["feature"],
                 first_frame=frame_index,
                 last_frame=frame_index,
                 last_center_3d=np.asarray([np.nan, np.nan, np.nan], dtype=np.float32),
                 velocity_3d=vel0,
                 prev_velocity_3d=vel0.copy(),
-                bbox_history={frame_index: (x1, y1, x2, y2)},
-                last_mask=(mask > 0).astype(np.uint8).copy(),
             )
             self._tracks.append(new_tr)
-            mask_to_track[m_idx] = track_id
+            mask_to_track[det["mask_idx"]] = track_id
+            frame_bboxes[track_id] = det["bbox"]
 
-        sample_index = meta.get("sample_index", frame_index)
-        scene_objects: List[Dict[str, Any]] = []
-        for tr in self._tracks:
-            bbox = tr.bbox_history.get(frame_index)
-            scene_objects.append(
-                {
-                    "track_id": tr.track_id,
-                    "label": tr.label,
-                    "appears": bbox is not None,
-                    "bbox_xyxy": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])] if bbox is not None else None,
-                }
-            )
-        self._frame_tracking_2d[frame_index] = {
-            "frame_index": frame_index,
-            "sample_index": sample_index,
-            "objects": scene_objects,
-        }
-
+        self._update_prev_patches(detections, mask_to_track)
+        self._write_scene_snapshot(frame_index, meta, frame_bboxes)
         return mask_to_track
 
     def track_on_image_deepsort(
@@ -618,38 +574,44 @@ class ObjectTracker:
     ) -> Dict[int, int]:
         confidences = meta.get("mask_confidences")
         detections = self._build_detection_entries(image, masks, class_names, confidences=confidences)
-        for tr in self._tracks:
+
+        active_tracks = [tr for tr in self._tracks if tr.track_id in self._prev_patches]
+        for tr in active_tracks:
             self._kf_predict(tr)
-        matches, unmatched_tracks, unmatched_dets = self._associate(
-            tracks=self._tracks,
+
+        matches, _unmatched_tracks, unmatched_dets = self._associate(
+            tracks=active_tracks,
             detections=detections,
             appearance_weight=0.6,
             motion_gate=9.49,
             cosine_gate=0.6,
         )
+
         mask_to_track: Dict[int, int] = {}
+        frame_bboxes: Dict[int, Tuple[int, int, int, int]] = {}
+
         for t_idx, d_idx in matches:
-            tr = self._tracks[t_idx]
+            tr = active_tracks[t_idx]
             det = detections[d_idx]
             x1, y1, x2, y2 = det["bbox"]
             _ = self._kf_update(tr, det["center"])
             tr.feature = det["feature"]
             tr.label = det["label"]
             tr.last_frame = frame_index
-            tr.bbox_history[frame_index] = (x1, y1, x2, y2)
-            tr.last_mask = (masks[int(det["mask_idx"])] > 0).astype(np.uint8).copy()
             tr.hits += 1
             tr.misses = 0
             tr.confidence = det["confidence"]
             mask_to_track[int(det["mask_idx"])] = tr.track_id
-        for t_idx in unmatched_tracks:
-            self._tracks[t_idx].misses += 1
+            frame_bboxes[tr.track_id] = (x1, y1, x2, y2)
+
         for d_idx in unmatched_dets:
             det = detections[d_idx]
-            tid = self._create_track_from_detection(det, frame_index, masks)
+            tid = self._create_track_from_detection(det, frame_index)
             mask_to_track[int(det["mask_idx"])] = tid
-        self._tracks = [tr for tr in self._tracks if tr.misses <= self.deepsort_max_misses]
-        self._write_scene_snapshot(frame_index, meta)
+            frame_bboxes[tid] = det["bbox"]
+
+        self._update_prev_patches(detections, mask_to_track)
+        self._write_scene_snapshot(frame_index, meta, frame_bboxes)
         return mask_to_track
 
     def track_on_image_bytetrack(
@@ -664,67 +626,66 @@ class ObjectTracker:
         detections = self._build_detection_entries(image, masks, class_names, confidences=confidences)
         high = [d for d in detections if d["confidence"] >= self.bytetrack_high_conf]
         low = [d for d in detections if self.bytetrack_low_conf <= d["confidence"] < self.bytetrack_high_conf]
-        for tr in self._tracks:
+
+        active_tracks = [tr for tr in self._tracks if tr.track_id in self._prev_patches]
+        for tr in active_tracks:
             self._kf_predict(tr)
+
         mask_to_track: Dict[int, int] = {}
+        frame_bboxes: Dict[int, Tuple[int, int, int, int]] = {}
+
         matches_hi, unmatched_tracks, unmatched_hi = self._associate(
-            tracks=self._tracks,
+            tracks=active_tracks,
             detections=high,
             appearance_weight=0.5,
             motion_gate=9.49,
             cosine_gate=0.65,
         )
         for t_idx, d_idx in matches_hi:
-            tr = self._tracks[t_idx]
+            tr = active_tracks[t_idx]
             det = high[d_idx]
             x1, y1, x2, y2 = det["bbox"]
             _ = self._kf_update(tr, det["center"])
             tr.feature = det["feature"]
             tr.label = det["label"]
             tr.last_frame = frame_index
-            tr.bbox_history[frame_index] = (x1, y1, x2, y2)
-            tr.last_mask = (masks[int(det["mask_idx"])] > 0).astype(np.uint8).copy()
             tr.hits += 1
             tr.misses = 0
             tr.confidence = det["confidence"]
             mask_to_track[int(det["mask_idx"])] = tr.track_id
-        rem_tracks = [self._tracks[i] for i in sorted(unmatched_tracks)]
+            frame_bboxes[tr.track_id] = (x1, y1, x2, y2)
+
+        rem_tracks = [active_tracks[i] for i in sorted(unmatched_tracks)]
         if len(rem_tracks) > 0 and len(low) > 0:
-            matches_lo, rem_unmatched_tracks, _ = self._associate(
+            matches_lo, _rem_unmatched_tracks, _ = self._associate(
                 tracks=rem_tracks,
                 detections=low,
                 appearance_weight=0.35,
                 motion_gate=12.0,
                 cosine_gate=0.75,
             )
-            rem_indices = sorted(unmatched_tracks)
-            consumed: Set[int] = set()
             for rt_idx, d_idx in matches_lo:
-                tr_idx = rem_indices[rt_idx]
-                consumed.add(tr_idx)
-                tr = self._tracks[tr_idx]
+                tr = rem_tracks[rt_idx]
                 det = low[d_idx]
                 x1, y1, x2, y2 = det["bbox"]
                 _ = self._kf_update(tr, det["center"])
                 tr.feature = det["feature"]
                 tr.label = det["label"]
                 tr.last_frame = frame_index
-                tr.bbox_history[frame_index] = (x1, y1, x2, y2)
-                tr.last_mask = (masks[int(det["mask_idx"])] > 0).astype(np.uint8).copy()
                 tr.hits += 1
                 tr.misses = 0
                 tr.confidence = det["confidence"]
                 mask_to_track[int(det["mask_idx"])] = tr.track_id
-            unmatched_tracks = {rem_indices[i] for i in rem_unmatched_tracks}
-            unmatched_tracks = unmatched_tracks | (set(rem_indices) - consumed - unmatched_tracks)
-        for t_idx in unmatched_tracks:
-            self._tracks[t_idx].misses += 1
+                frame_bboxes[tr.track_id] = (x1, y1, x2, y2)
+
         for d_idx in unmatched_hi:
             det = high[d_idx]
-            tid = self._create_track_from_detection(det, frame_index, masks)
+            tid = self._create_track_from_detection(det, frame_index)
             mask_to_track[int(det["mask_idx"])] = tid
-        self._tracks = [tr for tr in self._tracks if tr.misses <= self.bytetrack_max_misses]
-        self._write_scene_snapshot(frame_index, meta)
+            frame_bboxes[tid] = det["bbox"]
+
+        self._update_prev_patches(detections, mask_to_track)
+        self._write_scene_snapshot(frame_index, meta, frame_bboxes)
         return mask_to_track
 
     def match_tracks_with_3d_detections(
@@ -811,6 +772,9 @@ class ObjectTracker:
         for mask in masks:
             mask_bboxes.append(_clamped_bbox_from_mask(mask, image.shape))
 
+        frame_bboxes: Dict[int, Tuple[int, int, int, int]] = {}
+        current_track_ids: Set[int] = set()
+
         for m_idx, track_id in mask_to_track.items():
             if not (0 <= int(m_idx) < len(masks)):
                 continue
@@ -840,25 +804,25 @@ class ObjectTracker:
                     last_center_3d=np.asarray([np.nan, np.nan, np.nan], dtype=np.float32),
                     velocity_3d=vel0,
                     prev_velocity_3d=vel0.copy(),
-                    bbox_history={frame_index: (x1, y1, x2, y2)},
-                    last_mask=(masks[int(m_idx)] > 0).astype(np.uint8).copy(),
                 )
                 self._tracks.append(new_tr)
                 track_map[int(track_id)] = new_tr
                 if int(track_id) >= self._next_track_id:
                     self._next_track_id = int(track_id) + 1
+                frame_bboxes[int(track_id)] = (x1, y1, x2, y2)
+                current_track_ids.add(int(track_id))
+                self._prev_patches[int(track_id)] = {
+                    "feature": feat,
+                    "bbox": (x1, y1, x2, y2),
+                    "label": label,
+                }
                 continue
 
-            prev_bbox = tr.bbox_history.get(tr.last_frame)
-            reference_size: Optional[Tuple[int, int]] = None
-            if prev_bbox is not None:
-                plx1, ply1, plx2, ply2 = prev_bbox
-                reference_size = (max(1, plx2 - plx1), max(1, ply2 - ply1))
             patch = self._masked_patch_for_feature(
                 image=image,
                 mask=masks[int(m_idx)],
                 bbox=bbox,
-                reference_size=reference_size,
+                reference_size=None,
             )
             if patch is None:
                 continue
@@ -866,26 +830,19 @@ class ObjectTracker:
             tr.label = label
             tr.feature = feat
             tr.last_frame = frame_index
-            tr.bbox_history[frame_index] = (x1, y1, x2, y2)
-            tr.last_mask = (masks[int(m_idx)] > 0).astype(np.uint8).copy()
+            frame_bboxes[int(track_id)] = (x1, y1, x2, y2)
+            current_track_ids.add(int(track_id))
+            self._prev_patches[int(track_id)] = {
+                "feature": feat,
+                "bbox": (x1, y1, x2, y2),
+                "label": label,
+            }
 
-        sample_index = meta.get("sample_index", frame_index)
-        scene_objects: List[Dict[str, Any]] = []
-        for tr in self._tracks:
-            bbox = tr.bbox_history.get(frame_index)
-            scene_objects.append(
-                {
-                    "track_id": tr.track_id,
-                    "label": tr.label,
-                    "appears": bbox is not None,
-                    "bbox_xyxy": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])] if bbox is not None else None,
-                }
-            )
-        self._frame_tracking_2d[frame_index] = {
-            "frame_index": frame_index,
-            "sample_index": sample_index,
-            "objects": scene_objects,
-        }
+        ended_ids = [tid for tid in self._prev_patches if tid not in current_track_ids]
+        for tid in ended_ids:
+            del self._prev_patches[tid]
+
+        self._write_scene_snapshot(frame_index, meta, frame_bboxes)
 
     def update_for_frame(
         self,
@@ -962,87 +919,20 @@ class ObjectTracker:
         }
 
         sorted_frame_indices = sorted(self._frames.keys())
+        frame_index_to_id: Dict[int, int] = {
+            fi: fid for fid, fi in enumerate(sorted_frame_indices)
+        }
 
-        track_frames: Dict[int, List[int]] = {}
-        track_positions: Dict[int, List[np.ndarray]] = {}
-        for frame_id, frame_index in enumerate(sorted_frame_indices):
-            frame_entry = self._frames[frame_index]
-            annotations = frame_entry["annotations"]
-            for ann in annotations:
-                track_id = ann["track_id"]
-                if track_id not in track_frames:
-                    track_frames[track_id] = []
-                track_frames[track_id].append(frame_id)
-                if track_id not in track_positions:
-                    track_positions[track_id] = []
-                track_positions[track_id].append(np.asarray(ann["position"], dtype=np.float32))
-
+        track_map: Dict[int, TrackedObject] = {tr.track_id: tr for tr in self._tracks}
         track_keyframes: Dict[int, Set[int]] = {}
-        for track_id, frames in track_frames.items():
-            if not frames:
-                continue
-
-            # Ensure we have matching 3D positions for every annotated frame in this track.
-            positions = track_positions.get(track_id, [])
-            if len(positions) != len(frames):
-                continue
-
-            # Sort frames and positions together by frame index so that motion
-            # vectors are computed in temporal order.
-            sorted_pairs = sorted(zip(frames, positions), key=lambda p: p[0])
-            sorted_frames = [p[0] for p in sorted_pairs]
-            sorted_positions = [p[1] for p in sorted_pairs]
-
-            first_f = sorted_frames[0]
-            last_f = sorted_frames[-1]
-            keyframes_for_track: Set[int] = set()
-
-            if first_f == last_f:
-                keyframes_for_track.add(first_f)
-                track_keyframes[track_id] = keyframes_for_track
-                continue
-
-            # Always treat the first and last appearances of a track as
-            # keyframes so CVAT interpolation has fixed endpoints.
-            keyframes_for_track.add(first_f)
-            keyframes_for_track.add(last_f)
-
-            # Use 3D motion direction to insert additional keyframes whenever
-            # the object turns sharply relative to its previous motion.
-            prev_vec: Optional[np.ndarray] = None
-            for idx in range(1, len(sorted_frames)):
-                p_prev = sorted_positions[idx - 1]
-                p_curr = sorted_positions[idx]
-                curr_vec = p_curr - p_prev
-
-                curr_len = float(np.linalg.norm(curr_vec))
-                if curr_len < self.direction_change_min_step:
-                    # Ignore almost-stationary motion segments.
-                    continue
-
-                if prev_vec is not None:
-                    prev_len = float(np.linalg.norm(prev_vec))
-                    if prev_len >= self.direction_change_min_step:
-                        denom = prev_len * curr_len
-                        if denom > 0.0:
-                            cos_angle = float(np.dot(prev_vec, curr_vec) / denom)
-                            # Clamp numerically in case of tiny floating point excursions.
-                            if cos_angle < -1.0:
-                                cos_angle = -1.0
-                            elif cos_angle > 1.0:
-                                cos_angle = 1.0
-
-                            if cos_angle < self.direction_change_cos_threshold:
-                                # Direction changed significantly between frames
-                                # sorted_frames[idx - 1] and sorted_frames[idx].
-                                # Mark both as keyframes so that CVAT does not
-                                # interpolate a straight path across a sharp turn.
-                                keyframes_for_track.add(sorted_frames[idx - 1])
-                                keyframes_for_track.add(sorted_frames[idx])
-
-                prev_vec = curr_vec
-
-            track_keyframes[track_id] = keyframes_for_track
+        for tr in self._tracks:
+            kf: Set[int] = set()
+            if tr.first_frame in frame_index_to_id:
+                kf.add(frame_index_to_id[tr.first_frame])
+            if tr.last_frame in frame_index_to_id:
+                kf.add(frame_index_to_id[tr.last_frame])
+            if kf:
+                track_keyframes[tr.track_id] = kf
 
         items: List[Dict[str, Any]] = []
 

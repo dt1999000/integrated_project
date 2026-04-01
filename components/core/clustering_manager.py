@@ -501,6 +501,78 @@ class ClusteringManager:
         return pose_cuboid
 
 
+def scene_is_indoor_from_point_cloud(
+    points: np.ndarray,
+    max_horizontal_span_m: float = 52.0,
+    min_points_per_m3: float = 1.0,
+    min_points: int = 400,
+    max_aabb_volume_m3: float = 22000.0,
+    max_vertical_span_m: float = 14.0,
+    near_xy_radius_m: float = 14.0,
+    min_near_xy_fraction: float = 0.16,
+    density_relax_factor: float = 0.42,
+) -> bool:
+    """
+    Infer indoor vs outdoor from the raw LiDAR scan using AABB bounds, mean density,
+    ceiling height, and near-field occupancy (combined rules).
+
+    Hard outdoor vetoes (automotive / open scene):
+        - max(dx, dy) > max_horizontal_span_m
+        - AABB volume > max_aabb_volume_m3
+        - fewer than min_points
+
+    Indoor if any passes (after vetoes):
+        1. Mean density N/V >= min_points_per_m3
+        2. Low ceiling: dz <= max_vertical_span_m and N/V >= min_points_per_m3 * density_relax_factor
+        3. Near field: fraction of points with ||(x,y)|| < near_xy_radius_m is at least
+           min_near_xy_fraction (typical for room / corridor LiDAR with many wall returns)
+
+    Args:
+        points: (N, 3+) array of points in meters (sensor frame; origin near sensor).
+        max_horizontal_span_m: Above this, classify as outdoor.
+        min_points_per_m3: Primary density threshold (points per cubic meter in AABB).
+        min_points: Below this count, default to outdoor.
+        max_aabb_volume_m3: Above this, classify as outdoor.
+        max_vertical_span_m: dz below this allows a relaxed density check (indoor ceiling).
+        near_xy_radius_m: Radius in the xy plane for near-field fraction.
+        min_near_xy_fraction: Minimum fraction of points inside that cylinder (0–1).
+        density_relax_factor: Multiplier on min_points_per_m3 for the low-ceiling path.
+
+    Returns:
+        True if classified as indoor, False for outdoor or uncertain.
+    """
+    if points is None or len(points) < min_points:
+        return False
+    p = np.asarray(points[:, :3], dtype=np.float64)
+    mn = np.min(p, axis=0)
+    mx = np.max(p, axis=0)
+    ext = mx - mn
+    horizontal = float(np.maximum(ext[0], ext[1]))
+    vert = float(ext[2])
+    vol = float(ext[0] * ext[1] * ext[2])
+    vol = max(vol, 1e-3)
+    density = float(len(p) / vol)
+
+    if vol > max_aabb_volume_m3:
+        return False
+    if horizontal > max_horizontal_span_m:
+        return False
+
+    if density >= min_points_per_m3:
+        return True
+
+    relaxed = min_points_per_m3 * float(density_relax_factor)
+    if vert <= max_vertical_span_m and density >= relaxed:
+        return True
+
+    d_xy = np.linalg.norm(p[:, :2], axis=1)
+    near_frac = float(np.mean(d_xy < float(near_xy_radius_m)))
+    if near_frac >= float(min_near_xy_fraction):
+        return True
+
+    return False
+
+
 def filter_clusters_by_max_volume(
     points: np.ndarray,
     labels: np.ndarray,

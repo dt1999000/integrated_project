@@ -428,7 +428,7 @@ def main():
                                 "Take every n-th frame (KITTI)",
                                 min_value=1,
                                 max_value=max(1, num_samples),
-                                value=min(10, max(1, num_samples)),
+                                value=min(3, max(1, num_samples)),
                                 step=1,
                                 key="kitti_stride_every_nth",
                             )
@@ -924,7 +924,6 @@ def main():
                         st.session_state.process_all_samples = True
                         # Indicate that raw samples have already been saved for batch
                         st.session_state.batch_samples_saved = True
-                        print(f'batch_samples_saved: {st.session_state.batch_samples_saved}, batch_samples: {batch_samples}')
                         st.success(
                             f"✅ Prepared {len(batch_samples)} ROS bag samples. "
                             "Go to **2_Detection** and click **Process entire batch**."
@@ -1089,7 +1088,6 @@ def main():
                         # Filter images button
                         if st.button("🔍 Filter Images", type="primary", key="filter_sim_images"):
                             with st.spinner("Filtering images from dataset..."):
-                                print(f"dataset_path: {dataset_path}")
                                 filtered_batch = filter_sim_images(
                                     handler=handler,
                                     subset_name=selected_subset,
