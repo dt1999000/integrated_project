@@ -148,6 +148,15 @@ def _datumaro_to_tracklet_xml(tracking_state: Dict) -> str:
     lines.append("</tracklets>")
     lines.append("</boost_serialization>")
     return "\n".join(lines)
+
+
+def _samples_to_tracklet_xml(samples: List[Dict[str, Any]]) -> str:
+    """
+    Build KITTI-style tracklet XML from per-frame detection samples
+    when tracking state is unavailable.
+
+    Each cuboid is exported as a single-pose tracklet (no track_id linkage).
+    """
     lines = [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
         "<!DOCTYPE boost_serialization>",
@@ -159,7 +168,7 @@ def _datumaro_to_tracklet_xml(tracking_state: Dict) -> str:
         cuboids = export_res.get("detected_cuboids", [])
         for c in cuboids:
             center = c.get("center", [0, 0, 0])
-            if hasattr(center, "tolist"):
+            if isinstance(center, np.ndarray):
                 center = center.tolist()
             yaw = float(c.get("yaw", 0))
             l = float(c.get("length", 1))
@@ -236,10 +245,10 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # 1) Tracklet XML export from tracking (Datumaro state)
+    # 1) Tracklet XML export (tracking if available, detection-only fallback)
     # ------------------------------------------------------------------
+    st.subheader("📦 Tracklet XML Export (KITTI-style)")
     if show_batch_tracking_exports:
-        st.subheader("📦 Tracklet XML Export (KITTI-style from tracking)")
         n_frames = len(tracking_state.get("items", []))
         st.metric("Frames in batch", n_frames)
 
@@ -251,32 +260,48 @@ def main():
                 if "track_id" in attrs:
                     track_ids.add(int(attrs["track_id"]))
         st.metric("Tracklets", len(track_ids))
+        st.caption("Tracking state detected: exports true multi-frame tracklets.")
+    elif batch_samples_list:
+        st.metric("Frames in batch", len(batch_samples_list))
+        st.metric("Tracklets", "N/A (tracking disabled)")
+        st.info(
+            "Tracking state is not available. Export will still produce KITTI-style "
+            "tracklet XML with one pose per detection (no track_id linkage)."
+        )
+    else:
+        st.info(
+            "No batch results found. Run batch processing on **2_Detection** first to export tracklet XML."
+        )
 
-        if not output_root:
-            st.warning("Output folder is not set. Please open **1_Dataset_Extraction** and set the Output Directory.")
-        else:
-            st.info(f"Tracklet XML will be saved under: `{output_root}` as `tracklet_labels.xml`.")
-            if st.button("💾 Save tracking as Tracklet XML", key="export_tracklet_xml_btn"):
+    if not output_root:
+        st.warning("Output folder is not set. Please open **1_Dataset_Extraction** and set the Output Directory.")
+    elif show_batch_tracking_exports or batch_samples_list:
+        st.info(f"Tracklet XML will be saved under: `{output_root}` as `tracklet_labels.xml`.")
+        if st.button("💾 Save Tracklet XML", key="export_tracklet_xml_btn"):
+            out_dir = Path(output_root).expanduser()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if show_batch_tracking_exports:
+                xml_str = _datumaro_to_tracklet_xml(tracking_state)
+            else:
+                xml_str = _samples_to_tracklet_xml(batch_samples_list)
+            out_file = out_dir / "tracklet_labels.xml"
+            out_file.write_text(xml_str, encoding="utf-8")
+            st.success(f"✅ Saved tracklet XML to **{out_file}**")
+
+    if show_batch_tracking_exports and output_root:
+        # Complete 2D tracking history JSON export from ObjectTracker state.
+        if st.button("💾 Save complete 2D tracking history (JSON)", key="export_tracking_2d_history_json"):
+            tracking_2d_json = st.session_state.get("tracking_2d_history")
+            if tracking_2d_json is None:
+                st.warning("No cached 2D tracking history found. Run batch tracking first.")
+            else:
                 out_dir = Path(output_root).expanduser()
                 out_dir.mkdir(parents=True, exist_ok=True)
-                xml_str = _datumaro_to_tracklet_xml(tracking_state)
-                out_file = out_dir / "tracklet_labels.xml"
-                out_file.write_text(xml_str, encoding="utf-8")
-                st.success(f"✅ Saved tracklet XML to **{out_file}**")
+                out_file = out_dir / "tracking_2d_history.json"
+                out_file.write_text(json.dumps(tracking_2d_json, indent=2), encoding="utf-8")
+                st.success(f"✅ Saved complete 2D tracking history to **{out_file}**")
 
-            # Complete 2D tracking history JSON export from ObjectTracker state.
-            if st.button("💾 Save complete 2D tracking history (JSON)", key="export_tracking_2d_history_json"):
-                tracking_2d_json = st.session_state.get("tracking_2d_history")
-                if tracking_2d_json is None:
-                    st.warning("No cached 2D tracking history found. Run batch tracking first.")
-                else:
-                    out_dir = Path(output_root).expanduser()
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    out_file = out_dir / "tracking_2d_history.json"
-                    out_file.write_text(json.dumps(tracking_2d_json, indent=2), encoding="utf-8")
-                    st.success(f"✅ Saved complete 2D tracking history to **{out_file}**")
-
-        st.markdown("---")
+    st.markdown("---")
 
     # ------------------------------------------------------------------
     # 4) Datumaro-style export with tracking
@@ -303,14 +328,23 @@ def main():
             st.success(f"✅ Saved Datumaro-style tracking annotations to **{out_file}**")
 
         st.markdown("---")
-    elif batch_samples_list and batch_export_results.get("batch_tracking_enabled") is False:
-        st.markdown("---")
-    elif batch_samples_list and not show_batch_tracking_exports:
-        st.subheader("📦 Datumaro-style export (with tracking)")
-        st.info(
-            "No tracking state in session. Run batch processing on **2_Detection** "
-            "with tracking enabled before exporting in Datumaro style."
+    elif batch_samples_list:
+        st.subheader("📦 Datumaro-style export (detection-only)")
+        st.caption(
+            "Exports batch detections in a Datumaro/CVAT-compatible JSON format "
+            "without tracking fields (`track_id`, keyframes, occlusion flags)."
         )
+        if not output_root:
+            st.warning(
+                "Output folder is not set. Please open **1_Dataset_Extraction** and set the Output Directory."
+            )
+        elif st.button("💾 Save Datumaro-style detection JSON", key="export_datumaro_detection_json"):
+            export_root = Path(output_root).expanduser()
+            export_root.mkdir(parents=True, exist_ok=True)
+            datumaro_json = Export._convert_to_cvat_format(batch_samples_list)
+            out_file = export_root / "detections_datumaro_detection_only.json"
+            out_file.write_text(json.dumps(datumaro_json, indent=2), encoding="utf-8")
+            st.success(f"✅ Saved Datumaro-style detection annotations to **{out_file}**")
         st.markdown("---")
     elif not batch_samples_list:
         st.subheader("📦 Datumaro-style export (with tracking)")
@@ -473,6 +507,72 @@ def main():
         out_file_2d = out_dir / fname_2d
         out_file_2d.write_text(json.dumps(image_payload, indent=2), encoding="utf-8")
         st.success(f"✅ Saved 2D image annotations to **{out_file_2d}**")
+
+    # ---- Bounding boxes only (no masks) ----
+    st.markdown("#### 2D bounding boxes only (JSON)")
+    st.caption(
+        "Exports bounding boxes, class names, and confidences from Step 3 without masks. "
+        "This lightweight format can be re-imported into Step 3 on **2_Detection**."
+    )
+
+    if st.button("💾 Save 2D bounding boxes to JSON", key="export_2d_bbox_json"):
+        bbox_annotations: List[Dict[str, Any]] = []
+        mask_bboxes = step_3_result.get("mask_bboxes", []) or []
+        class_names_list = step_3_result.get("class_names", []) or []
+        confidences_list = step_3_result.get("confidences", []) or []
+        for i, bbox in enumerate(mask_bboxes):
+            entry: Dict[str, Any] = {
+                "bbox": _to_serializable(bbox),
+                "class_name": class_names_list[i] if i < len(class_names_list) else "Unknown",
+                "confidence": float(confidences_list[i]) if i < len(confidences_list) else None,
+            }
+            bbox_annotations.append(entry)
+
+        bbox_payload: Dict[str, Any] = {
+            "format": "bbox_only",
+            "metadata": _to_serializable(meta),
+            "annotations": bbox_annotations,
+        }
+        fname_bbox = f"det2d_bbox_{dataset_type}_{sample_index}.json"
+        out_file_bbox = out_dir / fname_bbox
+        out_file_bbox.write_text(json.dumps(bbox_payload, indent=2), encoding="utf-8")
+        st.success(f"✅ Saved 2D bounding boxes to **{out_file_bbox}**")
+
+    # ---- Bounding boxes with tracking / instance ID ----
+    st.markdown("#### 2D bounding boxes with tracking (JSON)")
+    st.caption(
+        "Exports per-frame bounding boxes with instance (track) IDs from batch tracking. "
+        "Requires a completed batch run with tracking enabled on **2_Detection**."
+    )
+    tracking_2d_json = st.session_state.get("tracking_2d_history")
+    if tracking_2d_json is None:
+        st.info("No 2D tracking history found. Run batch processing with tracking enabled first.")
+    elif st.button("💾 Save 2D bounding boxes with tracking to JSON", key="export_2d_bbox_tracking_json"):
+        frames_out: List[Dict[str, Any]] = []
+        for frame_entry in tracking_2d_json.get("frames", []):
+            frame_annotations: List[Dict[str, Any]] = []
+            for obj in frame_entry.get("objects", []):
+                entry: Dict[str, Any] = {
+                    "bbox": obj.get("bbox_xyxy"),
+                    "class_name": obj.get("label", "Unknown"),
+                    "instance_id": int(obj["track_id"]),
+                    "appears": bool(obj.get("appears", False)),
+                }
+                frame_annotations.append(entry)
+            frames_out.append({
+                "frame_index": frame_entry.get("frame_index"),
+                "sample_index": frame_entry.get("sample_index"),
+                "annotations": frame_annotations,
+            })
+        tracking_bbox_payload: Dict[str, Any] = {
+            "format": "bbox_tracking",
+            "summary": _to_serializable(tracking_2d_json.get("summary", {})),
+            "frames": frames_out,
+        }
+        fname_trk = f"det2d_bbox_tracking_{dataset_type}_{sample_index}.json"
+        out_file_trk = out_dir / fname_trk
+        out_file_trk.write_text(json.dumps(tracking_bbox_payload, indent=2), encoding="utf-8")
+        st.success(f"✅ Saved 2D bounding boxes with tracking to **{out_file_trk}**")
 
     st.markdown("---")
 

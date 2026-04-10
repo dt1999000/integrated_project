@@ -1041,3 +1041,145 @@ class PointCloud:
             print(f"Added {len(all_points)} points from {len(mask_points)} segmentation masks")
         else:
             print("No points to add from segmentation masks")
+
+    @staticmethod
+    def from_rgbd_sunrgbd(
+        rgb_image: np.ndarray,
+        depth_image: np.ndarray,
+        camera_intrinsic: np.ndarray,
+        depth_scale: float = 10000.0,
+        depth_trunc: float = 10.0,
+        stride: int = 1,
+    ) -> "PointCloud":
+        """
+        Create a PointCloud from an RGBD image pair following the SunRGBD dataset conventions.
+
+        SunRGBD stores depth as 16-bit PNG. The ``depth_bfx/`` directory uses a
+        scale of 10000 (depth_meters = raw / 10000). Raw sensor directories may
+        use 1000 (millimetres). Adjust ``depth_scale`` accordingly.
+
+        The returned point cloud lives in the **camera** coordinate system
+        (X-right, Y-down, Z-forward) because SunRGBD has no separate LiDAR
+        frame.  Colours are carried on the ``PointCloud`` via the
+        ``.colors`` attribute (Nx3, 0-255 uint8).
+
+        Args:
+            rgb_image:        H×W×3 uint8 RGB image.
+            depth_image:      H×W uint16 / float depth map (raw sensor values).
+            camera_intrinsic: 3×3 intrinsic matrix ``[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]``.
+            depth_scale:      Divisor that converts raw depth to **metres**
+                              (10000 for ``depth_bfx``, 1000 for raw mm).
+            depth_trunc:      Maximum depth in metres; farther points are discarded.
+            stride:           Pixel sampling stride (1 = every pixel).
+
+        Returns:
+            A ``PointCloud`` instance whose ``.original_point_cloud`` is Nx3 in
+            camera coords and ``.colors`` is the corresponding Nx3 RGB array.
+        """
+        depth_m = depth_image.astype(np.float64) / depth_scale
+
+        h, w = depth_m.shape
+        u_coords, v_coords = np.meshgrid(
+            np.arange(0, w, stride),
+            np.arange(0, h, stride),
+        )
+        u = u_coords.ravel()
+        v = v_coords.ravel()
+        z = depth_m[v, u]
+
+        valid = (z > 0.0) & (z <= depth_trunc)
+        u, v, z = u[valid], v[valid], z[valid]
+
+        fx = camera_intrinsic[0, 0]
+        fy = camera_intrinsic[1, 1]
+        cx = camera_intrinsic[0, 2]
+        cy = camera_intrinsic[1, 2]
+
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+
+        points = np.stack([x, y, z], axis=-1).astype(np.float32)
+        colors = rgb_image[v, u]  # Nx3 uint8
+
+        pc = PointCloud(points)
+        pc.colors = colors
+
+        print(f"SunRGBD point cloud: {len(points):,} points from {h}×{w} RGBD "
+              f"(stride={stride}, depth_scale={depth_scale}, trunc={depth_trunc}m)")
+        if len(points) > 0:
+            print(f"  X [{points[:, 0].min():.2f}, {points[:, 0].max():.2f}]  "
+                  f"Y [{points[:, 1].min():.2f}, {points[:, 1].max():.2f}]  "
+                  f"Z [{points[:, 2].min():.2f}, {points[:, 2].max():.2f}]")
+
+        return pc
+
+
+def load_sunrgbd_intrinsics(intrinsics_path: str) -> np.ndarray:
+    """
+    Load a 3×3 camera intrinsic matrix from a SunRGBD ``intrinsics.txt`` file.
+
+    The file contains 3 lines with 3 space-separated floats each::
+
+        fx  0  cx
+         0 fy  cy
+         0  0   1
+
+    Args:
+        intrinsics_path: Path to the ``intrinsics.txt`` file.
+
+    Returns:
+        3×3 numpy float64 intrinsic matrix.
+    """
+    K = np.loadtxt(intrinsics_path, dtype=np.float64).reshape(3, 3)
+    return K
+
+
+def create_o3d_pointcloud_from_rgbd_sunrgbd(
+    rgb_image: np.ndarray,
+    depth_image: np.ndarray,
+    camera_intrinsic: np.ndarray,
+    depth_scale: float = 10000.0,
+    depth_trunc: float = 10.0,
+) -> o3d.geometry.PointCloud:
+    """
+    Create an Open3D PointCloud directly from SunRGBD RGBD data using the
+    Open3D RGBD pipeline for maximum efficiency.
+
+    Args:
+        rgb_image:        H×W×3 uint8 RGB image.
+        depth_image:      H×W uint16 / float raw depth values.
+        camera_intrinsic: 3×3 numpy intrinsic matrix.
+        depth_scale:      Divisor converting raw depth to metres.
+        depth_trunc:      Maximum depth in metres.
+
+    Returns:
+        ``open3d.geometry.PointCloud`` with colours.
+    """
+    h, w = depth_image.shape[:2]
+
+    o3d_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+        width=w,
+        height=h,
+        fx=float(camera_intrinsic[0, 0]),
+        fy=float(camera_intrinsic[1, 1]),
+        cx=float(camera_intrinsic[0, 2]),
+        cy=float(camera_intrinsic[1, 2]),
+    )
+
+    rgb_o3d = o3d.geometry.Image(np.ascontiguousarray(rgb_image))
+    depth_o3d = o3d.geometry.Image(np.ascontiguousarray(depth_image.astype(np.float32)))
+
+    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        rgb_o3d,
+        depth_o3d,
+        depth_scale=depth_scale,
+        depth_trunc=depth_trunc,
+        convert_rgb_to_intensity=False,
+    )
+
+    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, o3d_intrinsic)
+
+    print(f"Open3D SunRGBD point cloud: {len(pcd.points):,} points "
+          f"(depth_scale={depth_scale}, trunc={depth_trunc}m)")
+
+    return pcd

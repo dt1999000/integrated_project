@@ -31,6 +31,16 @@ class ClusteringManager:
             'algorithm': 'auto',
             'leaf_size': 30
         },
+        'adaptive_dbscan': {
+            'base_eps': 0.35,
+            'min_samples': 10,
+            'eps_growth_rate': 1.0,
+            'reference_distance': 15.0,
+            'min_scale': 0.7,
+            'max_scale': 4.0,
+            'algorithm': 'auto',
+            'leaf_size': 30
+        },
         'optics': {
             'min_samples': 10,
             'max_eps': 1.0,
@@ -117,6 +127,10 @@ class ClusteringManager:
     VALID_PARAMS = {
         'hdbscan': {'min_cluster_size', 'min_samples', 'metric', 'cluster_selection_method'},
         'dbscan': {'eps', 'min_samples', 'metric', 'algorithm', 'leaf_size'},
+        'adaptive_dbscan': {
+            'base_eps', 'min_samples', 'eps_growth_rate', 'reference_distance',
+            'min_scale', 'max_scale', 'algorithm', 'leaf_size'
+        },
         'optics': {'min_samples', 'max_eps', 'xi', 'min_cluster_size', 'metric'},
         'birch': {'threshold', 'branching_factor', 'n_clusters'},
         'agglomerative': {'n_clusters', 'linkage'}
@@ -143,6 +157,8 @@ class ClusteringManager:
             return self.run_hdbscan(**params)
         elif algorithm == 'dbscan':
             return self.run_dbscan(**params)
+        elif algorithm == 'adaptive_dbscan':
+            return self.run_adaptive_dbscan(**params)
         elif algorithm == 'optics':
             return self.run_optics(**params)
         elif algorithm == 'birch':
@@ -224,6 +240,80 @@ class ClusteringManager:
             }
         }
         
+        return self.labels
+
+    def run_adaptive_dbscan(
+        self,
+        base_eps: float = 0.35,
+        min_samples: int = 5,
+        eps_growth_rate: float = 1.0,
+        reference_distance: float = 15.0,
+        min_scale: float = 0.7,
+        max_scale: float = 4.0,
+        algorithm: str = 'auto',
+        leaf_size: int = 30,
+    ) -> np.ndarray:
+        """
+        Run distance-adaptive DBSCAN by isotropic coordinate scaling before clustering.
+
+        For each point i, let r_i be 3D distance from the sensor origin (same frame as
+        ``points``). Scale is centered on the **median** r of this point set:
+
+            s_i = clip(1 + eps_growth_rate * (r_i - median(r)) / reference_distance,
+                       min_scale, max_scale)
+
+        Transformed coordinates: p'_i = p_i / s_i (x, y, and z).
+
+        DBSCAN uses fixed ``eps=base_eps`` in transformed space. Physically, neighbor
+        tolerance grows roughly with range for points farther than the median and
+        shrinks for closer points. Using 3D range and scaling z avoids the old XY-only
+        warp, where vertical gaps stayed in meters while horizontal gaps were shrunk,
+        which blocked merging tall/sparse structure along z.
+
+        **Why growth rate used to feel inert:** if all points shared nearly the same
+        XY radius from the sensor, s_i was almost constant, so geometry only rescales
+        uniformly and cluster connectivity barely changes. Median centering spreads
+        s_i within each mask (roof vs bumper, etc.), so ``eps_growth_rate`` actually
+        changes which pairs fall within ``base_eps``.
+        """
+        print(
+            f"Running adaptive DBSCAN with base_eps={base_eps}, "
+            f"min_samples={min_samples}, eps_growth_rate={eps_growth_rate}"
+        )
+
+        points = np.asarray(self.points, dtype=np.float64)
+        range_3d = np.linalg.norm(points[:, :3], axis=1)
+        r_med = float(np.median(range_3d))
+        safe_ref = max(float(reference_distance), 1e-6)
+        g = float(eps_growth_rate)
+        scale = 1.0 + g * (range_3d - r_med) / safe_ref
+        scale = np.clip(scale, float(min_scale), float(max_scale))
+
+        transformed_points = points / scale[:, np.newaxis]
+
+        clusterer = DBSCAN(
+            eps=base_eps,
+            min_samples=min_samples,
+            metric='euclidean',
+            algorithm=algorithm,
+            leaf_size=leaf_size
+        )
+        self.labels = clusterer.fit_predict(transformed_points)
+
+        self.results['adaptive_dbscan'] = {
+            'labels': self.labels,
+            'params': {
+                'base_eps': base_eps,
+                'min_samples': min_samples,
+                'eps_growth_rate': eps_growth_rate,
+                'reference_distance': reference_distance,
+                'min_scale': min_scale,
+                'max_scale': max_scale,
+                'algorithm': algorithm,
+                'leaf_size': leaf_size,
+            }
+        }
+
         return self.labels
     
     def run_birch(self, threshold: float = 0.5, branching_factor: int = 50,
@@ -677,12 +767,21 @@ def select_best_cluster_points(
     mask: np.ndarray,
     projection,
     image_shape: Tuple[int, int],
+    cluster_labels: Optional[np.ndarray] = None,
+    clustering_algorithm: str = 'dbscan',
     dbscan_eps: float = 0.5,
     dbscan_min_samples: int = 5,
+    adaptive_dbscan_base_eps: float = 0.35,
+    adaptive_dbscan_eps_growth_rate: float = 1.0,
+    adaptive_dbscan_reference_distance: float = 15.0,
+    adaptive_dbscan_min_scale: float = 0.7,
+    adaptive_dbscan_max_scale: float = 4.0,
+    hdbscan_min_cluster_size: int = 5,
+    hdbscan_min_samples: int = 5,
     sparse_depth_map: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
     """
-    Cluster mask points with DBSCAN and select the cluster with highest 2D IoU to the mask.
+    Select the cluster with highest 2D IoU to the mask.
 
     Reprojects each cluster onto the 2D image and computes IoU with the full mask.
     IoU is normalized so that the IoU of all mask_points (reprojected) vs the mask
@@ -695,6 +794,8 @@ def select_best_cluster_points(
         mask: Binary mask (H, W) as numpy array
         projection: Projection object with point_to_pixel method
         image_shape: (height, width) tuple
+        cluster_labels: Optional precomputed labels aligned with mask_points.
+        clustering_algorithm: Clustering algorithm to run when cluster_labels is None.
         dbscan_eps: DBSCAN eps parameter
         dbscan_min_samples: DBSCAN min_samples parameter
         sparse_depth_map: Unused; kept for API compatibility.
@@ -702,13 +803,29 @@ def select_best_cluster_points(
     Returns:
         Points of the best cluster, or None if no valid cluster found
     """
-    if len(mask_points) < dbscan_min_samples:
+    if cluster_labels is None and len(mask_points) < dbscan_min_samples:
         return None
 
-    clustering_manager = ClusteringManager(mask_points)
-    cluster_labels = clustering_manager.run_dbscan(
-        eps=dbscan_eps, min_samples=dbscan_min_samples
-    )
+    if cluster_labels is None:
+        clustering_manager = ClusteringManager(mask_points)
+        if clustering_algorithm == 'hdbscan':
+            cluster_labels = clustering_manager.run_hdbscan(
+                min_cluster_size=hdbscan_min_cluster_size,
+                min_samples=hdbscan_min_samples
+            )
+        elif clustering_algorithm == 'adaptive_dbscan':
+            cluster_labels = clustering_manager.run_adaptive_dbscan(
+                base_eps=adaptive_dbscan_base_eps,
+                min_samples=dbscan_min_samples,
+                eps_growth_rate=adaptive_dbscan_eps_growth_rate,
+                reference_distance=adaptive_dbscan_reference_distance,
+                min_scale=adaptive_dbscan_min_scale,
+                max_scale=adaptive_dbscan_max_scale,
+            )
+        else:
+            cluster_labels = clustering_manager.run_dbscan(
+                eps=dbscan_eps, min_samples=dbscan_min_samples
+            )
 
     unique_labels = np.unique(cluster_labels)
     unique_labels = unique_labels[unique_labels >= 0]

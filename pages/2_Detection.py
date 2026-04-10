@@ -2,10 +2,11 @@
 3D Object Detection Pipeline
 Unified detection pipeline with step-by-step execution and full pipeline mode.
 """
+import json
 import os
 import time
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 import cv2
 import matplotlib.pyplot as plt
@@ -125,8 +126,16 @@ def default_detection_params() -> Dict:
             "filter_forward_only": False,
         },
         "clustering": {
+            "clustering_algorithm": "adaptive_dbscan",
             "dbscan_eps": 0.5,
             "dbscan_min_samples": 5,
+            "hdbscan_min_cluster_size": 5,
+            "hdbscan_min_samples": 5,
+            "adaptive_dbscan_base_eps": 0.35,
+            "adaptive_dbscan_eps_growth_rate": 1.0,
+            "adaptive_dbscan_reference_distance": 15.0,
+            "adaptive_dbscan_min_scale": 0.7,
+            "adaptive_dbscan_max_scale": 4.0,
             "volume_factor": 1.2,
         },
         "cuboid_fitting": {
@@ -347,6 +356,95 @@ def _ensure_projection(
     )
 
 
+def _build_step3_from_bboxes(
+    bbox_data: Dict,
+    image: np.ndarray,
+    sparse_points: np.ndarray,
+    sample_meta_data: Dict,
+    projection: Optional[Projection] = None,
+) -> Dict:
+    """
+    Build a Step 3-compatible result dict from an uploaded bbox annotation file.
+
+    Accepts both ``bbox_only`` and ``bbox_tracking`` formats exported by **4_Export**.
+    For the tracking variant the current frame's annotations are selected by *frame_index*
+    stored in ``st.session_state``.
+
+    Rectangular binary masks are synthesised from the bounding boxes so that the
+    downstream clustering / pose-estimation pipeline works unchanged.
+    """
+    start_time = time.time()
+    h, w = image.shape[:2]
+    fmt = bbox_data.get("format", "bbox_only")
+
+    annotations: List[Dict] = []
+    if fmt == "bbox_tracking":
+        frame_idx = st.session_state.get("_bbox_load_frame_index", 0)
+        frames = bbox_data.get("frames", [])
+        for f in frames:
+            if int(f.get("frame_index", -1)) == frame_idx:
+                annotations = f.get("annotations", [])
+                break
+        if not annotations and frames:
+            annotations = frames[0].get("annotations", [])
+    else:
+        annotations = bbox_data.get("annotations", [])
+
+    sam_masks: List[np.ndarray] = []
+    mask_bboxes: List[List[int]] = []
+    class_names_out: List[str] = []
+    confidences_out: List[float] = []
+    instance_ids: List[Optional[int]] = []
+
+    for ann in annotations:
+        bbox = ann.get("bbox")
+        if bbox is None or len(bbox) != 4:
+            continue
+        if fmt == "bbox_tracking" and not ann.get("appears", True):
+            continue
+        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[y1:y2, x1:x2] = 1
+        sam_masks.append(mask)
+        mask_bboxes.append([x1, y1, x2, y2])
+        class_names_out.append(str(ann.get("class_name", "Unknown")))
+        conf = ann.get("confidence")
+        confidences_out.append(float(conf) if conf is not None else 1.0)
+        instance_ids.append(ann.get("instance_id"))
+
+    mask_assignments = None
+    if sam_masks:
+        proj = _ensure_projection(
+            projection=projection,
+            sample_meta_data=sample_meta_data,
+            sparse_points=sparse_points,
+        )
+        mask_assignments = assign_points_to_masks(sparse_points, sam_masks, proj, (h, w))
+
+    has_tracking = any(iid is not None for iid in instance_ids)
+
+    result: Dict = {
+        "sam_masks": sam_masks,
+        "mask_assignments": mask_assignments,
+        "mask_bboxes": mask_bboxes,
+        "class_names": class_names_out,
+        "confidences": confidences_out,
+        "segmentation_debug": {"source": "loaded_bbox_annotation", "format": fmt},
+        "n_masks": len(sam_masks),
+        "time": time.time() - start_time,
+    }
+    if has_tracking:
+        result["loaded_instance_ids"] = instance_ids
+    return result
+
+
 def step_3_sam_segmentation(
     sample_meta_data: Dict,
     image: np.ndarray,
@@ -488,22 +586,31 @@ def step_4_clustering(
     sparse_points: np.ndarray,
     sam_masks: List[np.ndarray],
     mask_assignments: np.ndarray,
+    clustering_algorithm: str = "adaptive_dbscan",
     dbscan_eps: float = 0.5,
     dbscan_min_samples: int = 5,
+    hdbscan_min_cluster_size: int = 5,
+    hdbscan_min_samples: int = 5,
+    adaptive_dbscan_base_eps: float = 0.35,
+    adaptive_dbscan_eps_growth_rate: float = 1.0,
+    adaptive_dbscan_reference_distance: float = 15.0,
+    adaptive_dbscan_min_scale: float = 0.7,
+    adaptive_dbscan_max_scale: float = 4.0,
     sparse_depth_map: Optional[np.ndarray] = None,
     volume_factor: float = 1.2,
     projection: Optional[Projection] = None,
 ) -> Dict:
     """
-    Step 4: Run DBSCAN clustering on points assigned to each mask.
+    Step 4: Run clustering on points assigned to each mask.
     
     Args:
         sample_meta_data: Sample metadata
         sparse_points: Nx3 array of backprojected sparse depth points
         sam_masks: List of binary masks
         mask_assignments: N array assigning each point to a mask index
+        clustering_algorithm: One of {'hdbscan', 'dbscan', 'adaptive_dbscan'}
         dbscan_eps: DBSCAN eps parameter
-        dbscan_min_samples: DBSCAN min_samples parameter
+        dbscan_min_samples: DBSCAN/adaptive-DBSCAN min_samples parameter
         sparse_depth_map: Optional HxW sparse depth map from step 2. When provided,
                           best cluster per mask is selected by highest 2D IoU with the mask.
 
@@ -558,7 +665,10 @@ def step_4_clustering(
         # Get points assigned to this mask
         mask_points = sparse_points[mask_assignments == mask_idx]
         
-        if len(mask_points) < dbscan_min_samples:
+        min_required_points = dbscan_min_samples
+        if clustering_algorithm == "hdbscan":
+            min_required_points = max(hdbscan_min_samples, hdbscan_min_cluster_size)
+        if len(mask_points) < min_required_points:
             continue
         
         # Derive expected object volume for this mask from LLM/template dimensions
@@ -574,11 +684,26 @@ def step_4_clustering(
         length, width, height = float(dims[0]), float(dims[1]), float(dims[2])
         reference_volume = length * width * height
 
-        # Run DBSCAN clustering
+        # Run configured clustering algorithm
         clustering_manager = ClusteringManager(mask_points)
-        cluster_labels = clustering_manager.run_dbscan(
-            eps=dbscan_eps, min_samples=dbscan_min_samples
-        )
+        if clustering_algorithm == "hdbscan":
+            cluster_labels = clustering_manager.run_hdbscan(
+                min_cluster_size=hdbscan_min_cluster_size,
+                min_samples=hdbscan_min_samples,
+            )
+        elif clustering_algorithm == "adaptive_dbscan":
+            cluster_labels = clustering_manager.run_adaptive_dbscan(
+                base_eps=adaptive_dbscan_base_eps,
+                min_samples=dbscan_min_samples,
+                eps_growth_rate=adaptive_dbscan_eps_growth_rate,
+                reference_distance=adaptive_dbscan_reference_distance,
+                min_scale=adaptive_dbscan_min_scale,
+                max_scale=adaptive_dbscan_max_scale,
+            )
+        else:
+            cluster_labels = clustering_manager.run_dbscan(
+                eps=dbscan_eps, min_samples=dbscan_min_samples
+            )
 
         if filter_by_template_volume:
             keep_mask = filter_clusters_by_max_volume(
@@ -595,7 +720,7 @@ def step_4_clustering(
 
         filtered_mask_points_dict[mask_idx] = mask_points_filtered
 
-        if len(mask_points_filtered) < dbscan_min_samples:
+        if len(mask_points_filtered) < min_required_points:
             # Not enough points left for clustering/selection; use all remaining points
             best_cluster_points_dict[mask_idx] = mask_points_filtered
             unique_clusters = np.unique(cluster_labels)
@@ -618,8 +743,17 @@ def step_4_clustering(
             mask=mask,
             projection=projection,
             image_shape=(h, w),
+            cluster_labels=cluster_labels,
+            clustering_algorithm=clustering_algorithm,
             dbscan_eps=dbscan_eps,
             dbscan_min_samples=dbscan_min_samples,
+            adaptive_dbscan_base_eps=adaptive_dbscan_base_eps,
+            adaptive_dbscan_eps_growth_rate=adaptive_dbscan_eps_growth_rate,
+            adaptive_dbscan_reference_distance=adaptive_dbscan_reference_distance,
+            adaptive_dbscan_min_scale=adaptive_dbscan_min_scale,
+            adaptive_dbscan_max_scale=adaptive_dbscan_max_scale,
+            hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+            hdbscan_min_samples=hdbscan_min_samples,
             sparse_depth_map=sparse_depth_map,
         )
         
@@ -819,12 +953,16 @@ def step_5_detection_pose_estimation(
 # Pipeline Orchestrator
 # ============================================================================
 
-def run_full_pipeline(params: Dict) -> Dict:
+def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) -> Dict:
     """
     Run the full detection pipeline from start to finish.
     
     Args:
         params: Dictionary with all pipeline parameters
+        preloaded_bbox_data: Raw bbox annotation dict (as exported by 4_Export).
+            When provided, Step 3 builds masks from these bboxes instead of
+            running SAM.  Built *after* Step 2 so that mask_assignments use
+            the correct sparse-depth points and projection.
     
     Returns:
         Dict with results from all steps
@@ -851,24 +989,33 @@ def run_full_pipeline(params: Dict) -> Dict:
     results['step_2'] = {'completed': True, 'result': step_2_result}
     st.session_state.pipeline_state['step_2'] = results['step_2']
     
-    # Step 3: SAM segmentation
-    class_names = params.get('class_names', [])
-    if not class_names:
-        class_names = ['car', 'person', 'bicycle']  # Default classes
-    print(f'class_names: {class_names}')
-    step_3_result = step_3_sam_segmentation(
-        sample_meta_data=st.session_state.sample['sample_meta_data'],
-        image=st.session_state.sample['image'],
-        sparse_points=step_2_result['colored_sparse_points'],
-        class_names=class_names,
-        sam_model_type=params.get('sam_model_type', 'sam2_t'),
-        yolo_model_path=params.get('yolo_model_path', None),
-        conf_threshold=params.get('yolo_conf_threshold', 0.25),
-        open_vocab_detector=params.get('open_vocab_detector', 'yolo'),
-        grounding_dino_model_id=params.get('grounding_dino_model_id'),
-        use_gpu=params.get('use_gpu', True),
-        projection=step_2_result['projection'],
-    )
+    # Step 3: SAM segmentation (or preloaded bbox annotations)
+    if preloaded_bbox_data is not None:
+        step_3_result = _build_step3_from_bboxes(
+            bbox_data=preloaded_bbox_data,
+            image=st.session_state.sample['image'],
+            sparse_points=step_2_result['colored_sparse_points'],
+            sample_meta_data=st.session_state.sample['sample_meta_data'],
+            projection=step_2_result['projection'],
+        )
+    else:
+        class_names = params.get('class_names', [])
+        if not class_names:
+            class_names = ['car', 'person', 'bicycle']
+        print(f'class_names: {class_names}')
+        step_3_result = step_3_sam_segmentation(
+            sample_meta_data=st.session_state.sample['sample_meta_data'],
+            image=st.session_state.sample['image'],
+            sparse_points=step_2_result['colored_sparse_points'],
+            class_names=class_names,
+            sam_model_type=params.get('sam_model_type', 'sam2_t'),
+            yolo_model_path=params.get('yolo_model_path', None),
+            conf_threshold=params.get('yolo_conf_threshold', 0.25),
+            open_vocab_detector=params.get('open_vocab_detector', 'yolo'),
+            grounding_dino_model_id=params.get('grounding_dino_model_id'),
+            use_gpu=params.get('use_gpu', True),
+            projection=step_2_result['projection'],
+        )
     results['step_3'] = {'completed': True, 'result': step_3_result}
     st.session_state.pipeline_state['step_3'] = results['step_3']
     
@@ -910,6 +1057,7 @@ def _run_pipeline_for_batch_sample(
     tracker: Optional[ObjectTracker],
     frame_index: int,
     prev_image: Optional[np.ndarray] = None,
+    preloaded_bbox_data: Optional[Dict] = None,
 ) -> Optional[Dict]:
     """Load one sample, run full pipeline, update tracker, return export_results for Export page."""
     print(
@@ -960,9 +1108,14 @@ def _run_pipeline_for_batch_sample(
                 else:
                     ensure_detection_params(st.session_state.params)
                 st.session_state.params["bag_freq_hz"] = float(detected_freq)
+    if preloaded_bbox_data is not None:
+        st.session_state["_bbox_load_frame_index"] = frame_index
     try:
         print("[batch] running full pipeline")
-        results = run_full_pipeline(st.session_state.params)
+        results = run_full_pipeline(
+            st.session_state.params,
+            preloaded_bbox_data=preloaded_bbox_data,
+        )
         print("[batch] pipeline finished")
     except Exception as e:
         print(f"[batch] run_full_pipeline raised exception: {e}")
@@ -989,7 +1142,7 @@ def _run_pipeline_for_batch_sample(
             "pipeline_params": st.session_state.params.copy() if "params" in st.session_state else {},
         },
     }
-    if dataset_type_lower in ("kitti", "sim"):
+    if dataset_type_lower in ("kitti", "sim", "sunrgbd"):
         # Always write ground_truth_cuboids (even empty list) for annotated dataset types.
         # An absent key means "no GT available"; an empty list means "GT available, empty scene".
         # This ensures filtered frames with zero annotations still contribute FPs to AP.
@@ -1027,31 +1180,46 @@ def _run_pipeline_for_batch_sample(
                 f"[batch] step_3_result: "
                 f"n_masks={len(sam_masks)}, n_class_names={len(class_names)}"
             )
-            image_track_mode = st.session_state.params.get("image_track_mode", "appearance")
-            if image_track_mode == "deepsort":
-                mask_to_track = tracker.track_on_image_deepsort(
+            loaded_ids = step_3_result.get("loaded_instance_ids")
+            if loaded_ids and any(iid is not None for iid in loaded_ids):
+                mask_to_track: Dict[int, int] = {
+                    i: int(iid) for i, iid in enumerate(loaded_ids) if iid is not None
+                }
+                print(f"[batch] using loaded instance IDs as mask_to_track: {mask_to_track}")
+                tracker.apply_external_image_tracks(
                     frame_index=frame_index,
                     image=image,
                     masks=sam_masks,
                     class_names=class_names,
                     meta=meta,
-                )
-            elif image_track_mode == "bytetrack":
-                mask_to_track = tracker.track_on_image_bytetrack(
-                    frame_index=frame_index,
-                    image=image,
-                    masks=sam_masks,
-                    class_names=class_names,
-                    meta=meta,
+                    mask_to_track=mask_to_track,
                 )
             else:
-                mask_to_track = tracker.track_on_image(
-                    frame_index=frame_index,
-                    image=image,
-                    masks=sam_masks,
-                    class_names=class_names,
-                    meta=meta,
-                )
+                image_track_mode = st.session_state.params.get("image_track_mode", "appearance")
+                if image_track_mode == "deepsort":
+                    mask_to_track = tracker.track_on_image_deepsort(
+                        frame_index=frame_index,
+                        image=image,
+                        masks=sam_masks,
+                        class_names=class_names,
+                        meta=meta,
+                    )
+                elif image_track_mode == "bytetrack":
+                    mask_to_track = tracker.track_on_image_bytetrack(
+                        frame_index=frame_index,
+                        image=image,
+                        masks=sam_masks,
+                        class_names=class_names,
+                        meta=meta,
+                    )
+                else:
+                    mask_to_track = tracker.track_on_image(
+                        frame_index=frame_index,
+                        image=image,
+                        masks=sam_masks,
+                        class_names=class_names,
+                        meta=meta,
+                    )
             tracker.match_tracks_with_3d_detections(
                 frame_index=frame_index,
                 detected_cuboids=step_5_result["detected_cuboids"],
@@ -1222,12 +1390,95 @@ def main():
         )
     
     with st.sidebar.expander("Clustering (Step 4)", expanded=False):
+        _clustering = st.session_state.params['clustering']
+        _algo_options = ["adaptive_dbscan", "hdbscan", "dbscan"]
+        _algo_labels = {
+            "adaptive_dbscan": "Adaptive DBSCAN (distance-aware eps)",
+            "hdbscan": "HDBSCAN",
+            "dbscan": "DBSCAN",
+        }
+        _current_algo = _clustering.get("clustering_algorithm", "adaptive_dbscan")
+        if _current_algo not in _algo_options:
+            _current_algo = "adaptive_dbscan"
+        _algo_index = _algo_options.index(_current_algo)
+        _selected_algo_label = st.selectbox(
+            "Clustering Algorithm",
+            options=[_algo_labels[a] for a in _algo_options],
+            index=_algo_index,
+            help="Use adaptive DBSCAN for near/far objects with different local densities."
+        )
+        _selected_algo = _algo_options[[_algo_labels[a] for a in _algo_options].index(_selected_algo_label)]
+        _clustering["clustering_algorithm"] = _selected_algo
+
         st.session_state.params['clustering']['dbscan_eps'] = st.slider(
-            "DBSCAN Eps", 0.1, 2.0, 0.1, 0.1
+            "DBSCAN Eps", 0.1, 2.0, 0.2, 0.1
         )
         st.session_state.params['clustering']['dbscan_min_samples'] = st.slider(
             "Min Samples", 3, 20, 5, 1
         )
+        if _selected_algo == "hdbscan":
+            _clustering["hdbscan_min_cluster_size"] = st.slider(
+                "HDBSCAN Min Cluster Size",
+                3,
+                50,
+                int(_clustering.get("hdbscan_min_cluster_size", 5)),
+                1
+            )
+            _clustering["hdbscan_min_samples"] = st.slider(
+                "HDBSCAN Min Samples",
+                1,
+                30,
+                int(_clustering.get("hdbscan_min_samples", 5)),
+                1
+            )
+        elif _selected_algo == "adaptive_dbscan":
+            _clustering["adaptive_dbscan_base_eps"] = st.slider(
+                "Adaptive DBSCAN Base Eps",
+                0.05,
+                1.5,
+                float(_clustering.get("adaptive_dbscan_base_eps", 0.35)),
+                0.05
+            )
+            _clustering["adaptive_dbscan_eps_growth_rate"] = st.slider(
+                "Adaptive Eps Growth Rate",
+                0.0,
+                3.0,
+                float(_clustering.get("adaptive_dbscan_eps_growth_rate", 1.0)),
+                0.1,
+                help=(
+                    "Scales how much per-point neighborhood size varies with 3D range "
+                    "relative to the median range of *this* point set. Larger values "
+                    "spread scale within a mask (e.g. roof vs base), so clustering "
+                    "reacts more to this slider. Uses 3D distance so vertical gaps "
+                    "shrink like horizontal ones after warping."
+                ),
+            )
+            _clustering["adaptive_dbscan_reference_distance"] = st.slider(
+                "Adaptive Reference Distance (m)",
+                5.0,
+                60.0,
+                float(_clustering.get("adaptive_dbscan_reference_distance", 15.0)),
+                1.0,
+                help=(
+                    "Denominator for growth: same (r - median r) in meters produces "
+                    "smaller scale changes when this is larger. Lower it if the "
+                    "growth slider feels too weak."
+                ),
+            )
+            _clustering["adaptive_dbscan_min_scale"] = st.slider(
+                "Adaptive Min Scale",
+                0.4,
+                2.0,
+                float(_clustering.get("adaptive_dbscan_min_scale", 0.7)),
+                0.1
+            )
+            _clustering["adaptive_dbscan_max_scale"] = st.slider(
+                "Adaptive Max Scale",
+                1.0,
+                8.0,
+                float(_clustering.get("adaptive_dbscan_max_scale", 4.0)),
+                0.1
+            )
         st.session_state.params['clustering']['volume_factor'] = st.slider(
             "Max Cluster Volume Factor",
             0.5, 5.0, 1.1, 0.1,
@@ -1507,6 +1758,38 @@ def main():
         st.subheader("📚 Batch Processing")
         total = len(batch_samples)
         st.info(f"Batch loaded: **{total}** samples. Process the entire batch to run detection on all samples.")
+
+        with st.expander("📂 Load 2D bounding-box annotations for batch (Step 3 override)", expanded=False):
+            st.caption(
+                "Upload a bbox_only or bbox_tracking JSON file exported from **4_Export**. "
+                "When provided, Step 3 (SAM segmentation) is replaced by the loaded bounding boxes for each frame. "
+                "If the file contains tracking instance IDs, they are used directly for cross-frame tracking."
+            )
+            batch_bbox_file = st.file_uploader(
+                "Upload bbox annotation JSON for batch",
+                type=["json"],
+                key="step3_bbox_upload_batch",
+            )
+            batch_bbox_data: Optional[Dict] = None
+            if batch_bbox_file is not None:
+                batch_bbox_data = json.loads(batch_bbox_file.read())
+                st.session_state["_batch_bbox_data"] = batch_bbox_data
+                bbox_fmt = batch_bbox_data.get("format", "bbox_only")
+                if bbox_fmt == "bbox_tracking":
+                    n_frames_file = len(batch_bbox_data.get("frames", []))
+                    st.info(
+                        f"Tracking file loaded with **{n_frames_file}** frames. "
+                        f"Batch has **{total}** samples — annotations will be matched by frame index."
+                    )
+                else:
+                    n_ann = len(batch_bbox_data.get("annotations", []))
+                    st.info(
+                        f"Single-frame bbox file loaded with **{n_ann}** annotations. "
+                        "The same annotations will be applied to every frame in the batch."
+                    )
+            else:
+                batch_bbox_data = st.session_state.get("_batch_bbox_data")
+
         if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
             do_batch_tracking = st.session_state.get("batch_process_enable_tracking", True)
             print(
@@ -1540,6 +1823,7 @@ def main():
                     tracker=tracker,
                     frame_index=i,
                     prev_image=prev_image,
+                    preloaded_bbox_data=batch_bbox_data,
                 )
                 prev_image = st.session_state.sample.get("image") if "sample" in st.session_state else None
                 if export_res is not None:
@@ -1624,7 +1908,7 @@ def main():
                         'pipeline_params': st.session_state.params.copy() if 'params' in st.session_state else {}
                     }
                 }
-                if dataset_type in ('kitti', 'sim'):
+                if dataset_type in ('kitti', 'sim', 'sunrgbd'):
                     ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
                     ground_truth_cuboids = []
                     for gt_box in ground_truth_boxes:
@@ -1982,7 +2266,53 @@ def main():
                             'error': str(e)
                         }
                         st.error(f"Step 3 failed: {str(e)}")
-        
+
+        # -- Load 2D bbox annotation file as alternative to running SAM --
+        with st.expander("📂 Load 2D bounding-box annotations from file", expanded=False):
+            st.caption(
+                "Upload a JSON file exported from **4_Export** (bbox_only or bbox_tracking format) "
+                "to populate Step 3 without running SAM."
+            )
+            uploaded_bbox_file = st.file_uploader(
+                "Upload bbox annotation JSON",
+                type=["json"],
+                key="step3_bbox_upload_single",
+            )
+            if uploaded_bbox_file is not None and step_2_completed:
+                bbox_data = json.loads(uploaded_bbox_file.read())
+                bbox_fmt = bbox_data.get("format", "bbox_only")
+                frame_idx_for_load = 0
+                if bbox_fmt == "bbox_tracking":
+                    n_frames_avail = len(bbox_data.get("frames", []))
+                    frame_idx_for_load = st.number_input(
+                        "Frame index to load",
+                        min_value=0,
+                        max_value=max(0, n_frames_avail - 1),
+                        value=0,
+                        key="step3_bbox_frame_idx_single",
+                    )
+                    st.info(f"Tracking file detected with **{n_frames_avail}** frames.")
+                if st.button("📥 Load annotations into Step 3", key="load_bbox_step3_single"):
+                    st.session_state["_bbox_load_frame_index"] = int(frame_idx_for_load)
+                    step_2_result = st.session_state.pipeline_state['step_2']['result']
+                    result = _build_step3_from_bboxes(
+                        bbox_data=bbox_data,
+                        image=image,
+                        sparse_points=step_2_result['colored_sparse_points'],
+                        sample_meta_data=sample_meta_data,
+                        projection=step_2_result['projection'],
+                    )
+                    st.session_state.pipeline_state['step_3'] = {
+                        'completed': True,
+                        'result': result,
+                        'time': result['time'],
+                        'error': result.get('error'),
+                    }
+                    loaded_ids = result.get("loaded_instance_ids")
+                    if loaded_ids:
+                        st.session_state["_loaded_bbox_instance_ids"] = loaded_ids
+                    st.rerun()
+
         if step_3_state['completed'] and not step_3_state.get('error'):
             result = step_3_state['result']
             detected_classes = result.get('class_names', [])
@@ -2122,7 +2452,7 @@ def main():
         with col1:
             status_icon = "✅" if step_4_state['completed'] else "⏸️"
             st.markdown(f"### {status_icon} Step 4: Clustering")
-            st.caption("Run DBSCAN clustering on points assigned to each mask")
+            st.caption("Run selected clustering algorithm on points assigned to each mask")
             if not step_3_completed:
                 st.warning("⚠️ Requires Step 3")
         
@@ -2350,7 +2680,7 @@ def main():
                         }
                         
                         # Add ground truth cuboids for annotated dataset types (KITTI and sim).
-                        if dataset_type in ('kitti', 'sim'):
+                        if dataset_type in ('kitti', 'sim', 'sunrgbd'):
                             ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
                             ground_truth_cuboids = []
                             for gt_box in ground_truth_boxes:

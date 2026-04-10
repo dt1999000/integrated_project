@@ -273,9 +273,9 @@ def _render_batch_eval():
     with col2:
         st.metric("AP_25  (IoU ≥ 0.25)", f"{ap_25['ap'] * 100:.1f}%")
     with col3:
-        st.metric("Precision@0.5", f"{ap_50['precision'] * 100:.1f}%")
+        st.metric("Precision@0.25", f"{ap_25['precision'] * 100:.1f}%")
     with col4:
-        st.metric("Recall@0.5", f"{ap_50['recall'] * 100:.1f}%")
+        st.metric("Recall@0.25", f"{ap_25['recall'] * 100:.1f}%")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:

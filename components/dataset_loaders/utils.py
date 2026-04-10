@@ -15,6 +15,7 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from .kitti_dataset_loader import KITTIDatasetLoader
 from .nuscenes_dataset_loader import NuScenesDatasetLoader
+from .sunrgbd_dataset_loader import SUNRGBDDatasetLoader
 from .dataset_loader import LinkedDataHandler
 
 
@@ -26,12 +27,13 @@ def detect_dataset_type(dataset_path: str) -> Optional[str]:
     1. LinkedDataHandler/sim: Check for dataset.json in root
     2. KITTI: Check for training/ or testing/ with image_2/, velodyne/, calib/
     3. nuScenes: Check for samples/, sweeps/, v1.0-*/ folders
+    4. SUNRGBD: Check for nested scenes with intrinsics.txt + image/ + depth_bfx/
     
     Args:
         dataset_path: Root directory of the dataset
         
     Returns:
-        Dataset type: 'kitti', 'nuscenes', 'sim', or None if cannot determine
+        Dataset type: 'kitti', 'nuscenes', 'sim', 'sunrgbd', or None if cannot determine
     """
     dataset_path = Path(dataset_path)
     
@@ -74,6 +76,16 @@ def detect_dataset_type(dataset_path: str) -> Optional[str]:
     
     if has_samples and (has_sweeps or has_v1):
         return "nuscenes"
+
+    # Check for SUNRGBD structure
+    # Typical root includes sensor folders (kv1, kv2, realsense, xtion) and many
+    # scene directories that each contain intrinsics.txt, image/, and depth_bfx/.
+    has_sensor_dirs = any((dataset_path / name).exists() for name in ["kv1", "kv2", "realsense", "xtion"])
+    has_intrinsics = any(dataset_path.glob("**/intrinsics.txt"))
+    has_rgb_scene = any(dataset_path.glob("**/image/*.jpg")) or any(dataset_path.glob("**/image/*.png"))
+    has_depth_scene = any(dataset_path.glob("**/depth_bfx/*.png"))
+    if has_sensor_dirs and has_intrinsics and has_rgb_scene and has_depth_scene:
+        return "sunrgbd"
     
     return None
 
@@ -85,7 +97,7 @@ def load_dataset_sample(
     filter_forward_only: bool = True
 ) -> Tuple[Optional[Dict], Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Load sample from dataset (KITTI, nuScenes, or sim format).
+    Load sample from dataset (KITTI, nuScenes, sim, or SUNRGBD format).
     
     Note: This function does NOT remove ground plane. Ground plane removal
     should be done in the detection pipeline (Step 1).
@@ -93,7 +105,7 @@ def load_dataset_sample(
     Args:
         dataset_path: Root directory of dataset
         sample_index: Index or token of sample to load (int for KITTI, str for nuScenes/sim)
-        dataset_type: 'kitti', 'nuscenes', 'sim', or None (auto-detect)
+        dataset_type: 'kitti', 'nuscenes', 'sim', 'sunrgbd', or None (auto-detect)
         filter_forward_only: Whether to keep only forward-facing points (x > 0) - for KITTI
         
     Returns:
@@ -114,6 +126,8 @@ def load_dataset_sample(
         return _load_nuscenes_sample(dataset_path, sample_index)
     elif dataset_type == "sim":
         return _load_sim_sample(dataset_path, sample_index)
+    elif dataset_type == "sunrgbd":
+        return _load_sunrgbd_sample(dataset_path, sample_index)
     elif dataset_type == "rosbag":
         # For rosbag we expect dataset_path to point to an extracted folder
         # produced by components.dataset_loaders.rosbag_extractor.extract_bag_to_folder.
@@ -463,6 +477,44 @@ def _load_sim_sample(
         import traceback
         traceback.print_exc()
         return None, None, None
+
+
+def _load_sunrgbd_sample(
+    dataset_path: str,
+    sample_index: int
+) -> Tuple[Optional[Dict], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Load SUNRGBD sample and reconstruct point cloud from RGB-D."""
+    loader = SUNRGBDDatasetLoader(dataroot=str(dataset_path))
+    loader.load_dataset()
+    sample_data = loader.load_sunrgbd_data(sample_index=int(sample_index))
+
+    image_path = sample_data["image_path"]
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"Error: Could not load image from {image_path}")
+        return None, None, None
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    point_cloud = sample_data["point_cloud"]
+    if point_cloud is None or len(point_cloud) == 0:
+        print(f"Error: Reconstructed SUNRGBD point cloud is empty for sample {sample_index}")
+        return None, None, None
+
+    sample_meta_data = {
+        "image_path": sample_data["image_path"],
+        "point_cloud_path": sample_data["depth_path"],
+        "camera_intrinsic": sample_data["camera_intrinsic"],
+        "camera_extrinsic": sample_data.get("camera_extrinsic", np.eye(4)),
+        "camera_to_lidar_transform": sample_data["camera_to_lidar_transform"],
+        "ground_truth_boxes": sample_data.get("ground_truth_boxes", []),
+        "sample_index": int(sample_index),
+        "dataset_type": "sunrgbd",
+        "scene_id": sample_data.get("scene_id"),
+        "depth_scale": sample_data.get("depth_scale", 10000.0),
+        "image_shape": image_rgb.shape[:2],
+    }
+
+    return sample_meta_data, image_rgb, point_cloud
 
 
 def _load_rosbag_sample(

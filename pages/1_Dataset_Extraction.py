@@ -11,6 +11,7 @@ from typing import Optional, Dict, List, Tuple, Any
 from components.dataset_loaders.utils import detect_dataset_type, load_dataset_sample
 from components.dataset_loaders.dataset_loader import LinkedDataHandler
 from components.dataset_loaders.nuscenes_dataset_loader import NuScenesDatasetLoader
+from components.dataset_loaders.sunrgbd_dataset_loader import SUNRGBDDatasetLoader
 from components.dataset_loaders.rosbag_extractor import (
     get_image_topics as get_ros_image_topics,
     get_pointcloud_topics as get_ros_pointcloud_topics,
@@ -345,6 +346,7 @@ def main():
                 - **KITTI**: `training/` or `testing/` with `image_2/`, `velodyne/`, `calib/`
                 - **nuScenes**: `samples/`, `sweeps/`, `v1.0-*/` folders
                 - **sim**: `dataset.json` file in root directory
+                - **SUNRGBD**: sensor folders (`kv1/kv2/realsense/xtion`) with scene subfolders containing `image/`, `depth_bfx/`, `intrinsics.txt`
                 """)
         else:
             st.error(f"❌ Path does not exist: {dataset_path}")
@@ -621,6 +623,45 @@ def main():
                     st.success(f"✅ Prepared {len(batch_samples)} nuScenes samples. Go to **2_Detection** and click **Process entire batch**.")
                     st.rerun()
         
+        elif dataset_type == "sunrgbd":
+            loader = SUNRGBDDatasetLoader(dataroot=str(dataset_path))
+            sun_samples = loader.load_dataset()
+            num_samples = len(sun_samples)
+            if num_samples == 0:
+                st.error("❌ No SUNRGBD samples found (expected scenes with image/depth_bfx/intrinsics.txt).")
+            else:
+                st.info(f"SUNRGBD detected with {num_samples} indexed scenes.")
+                sample_index = st.number_input(
+                    "Sample Index",
+                    min_value=0,
+                    max_value=max(0, num_samples - 1),
+                    value=0,
+                    help=f"Select SUNRGBD scene index (0 to {num_samples - 1})",
+                )
+                if st.button("🔄 Load Sample", key="load_sunrgbd_sample"):
+                    with st.spinner(f"Loading SUNRGBD sample {sample_index}..."):
+                        sample_meta_data, image, point_cloud = load_dataset_sample(
+                            dataset_path=dataset_path,
+                            sample_index=int(sample_index),
+                            dataset_type=dataset_type
+                        )
+                        if sample_meta_data and image is not None and point_cloud is not None:
+                            sun_gt = sample_meta_data.get("ground_truth_boxes", [])
+                            st.session_state.sample = {
+                                "sample_meta_data": sample_meta_data,
+                                "image": image,
+                                "point_cloud": point_cloud
+                            }
+                            st.session_state.ground_truth_annotations = sun_gt
+                            st.session_state.ground_truth_2d_boxes = [
+                                box for box in sun_gt if box.get("bbox_2d") is not None
+                            ]
+                            st.session_state.process_all_samples = False
+                            st.success(f"✅ SUNRGBD sample {sample_index} loaded successfully!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Failed to load SUNRGBD sample")
+
         elif dataset_type == "rosbag":
             # ROS bag: configure topics, filter frames, then extract and load batch
             st.info("ROS bag detected. Configure topics and filters, then process the bag into samples.")
