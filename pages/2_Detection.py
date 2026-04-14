@@ -1056,6 +1056,7 @@ def _run_pipeline_for_batch_sample(
     sample_index,
     tracker: Optional[ObjectTracker],
     frame_index: int,
+    sample_desc: Optional[Dict[str, Any]] = None,
     prev_image: Optional[np.ndarray] = None,
     preloaded_bbox_data: Optional[Dict] = None,
 ) -> Optional[Dict]:
@@ -1065,12 +1066,49 @@ def _run_pipeline_for_batch_sample(
         f"dataset_path={dataset_path}, dataset_type={dataset_type}, "
         f"sample_index={sample_index}, frame_index={frame_index}"
     )
-    meta, image, point_cloud = load_dataset_sample(
-        dataset_path=dataset_path,
-        sample_index=sample_index,
-        dataset_type=dataset_type,
-        filter_forward_only=False,
+    image_path_from_desc = ""
+    point_cloud_path_from_desc = ""
+    if sample_desc is not None:
+        image_path_from_desc = str(sample_desc.get("image_path", "") or "")
+        point_cloud_path_from_desc = str(sample_desc.get("point_cloud_path", "") or "")
+
+    use_saved_sunrgbd_files = (
+        str(dataset_type).lower() == "sunrgbd"
+        and image_path_from_desc != ""
+        and point_cloud_path_from_desc != ""
+        and Path(image_path_from_desc).exists()
+        and Path(point_cloud_path_from_desc).exists()
     )
+
+    if use_saved_sunrgbd_files:
+        image_bgr = cv2.imread(image_path_from_desc)
+        if image_bgr is None:
+            return None
+        image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        pcd = o3d.io.read_point_cloud(point_cloud_path_from_desc)
+        point_cloud = np.asarray(pcd.points)
+        if point_cloud.size == 0:
+            return None
+
+        # Keep SUNRGBD metadata/annotations from the dataset loader, but override file paths
+        # so exports and downstream pages reuse the saved files.
+        meta, _, _ = load_dataset_sample(
+            dataset_path=dataset_path,
+            sample_index=sample_index,
+            dataset_type=dataset_type,
+            filter_forward_only=False,
+        )
+        if meta is None:
+            return None
+        meta["image_path"] = image_path_from_desc
+        meta["point_cloud_path"] = point_cloud_path_from_desc
+    else:
+        meta, image, point_cloud = load_dataset_sample(
+            dataset_path=dataset_path,
+            sample_index=sample_index,
+            dataset_type=dataset_type,
+            filter_forward_only=False,
+        )
     if meta is None or image is None or point_cloud is None:
         print(
             f"[batch] load_dataset_sample returned None "
@@ -1822,6 +1860,7 @@ def main():
                     sample_index=sample_desc["sample_index"],
                     tracker=tracker,
                     frame_index=i,
+                    sample_desc=sample_desc,
                     prev_image=prev_image,
                     preloaded_bbox_data=batch_bbox_data,
                 )

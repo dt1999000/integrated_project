@@ -336,7 +336,7 @@ class SAMIntegration:
                 bboxes=[bbox_prompt],
                 device=0 if self.use_gpu else "cpu",
             )
-            print(f'results: {results}', flush=True)
+            #print(f'results: {results}', flush=True)
             if results and len(results) > 0:
                 result = results[0] if isinstance(results, list) else results
                 masks_obj = getattr(result, "masks", None)
