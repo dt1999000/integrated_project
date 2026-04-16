@@ -232,6 +232,11 @@ def _ground_removal_kwargs(params: Dict, point_cloud: np.ndarray) -> Dict:
     return dict(params["pipeline"])
 
 
+def _default_use_ground_plane_removal(sample_meta_data: Optional[Dict[str, Any]]) -> bool:
+    dataset_type = ((sample_meta_data or {}).get("dataset_type") or "").lower()
+    return dataset_type != "sunrgbd"
+
+
 # ============================================================================
 # Pipeline Step Functions
 # ============================================================================
@@ -243,6 +248,7 @@ def step_1_ground_plane_removal(
     num_iterations: int = 1000,
     filter_forward_only: bool = False,
     camera_to_lidar_transform: Optional[np.ndarray] = None,
+    use_ground_plane_removal: bool = True,
 ) -> Dict:
     """
     Step 1: Remove ground plane from point cloud using RANSAC.
@@ -257,6 +263,8 @@ def step_1_ground_plane_removal(
             LiDAR coordinates; otherwise it falls back to x > 0.
         camera_to_lidar_transform: Optional 4x4 camera-to-LiDAR transform used
             when filter_forward_only is True to define the forward direction.
+        use_ground_plane_removal: If False, Step 1 is marked completed while
+            keeping the original point cloud unchanged.
     
     Returns:
         Dict with 'point_cloud_obj', 'ground_plane_model', 'ground_z'
@@ -266,23 +274,31 @@ def step_1_ground_plane_removal(
     # Create PointCloud object
     point_cloud_obj = PointCloud(point_cloud)
     print(f"Point cloud object created with {len(point_cloud_obj.original_point_cloud)} points")
-    # Remove ground plane
-    point_cloud_obj.remove_ground_plane_ransac(
-        distance_threshold=distance_threshold,
-        ransac_n=ransac_n,
-        num_iterations=num_iterations,
-        filter_forward_only=filter_forward_only,
-        camera_to_lidar_transform=camera_to_lidar_transform,
-    )
-    print(f"Ground plane removed with {len(point_cloud_obj.point_cloud_plane_removed)} points remaining")
-    # Get ground_z at origin
-    ground_z = point_cloud_obj.get_ground_z(x=0.0, y=0.0)
+    if use_ground_plane_removal:
+        # Remove ground plane
+        point_cloud_obj.remove_ground_plane_ransac(
+            distance_threshold=distance_threshold,
+            ransac_n=ransac_n,
+            num_iterations=num_iterations,
+            filter_forward_only=filter_forward_only,
+            camera_to_lidar_transform=camera_to_lidar_transform,
+        )
+        print(f"Ground plane removed with {len(point_cloud_obj.point_cloud_plane_removed)} points remaining")
+        # Get ground_z at origin
+        ground_z = point_cloud_obj.get_ground_z(x=0.0, y=0.0)
+        ground_plane_model = point_cloud_obj.ground_plane_model
+    else:
+        point_cloud_obj.ground_removed = True
+        point_cloud_obj.point_cloud_plane_removed = point_cloud_obj.original_point_cloud.copy()
+        print(f"Ground plane removal skipped with {len(point_cloud_obj.point_cloud_plane_removed)} points")
+        ground_z = None
+        ground_plane_model = None
     
     elapsed_time = time.time() - start_time
     
     return {
         'point_cloud_obj': point_cloud_obj,
-        'ground_plane_model': point_cloud_obj.ground_plane_model,
+        'ground_plane_model': ground_plane_model,
         'ground_z': ground_z,
         'points_remaining': len(point_cloud_obj.point_cloud_plane_removed),
         'time': elapsed_time
@@ -970,11 +986,13 @@ def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) 
     results = {}
     raw_pc = st.session_state.sample["point_cloud"]
     ground_kw = _ground_removal_kwargs(params, raw_pc)
+    use_ground_plane_removal = bool(st.session_state.get("use_ground_plane_removal", True))
 
     # Step 1: Ground plane removal
     if 'step_1' not in results or not results['step_1'].get('completed', False):
         step_1_result = step_1_ground_plane_removal(
             point_cloud=st.session_state.sample['point_cloud'],
+            use_ground_plane_removal=use_ground_plane_removal,
             **ground_kw
         )
         results['step_1'] = {'completed': True, 'result': step_1_result}
@@ -1056,9 +1074,10 @@ def _run_pipeline_for_batch_sample(
     sample_index,
     tracker: Optional[ObjectTracker],
     frame_index: int,
-    sample_desc: Optional[Dict[str, Any]] = None,
     prev_image: Optional[np.ndarray] = None,
     preloaded_bbox_data: Optional[Dict] = None,
+    saved_image_path: str = "",
+    saved_point_cloud_path: str = "",
 ) -> Optional[Dict]:
     """Load one sample, run full pipeline, update tracker, return export_results for Export page."""
     print(
@@ -1066,49 +1085,23 @@ def _run_pipeline_for_batch_sample(
         f"dataset_path={dataset_path}, dataset_type={dataset_type}, "
         f"sample_index={sample_index}, frame_index={frame_index}"
     )
-    image_path_from_desc = ""
-    point_cloud_path_from_desc = ""
-    if sample_desc is not None:
-        image_path_from_desc = str(sample_desc.get("image_path", "") or "")
-        point_cloud_path_from_desc = str(sample_desc.get("point_cloud_path", "") or "")
-
-    use_saved_sunrgbd_files = (
-        str(dataset_type).lower() == "sunrgbd"
-        and image_path_from_desc != ""
-        and point_cloud_path_from_desc != ""
-        and Path(image_path_from_desc).exists()
-        and Path(point_cloud_path_from_desc).exists()
+    use_saved_media_paths = (
+        dataset_type.lower() == "sunrgbd"
+        and bool(st.session_state.get("batch_samples_saved"))
     )
-
-    if use_saved_sunrgbd_files:
-        image_bgr = cv2.imread(image_path_from_desc)
-        if image_bgr is None:
-            return None
-        image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        pcd = o3d.io.read_point_cloud(point_cloud_path_from_desc)
-        point_cloud = np.asarray(pcd.points)
-        if point_cloud.size == 0:
-            return None
-
-        # Keep SUNRGBD metadata/annotations from the dataset loader, but override file paths
-        # so exports and downstream pages reuse the saved files.
-        meta, _, _ = load_dataset_sample(
-            dataset_path=dataset_path,
-            sample_index=sample_index,
-            dataset_type=dataset_type,
-            filter_forward_only=False,
-        )
-        if meta is None:
-            return None
-        meta["image_path"] = image_path_from_desc
-        meta["point_cloud_path"] = point_cloud_path_from_desc
-    else:
-        meta, image, point_cloud = load_dataset_sample(
-            dataset_path=dataset_path,
-            sample_index=sample_index,
-            dataset_type=dataset_type,
-            filter_forward_only=False,
-        )
+    print(f'st.session_state.get("batch_samples_saved"): {st.session_state.get("batch_samples_saved")}')
+    print(f'dataset_type.lower(): {dataset_type.lower()}')
+    print(f'bool(st.session_state.get("batch_samples_saved")): {bool(st.session_state.get("batch_samples_saved"))}')
+    print(f"use_saved_media_paths: {use_saved_media_paths}")
+    meta, image, point_cloud = load_dataset_sample(
+        dataset_path=dataset_path,
+        sample_index=sample_index,
+        dataset_type=dataset_type,
+        filter_forward_only=False,
+        use_saved_media_paths=use_saved_media_paths,
+        saved_image_path=saved_image_path,
+        saved_point_cloud_path=saved_point_cloud_path,
+    )
     if meta is None or image is None or point_cloud is None:
         print(
             f"[batch] load_dataset_sample returned None "
@@ -1117,6 +1110,13 @@ def _run_pipeline_for_batch_sample(
             f"point_cloud is None: {point_cloud is None})"
         )
         return None
+
+    if use_saved_media_paths:
+        print(
+            f"[batch] requested saved SUNRGBD media "
+            f"(image={saved_image_path}, pcd={saved_point_cloud_path})"
+        )
+
     print(
         f"[batch] loaded sample: "
         f"image_shape={image.shape if hasattr(image, 'shape') else 'n/a'}, "
@@ -1325,6 +1325,20 @@ def main():
         "Save processed sample to disk",
         value=st.session_state.get("save_processed_samples", False),
     )
+    sidebar_sample_meta = (st.session_state.get("sample") or {}).get("sample_meta_data", {})
+    sidebar_dataset_type = (sidebar_sample_meta.get("dataset_type") or "").lower()
+    if "ground_plane_toggle_dataset_type" not in st.session_state:
+        st.session_state["ground_plane_toggle_dataset_type"] = sidebar_dataset_type
+        st.session_state["use_ground_plane_removal"] = _default_use_ground_plane_removal(sidebar_sample_meta)
+    elif st.session_state["ground_plane_toggle_dataset_type"] != sidebar_dataset_type:
+        st.session_state["ground_plane_toggle_dataset_type"] = sidebar_dataset_type
+        st.session_state["use_ground_plane_removal"] = _default_use_ground_plane_removal(sidebar_sample_meta)
+
+    st.session_state["use_ground_plane_removal"] = st.sidebar.checkbox(
+        "Use ground plane removal (RANSAC)",
+        value=st.session_state.get("use_ground_plane_removal", True),
+        help="Disable this for datasets/scenes where keeping all points is preferred (e.g., SUNRGBD).",
+    )
     
     with st.sidebar.expander("Ground Plane Removal (outdoor)", expanded=False):
         st.session_state.params['pipeline']['distance_threshold'] = st.slider(
@@ -1435,9 +1449,15 @@ def main():
             "hdbscan": "HDBSCAN",
             "dbscan": "DBSCAN",
         }
-        _current_algo = _clustering.get("clustering_algorithm", "adaptive_dbscan")
+        _sidebar_point_cloud = (st.session_state.get("sample") or {}).get("point_cloud")
+        _default_algo = "adaptive_dbscan"
+        if isinstance(_sidebar_point_cloud, np.ndarray) and _sidebar_point_cloud.size > 0:
+            if _pipeline_scene_is_indoor(st.session_state.params, _sidebar_point_cloud):
+                _default_algo = "dbscan"
+
+        _current_algo = _clustering.get("clustering_algorithm", _default_algo)
         if _current_algo not in _algo_options:
-            _current_algo = "adaptive_dbscan"
+            _current_algo = _default_algo
         _algo_index = _algo_options.index(_current_algo)
         _selected_algo_label = st.selectbox(
             "Clustering Algorithm",
@@ -1585,105 +1605,113 @@ def main():
         value="person",
         help="Enter class names separated by commas (e.g., 'car, person, bicycle')"
     )
-    
-    # LLM Settings
-    with st.sidebar.expander("LLM Settings", expanded=False):
-        
-        # Initialize temperature in session state if not present
-        if 'llm_temperature' not in st.session_state:
-            st.session_state.llm_temperature = get_llm_temperature()
-        
-        # Temperature slider
-        st.session_state.llm_temperature = st.slider(
-            "LLM Temperature",
-            0.0, 2.0, st.session_state.llm_temperature, 0.1,
-            help="Temperature for LLM generation. Lower values (0.0-0.5) = more deterministic, Higher values (1.0-2.0) = more creative/random. Default: 0.3"
-        )
-        
-        # Update LLM service temperature
-        set_llm_temperature(st.session_state.llm_temperature)
 
-        # Local/remote model selection
-        available_llm_models = get_available_llm_models()
-        current_llm_model = get_current_llm_model_name()
-        llm_model_options = available_llm_models.copy()
-        if current_llm_model not in llm_model_options:
-            llm_model_options.insert(0, current_llm_model)
+    # For SUNRGBD (indoor-only) dataset, skip LLM initialization entirely.
+    is_sunrgbd_dataset = sidebar_dataset_type == "sunrgbd"
 
-        llm_model_labels = {}
-        for m in llm_model_options:
-            if os.path.isabs(m):
-                llm_model_labels[m] = f"{os.path.basename(m)} (local)"
+    if not is_sunrgbd_dataset:
+        # LLM Settings
+        with st.sidebar.expander("LLM Settings", expanded=False):
+
+            # Initialize temperature in session state if not present
+            if 'llm_temperature' not in st.session_state:
+                st.session_state.llm_temperature = get_llm_temperature()
+
+            # Temperature slider
+            st.session_state.llm_temperature = st.slider(
+                "LLM Temperature",
+                0.0, 2.0, st.session_state.llm_temperature, 0.1,
+                help="Temperature for LLM generation. Lower values (0.0-0.5) = more deterministic, Higher values (1.0-2.0) = more creative/random. Default: 0.3"
+            )
+
+            # Update LLM service temperature
+            set_llm_temperature(st.session_state.llm_temperature)
+
+            # Local/remote model selection
+            available_llm_models = get_available_llm_models()
+            current_llm_model = get_current_llm_model_name()
+            llm_model_options = available_llm_models.copy()
+            if current_llm_model not in llm_model_options:
+                llm_model_options.insert(0, current_llm_model)
+
+            llm_model_labels = {}
+            for m in llm_model_options:
+                if os.path.isabs(m):
+                    llm_model_labels[m] = f"{os.path.basename(m)} (local)"
+                else:
+                    llm_model_labels[m] = m
+
+            llm_model_index = 0
+            if current_llm_model in llm_model_options:
+                llm_model_index = llm_model_options.index(current_llm_model)
+
+            selected_llm_model = st.selectbox(
+                "LLM Model",
+                options=llm_model_options,
+                index=llm_model_index,
+                format_func=lambda m: llm_model_labels.get(m, m),
+                help="Pick a stronger instruction model from ./llm for better dimension estimates."
+            )
+            set_llm_model_name(selected_llm_model)
+
+            if available_llm_models:
+                st.caption(f"Discovered {len(available_llm_models)} local model(s) in ./llm")
             else:
-                llm_model_labels[m] = m
+                st.caption("No local models found in ./llm; using LLM_MODEL_NAME or default model id.")
 
-        llm_model_index = 0
-        if current_llm_model in llm_model_options:
-            llm_model_index = llm_model_options.index(current_llm_model)
+            # Toggle for enabling LLM model queries (may download a model on first use)
+            if "llm_enable_model_query" not in st.session_state:
+                st.session_state.llm_enable_model_query = True
 
-        selected_llm_model = st.selectbox(
-            "LLM Model",
-            options=llm_model_options,
-            index=llm_model_index,
-            format_func=lambda m: llm_model_labels.get(m, m),
-            help="Pick a stronger instruction model from ./llm for better dimension estimates."
-        )
-        set_llm_model_name(selected_llm_model)
+            st.session_state.llm_enable_model_query = st.checkbox(
+                "Enable LLM model (dimension lookup)",
+                value=st.session_state.llm_enable_model_query,
+                help="When enabled, a Hugging Face LLM is used for unseen classes. "
+                     "May download a model the first time it runs."
+            )
 
-        if available_llm_models:
-            st.caption(f"Discovered {len(available_llm_models)} local model(s) in ./llm")
+            if st.session_state.llm_enable_model_query:
+                os.environ["LLM_ENABLE_MODEL_QUERY"] = "1"
+                os.environ["LLM_ALLOW_DOWNLOAD"] = "1"
+                st.sidebar.caption("LLM model queries enabled")
+            else:
+                os.environ["LLM_ENABLE_MODEL_QUERY"] = "0"
+                st.sidebar.caption("LLM model queries disabled (using template defaults only)")
+
+            st.sidebar.caption("💡 LLM is used when semantic similarity doesn't find a match (similarity < 0.75)")
+
+        # Parse class names and pre-compute dimensions via LLM
+        if class_names_input:
+            class_names = [name.strip() for name in class_names_input.split(',') if name.strip()]
+
+            # Check if class names have changed
+            previous_class_names = st.session_state.get('previous_class_names', [])
+            if set(class_names) != set(previous_class_names):
+                with st.sidebar.spinner("Pre-computing dimensions for class names..."):
+                    dims_by_class = {}
+                    for class_name in class_names:
+                        length, width, height = query_llm_for_dimensions(class_name)
+                        dims_by_class[class_name] = (length, width, height)
+
+                    st.session_state.params['dimensions_by_class'] = dims_by_class
+                    # template_dims format for frustum_manager / evaluation
+                    st.session_state.params['template_dims'] = {
+                        k: {'length': v[0], 'width': v[1], 'height': v[2]}
+                        for k, v in dims_by_class.items()
+                    }
+
+                st.session_state.previous_class_names = class_names.copy()
+
+            st.session_state.params['class_names'] = class_names
         else:
-            st.caption("No local models found in ./llm; using LLM_MODEL_NAME or default model id.")
+            st.session_state.params['class_names'] = []
 
-        # Toggle for enabling LLM model queries (may download a model on first use)
-        if "llm_enable_model_query" not in st.session_state:
-            st.session_state.llm_enable_model_query = True
-
-        st.session_state.llm_enable_model_query = st.checkbox(
-            "Enable LLM model (dimension lookup)",
-            value=st.session_state.llm_enable_model_query,
-            help="When enabled, a Hugging Face LLM is used for unseen classes. "
-                 "May download a model the first time it runs."
-        )
-
-        if st.session_state.llm_enable_model_query:
-            os.environ["LLM_ENABLE_MODEL_QUERY"] = "1"
-            os.environ["LLM_ALLOW_DOWNLOAD"] = "1"
-            st.sidebar.caption("LLM model queries enabled")
-        else:
-            os.environ["LLM_ENABLE_MODEL_QUERY"] = "0"
-            st.sidebar.caption("LLM model queries disabled (using template defaults only)")
-        
-        st.sidebar.caption("💡 LLM is used when semantic similarity doesn't find a match (similarity < 0.75)")
-
-    # Parse class names
-    if class_names_input:
-        class_names = [name.strip() for name in class_names_input.split(',') if name.strip()]
-        
-        # Check if class names have changed
-        previous_class_names = st.session_state.get('previous_class_names', [])
-        if set(class_names) != set(previous_class_names):            
-            with st.sidebar.spinner("Pre-computing dimensions for class names..."):
-                dims_by_class = {}
-                for class_name in class_names:
-                    length, width, height = query_llm_for_dimensions(class_name)
-                    dims_by_class[class_name] = (length, width, height)
-                
-                st.session_state.params['dimensions_by_class'] = dims_by_class
-                # template_dims format for frustum_manager / evaluation
-                st.session_state.params['template_dims'] = {
-                    k: {'length': v[0], 'width': v[1], 'height': v[2]}
-                    for k, v in dims_by_class.items()
-                }
-            
-            st.session_state.previous_class_names = class_names.copy()
-        
-        st.session_state.params['class_names'] = class_names
+        if not st.session_state.params['class_names']:
+            st.sidebar.warning("⚠️ Please enter at least one class name")
     else:
+        # For SUNRGBD, do not initialize or query any LLM components.
         st.session_state.params['class_names'] = []
-    
-    if not st.session_state.params['class_names']:
-        st.sidebar.warning("⚠️ Please enter at least one class name")
+        st.sidebar.info("LLM-based dimension lookup is disabled for SUNRGBD dataset.")
     
     is_sam2 = st.session_state.params['sam_model_type'].startswith('sam2')
     if is_sam2:
@@ -1860,9 +1888,10 @@ def main():
                     sample_index=sample_desc["sample_index"],
                     tracker=tracker,
                     frame_index=i,
-                    sample_desc=sample_desc,
                     prev_image=prev_image,
                     preloaded_bbox_data=batch_bbox_data,
+                    saved_image_path=str(sample_desc.get("image_path") or ""),
+                    saved_point_cloud_path=str(sample_desc.get("point_cloud_path") or ""),
                 )
                 prev_image = st.session_state.sample.get("image") if "sample" in st.session_state else None
                 if export_res is not None:
@@ -2074,11 +2103,15 @@ def main():
     with st.container():
         step_1_state = st.session_state.pipeline_state['step_1']
         col1, col2 = st.columns([3, 1])
+        use_ground_plane_removal = bool(st.session_state.get("use_ground_plane_removal", True))
         
         with col1:
             status_icon = "✅" if step_1_state['completed'] else "⏸️"
             st.markdown(f"### {status_icon} Step 1: Ground Plane Removal")
-            st.caption("Remove ground plane from point cloud using RANSAC")
+            if use_ground_plane_removal:
+                st.caption("Remove ground plane from point cloud using RANSAC")
+            else:
+                st.caption("Ground plane removal disabled: using full point cloud")
         
         with col2:
             step_1_enabled = True  # Always enabled
@@ -2087,6 +2120,7 @@ def main():
                     try:
                         result = step_1_ground_plane_removal(
                             point_cloud=point_cloud,
+                            use_ground_plane_removal=use_ground_plane_removal,
                             **_ground_removal_kwargs(st.session_state.params, point_cloud)
                         )
                         st.session_state.pipeline_state['step_1'] = {
@@ -2109,6 +2143,8 @@ def main():
         if step_1_state['completed']:
             result = step_1_state['result']
             st.success(f"✅ Completed: {result['points_remaining']:,} points remaining")
+            if not use_ground_plane_removal:
+                st.info("Ground plane removal is disabled; points are unchanged from the input cloud.")
             
             with st.expander("View Step 1 Details", expanded=True):
                 col1, col2 = st.columns(2)

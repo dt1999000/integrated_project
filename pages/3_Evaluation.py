@@ -11,7 +11,7 @@ import io
 import copy
 import importlib.util
 from pathlib import Path
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
 
 from components.core.evaluation import (
@@ -19,43 +19,12 @@ from components.core.evaluation import (
     compute_batch_statistics,
     compute_frame_metrics_at_iou,
     _normalize_gt_cuboids,
-    filter_ground_truth_for_class_eval,
-    normalize_cuboid_categories_for_matching,
-    greedy_detection_gt_match_rows,
 )
 from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
     draw_projected_cuboid_bboxes,
     create_comparison_plot,
 )
-
-
-def _prepare_sunrgbd_batch_results(batch_results: List[Dict]) -> List[Dict]:
-    """
-    For SUNRGBD samples, restrict GT to categories present in detections so
-    AP and per-frame counts match class-scoped evaluation.
-    """
-    prepared: List[Dict] = []
-    for r in batch_results:
-        rr = dict(r)
-        meta = rr.get("metadata") or {}
-        if str(meta.get("dataset_type", "")).lower() != "sunrgbd":
-            prepared.append(rr)
-            continue
-        gt_raw = rr.get("ground_truth_cuboids")
-        if gt_raw is None:
-            prepared.append(rr)
-            continue
-        dets = rr.get("detected_cuboids") or []
-        filtered_gt, targets = filter_ground_truth_for_class_eval(gt_raw, dets, "sunrgbd")
-        if targets:
-            norm_gt = _normalize_gt_cuboids(filtered_gt)
-            norm_det = normalize_cuboid_categories_for_matching(dets)
-            rr["ground_truth_cuboids"] = norm_gt
-            rr["detected_cuboids"] = norm_det
-            rr["_sunrgbd_eval_class_filter"] = sorted(targets)
-        prepared.append(rr)
-    return prepared
 
 
 def _normalize_gt_for_eval(raw_ground_truth: List[Dict]) -> List[Dict]:
@@ -104,6 +73,94 @@ def _to_gt_table_rows(ground_truth_boxes: List[Dict]) -> List[Dict]:
     return rows
 
 
+def _extract_detection_classes(batch_results: List[Dict], max_classes: int = 3) -> List[str]:
+    """
+    Extract target detection classes from batch metadata (pipeline params),
+    falling back to detected cuboid categories.
+    """
+    ordered: List[str] = []
+    seen = set()
+
+    for sample in batch_results:
+        params = sample.get("metadata", {}).get("pipeline_params", {}) or {}
+        class_names = params.get("class_names", []) or []
+        for cls in class_names:
+            cls_norm = str(cls).strip()
+            if cls_norm and cls_norm not in seen:
+                ordered.append(cls_norm)
+                seen.add(cls_norm)
+                if len(ordered) >= max_classes:
+                    return ordered
+
+    for sample in batch_results:
+        for det in sample.get("detected_cuboids", []) or []:
+            cls_norm = str(det.get("category", "Unknown")).strip()
+            if cls_norm and cls_norm not in seen:
+                ordered.append(cls_norm)
+                seen.add(cls_norm)
+                if len(ordered) >= max_classes:
+                    return ordered
+
+    return ordered
+
+
+def _compute_per_class_per_frame_tables(
+    batch_results: List[Dict],
+    eval_classes: List[str],
+) -> Dict[str, Dict[str, List[Dict]]]:
+    """
+    Build per-class, per-frame metrics at IoU 0.5 and 0.25.
+    """
+    out: Dict[str, Dict[str, List[Dict]]] = {}
+    for cls in eval_classes:
+        rows_50: List[Dict] = []
+        rows_25: List[Dict] = []
+        for frame_idx, sample in enumerate(batch_results):
+            gt_all = _normalize_gt_cuboids(sample.get("ground_truth_cuboids", []) or [])
+            det_all = sample.get("detected_cuboids", []) or []
+
+            gt_cls = [g for g in gt_all if g.get("category", g.get("class", "Unknown")) == cls]
+            det_cls = [d for d in det_all if d.get("category", "Unknown") == cls]
+
+            m50 = compute_frame_metrics_at_iou(
+                gt_cls, det_cls, iou_threshold=0.5, match_by_category=True
+            )
+            m25 = compute_frame_metrics_at_iou(
+                gt_cls, det_cls, iou_threshold=0.25, match_by_category=True
+            )
+            sample_id = sample.get("metadata", {}).get("sample_index", str(frame_idx))
+
+            rows_50.append({
+                "Frame": frame_idx,
+                "Sample": sample_id,
+                "Class": cls,
+                "GT": m50["n_gt"],
+                "Det": m50["n_det"],
+                "TP": m50["TP"],
+                "FP": m50["FP"],
+                "FN": m50["FN"],
+                "Precision": f"{m50['precision'] * 100:.1f}%",
+                "Recall": f"{m50['recall'] * 100:.1f}%",
+                "F1": f"{m50['f1'] * 100:.1f}%",
+            })
+            rows_25.append({
+                "Frame": frame_idx,
+                "Sample": sample_id,
+                "Class": cls,
+                "GT": m25["n_gt"],
+                "Det": m25["n_det"],
+                "TP": m25["TP"],
+                "FP": m25["FP"],
+                "FN": m25["FN"],
+                "Precision": f"{m25['precision'] * 100:.1f}%",
+                "Recall": f"{m25['recall'] * 100:.1f}%",
+                "F1": f"{m25['f1'] * 100:.1f}%",
+            })
+
+        out[cls] = {"iou_50": rows_50, "iou_25": rows_25}
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Single-sample evaluation (existing logic)
 # ---------------------------------------------------------------------------
@@ -123,27 +180,6 @@ def _render_single_sample_eval():
         ground_truth_boxes = sample_meta_data.get('ground_truth_boxes', [])
 
     ground_truth_boxes = _normalize_gt_for_eval(ground_truth_boxes)
-
-    dataset_type = str(sample_meta_data.get("dataset_type", "")).lower()
-    sunrgbd_targets: Optional[Set[str]] = None
-    if dataset_type == "sunrgbd":
-        filtered_gt, sunrgbd_targets = filter_ground_truth_for_class_eval(
-            ground_truth_boxes, detected_cuboids, "sunrgbd"
-        )
-        if sunrgbd_targets:
-            ground_truth_boxes = _normalize_gt_for_eval(filtered_gt)
-            detected_cuboids = normalize_cuboid_categories_for_matching(detected_cuboids)
-            st.caption(
-                "SUNRGBD: showing and counting only ground-truth objects whose class matches "
-                f"detected class(es): **{', '.join(sorted(sunrgbd_targets))}** "
-                "(labels compared after normalizing case and ``:suffix`` tokens)."
-            )
-        else:
-            st.caption(
-                "SUNRGBD: no non-unknown detections — showing **all** ground-truth classes. "
-                "Load or run detections with a specific class to scope GT to that class."
-            )
-
     if not ground_truth_boxes:
         st.warning("⚠️ No ground truth boxes available for this sample.")
         st.info("Evaluation requires ground truth annotations from dataset extraction.")
@@ -169,33 +205,24 @@ def _render_single_sample_eval():
         st.metric("Detection Rate", f"{detection_rate:.1f}%")
 
     st.subheader("📊 3D IoU Matching Statistics")
-    if dataset_type == "sunrgbd" and sunrgbd_targets:
-        st.markdown(
-            "**Matching Logic (SUNRGBD):** Greedy one-to-one matching by 3D IoU over "
-            "ground-truth boxes **restricted to the same canonical classes as your detections**."
-        )
-    else:
-        st.markdown("""
-        **Matching Logic:** Each detected cuboid is matched to the ground truth box using `source_bbox_idx`
-        which corresponds to the mask index matched to the bounding box.
-        """)
+    st.markdown("""
+    **Matching Logic:** Each detected cuboid is matched to the ground truth box using `source_bbox_idx`
+    which corresponds to the mask index matched to the bounding box.
+    """)
 
-    if dataset_type == "sunrgbd" and sunrgbd_targets:
-        matching_results = greedy_detection_gt_match_rows(detected_cuboids, ground_truth_boxes)
-    else:
-        matching_results = []
-        for detected in detected_cuboids:
-            gt_idx = detected.get('source_bbox_idx')
-            if gt_idx is not None and gt_idx < len(ground_truth_boxes):
-                gt_box = ground_truth_boxes[gt_idx]
-                iou_3d = compute_3d_iou(detected, gt_box)
-                matching_results.append({
-                    'GT Index': gt_idx,
-                    'Category': detected.get('category', 'Unknown'),
-                    'GT Category': gt_box.get('category', 'Unknown'),
-                    '3D IoU': iou_3d,
-                    '2D IoU': detected.get('iou', None),
-                })
+    matching_results = []
+    for detected in detected_cuboids:
+        gt_idx = detected.get('source_bbox_idx')
+        if gt_idx is not None and gt_idx < len(ground_truth_boxes):
+            gt_box = ground_truth_boxes[gt_idx]
+            iou_3d = compute_3d_iou(detected, gt_box)
+            matching_results.append({
+                'GT Index': gt_idx,
+                'Category': detected.get('category', 'Unknown'),
+                'GT Category': gt_box.get('category', 'Unknown'),
+                '3D IoU': iou_3d,
+                '2D IoU': detected.get('iou', None),
+            })
 
     if matching_results:
         iou_3d_values = [r['3D IoU'] for r in matching_results]
@@ -258,7 +285,7 @@ def _render_single_sample_eval():
 def _render_batch_eval():
     """Render the batch evaluation panel with AP_50, AP_25 and per-frame stats."""
     batch_export = st.session_state.batch_export_results
-    batch_results: List[Dict] = _prepare_sunrgbd_batch_results(batch_export.get("samples", []))
+    batch_results: List[Dict] = batch_export.get("samples", [])
     total_queued: int = len(st.session_state.get("batch_samples", []))
 
     st.subheader("📦 Batch Sample Overview")
@@ -305,7 +332,7 @@ def _render_batch_eval():
     if n_evaluable == 0:
         st.warning(
             "⚠️ None of the processed samples contain ground truth cuboids. "
-            "AP metrics cannot be computed. Ground truth is available for KITTI, sim, and SUNRGBD batches."
+            "AP metrics cannot be computed.  Ground truth is available for KITTI and sim batches."
         )
         _render_batch_detection_only(batch_results)
         return
@@ -317,7 +344,7 @@ def _render_batch_eval():
         stats = compute_batch_statistics(
             batch_results,
             total_queued=total_queued,
-            match_by_category=False,
+            match_by_category=True,
         )
 
     ap_50 = stats["ap_50"]
@@ -356,11 +383,15 @@ def _render_batch_eval():
     # ------------------------------------------------------------------
     # Per-class breakdown
     # ------------------------------------------------------------------
+    eval_classes = _extract_detection_classes(batch_results, max_classes=3)
+    if eval_classes:
+        st.caption(f"Evaluating configured detection classes: {', '.join(eval_classes)}")
+
     if ap_50["per_class"]:
         st.subheader("📊 Per-Class Metrics")
-        all_cats = sorted(
-            set(list(ap_50["per_class"]) + list(ap_25["per_class"]))
-        )
+        all_cats = sorted(set(list(ap_50["per_class"]) + list(ap_25["per_class"])))
+        if eval_classes:
+            all_cats = [c for c in all_cats if c in eval_classes]
         rows = []
         for cat in all_cats:
             c50 = ap_50["per_class"].get(cat, {})
@@ -375,7 +406,10 @@ def _render_batch_eval():
                 "AP@0.5": f"{c50.get('ap', 0) * 100:.1f}%",
                 "AP@0.25": f"{c25.get('ap', 0) * 100:.1f}%",
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.info("No per-class metrics available for the configured detection classes.")
 
     # ------------------------------------------------------------------
     # Per-frame breakdown
@@ -415,6 +449,24 @@ def _render_batch_eval():
             })
         if frame_rows_25:
             st.dataframe(pd.DataFrame(frame_rows_25), use_container_width=True)
+
+    # ------------------------------------------------------------------
+    # Per-class per-frame breakdown (requested for SUNRGBD / class-aware eval)
+    # ------------------------------------------------------------------
+    if eval_classes:
+        st.subheader("🧪 Per-Class Per-Frame Metrics")
+        st.caption(
+            "Each table isolates a single configured detection class so you can "
+            "inspect frame-by-frame TP/FP/FN against GT for that class only."
+        )
+        class_tables = _compute_per_class_per_frame_tables(batch_results, eval_classes)
+        class_tabs = st.tabs([f"Class: {cls}" for cls in eval_classes])
+        for tab, cls in zip(class_tabs, eval_classes):
+            with tab:
+                st.markdown(f"**{cls} — IoU ≥ 0.5**")
+                st.dataframe(pd.DataFrame(class_tables[cls]["iou_50"]), use_container_width=True)
+                st.markdown(f"**{cls} — IoU ≥ 0.25**")
+                st.dataframe(pd.DataFrame(class_tables[cls]["iou_25"]), use_container_width=True)
 
     # ------------------------------------------------------------------
     # Sample list with keep/skip status
@@ -458,17 +510,24 @@ def _render_batch_eval():
             st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
 
 
-def _infer_scene_bucket(sample_meta: Dict) -> str:
-    scene_raw = str(sample_meta.get("scene_type", sample_meta.get("environment", ""))).lower()
-    if "indoor" in scene_raw:
-        return "indoor"
-    if "outdoor" in scene_raw:
-        return "outdoor"
+def _render_batch_detection_only(batch_results: List[Dict]):
+    """Show basic detection counts when GT is not available."""
+    st.subheader("📈 Detection Summary (no GT)")
+    rows = []
+    for i, r in enumerate(batch_results):
+        rows.append({
+            "Frame": i,
+            "Sample": r.get("metadata", {}).get("sample_index", str(i)),
+            "Detections": len(r.get("detected_cuboids", [])),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
+
+def _infer_scene_bucket(sample_meta: Dict) -> str:
     dataset_type = str(sample_meta.get("dataset_type", "")).lower()
     if dataset_type in {"sunrgbd", "scannet"}:
         return "indoor"
-    if dataset_type in {"kitti", "nuscenes", "rosbag", "waymo"}:
+    if dataset_type in {"kitti", "nuscenes", "rosbag", "waymo", "sim"}:
         return "outdoor"
     return "unknown"
 
@@ -489,33 +548,6 @@ def _compute_eval_stats(batch_results: List[Dict], total_queued: int) -> Dict:
         "f125": ap25["f1"],
         "n_samples": len(batch_results),
     }
-
-
-def _make_download_buttons(fig: plt.Figure, base_name: str):
-    png_buf = io.BytesIO()
-    svg_buf = io.BytesIO()
-    fig.savefig(png_buf, format="png", dpi=400, bbox_inches="tight")
-    fig.savefig(svg_buf, format="svg", bbox_inches="tight")
-    png_buf.seek(0)
-    svg_buf.seek(0)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            "⬇️ Download PNG (400 DPI)",
-            data=png_buf.getvalue(),
-            file_name=f"{base_name}.png",
-            mime="image/png",
-            use_container_width=True,
-        )
-    with col2:
-        st.download_button(
-            "⬇️ Download SVG (vector)",
-            data=svg_buf.getvalue(),
-            file_name=f"{base_name}.svg",
-            mime="image/svg+xml",
-            use_container_width=True,
-        )
 
 
 @st.cache_resource
@@ -551,73 +583,86 @@ def _run_batch_with_params(
         if export_res is not None:
             results.append(export_res)
     progress.empty()
-    return _prepare_sunrgbd_batch_results(results)
+    return results
+
+
+def _make_download_buttons(fig: plt.Figure, base_name: str):
+    png_buf = io.BytesIO()
+    svg_buf = io.BytesIO()
+    fig.savefig(png_buf, format="png", dpi=400, bbox_inches="tight")
+    fig.savefig(svg_buf, format="svg", bbox_inches="tight")
+    png_buf.seek(0)
+    svg_buf.seek(0)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "⬇️ Download PNG (400 DPI)",
+            data=png_buf.getvalue(),
+            file_name=f"{base_name}.png",
+            mime="image/png",
+            use_container_width=True,
+        )
+    with col2:
+        st.download_button(
+            "⬇️ Download SVG (vector)",
+            data=svg_buf.getvalue(),
+            file_name=f"{base_name}.svg",
+            mime="image/svg+xml",
+            use_container_width=True,
+        )
 
 
 def _render_ablation_study_runner():
     st.subheader("🧪 Ablation Study Runner")
-    st.caption(
-        "Run ablations on the currently selected batch and generate thesis-ready figures."
-    )
     batch_samples = st.session_state.get("batch_samples", [])
     if not batch_samples:
-        st.info("Load a batch in `1_Dataset_Extraction` first.")
+        st.info("Load a batch first from `1_Dataset_Extraction`.")
         return
 
-    st.markdown("**Batch scope for ablation reruns**")
-    col_scope_1, col_scope_2 = st.columns(2)
-    with col_scope_1:
-        max_samples = st.number_input(
+    scope1, scope2 = st.columns(2)
+    with scope1:
+        mini_size = st.number_input(
             "Mini-batch size (0 = full batch)",
             min_value=0,
             max_value=len(batch_samples),
             value=0,
             step=1,
-            key="ablation_minibatch_size",
         )
-    with col_scope_2:
-        start_idx = st.number_input(
-            "Start index in loaded batch",
+    with scope2:
+        mini_start = st.number_input(
+            "Start index",
             min_value=0,
             max_value=max(0, len(batch_samples) - 1),
             value=0,
             step=1,
-            key="ablation_minibatch_start",
         )
-
-    if max_samples == 0:
-        selected_batch_samples = batch_samples
+    if mini_size == 0:
+        selected_batch = batch_samples
     else:
-        end_idx = min(len(batch_samples), int(start_idx) + int(max_samples))
-        selected_batch_samples = batch_samples[int(start_idx):end_idx]
-    st.caption(f"Ablation will re-run pipeline on **{len(selected_batch_samples)}** selected sample(s).")
+        end_idx = min(len(batch_samples), int(mini_start) + int(mini_size))
+        selected_batch = batch_samples[int(mini_start):end_idx]
+    st.caption(f"Selected samples for rerun: **{len(selected_batch)}**")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        iou_for_report = st.selectbox(
-            "Primary metric for plots",
-            options=["F1@0.25", "AP@0.25", "AP@0.50"],
-            index=0,
-            key="ablation_primary_metric",
-        )
-    with col2:
-        eps_values_raw = st.text_input(
-            "Epsilon sweep values (comma-separated)",
-            value="0.20,0.30,0.40,0.50,0.70,0.90",
-            key="ablation_eps_values",
-        )
+    cfg1, cfg2 = st.columns(2)
+    with cfg1:
+        primary_metric = st.selectbox("Primary metric", ["F1@0.25", "AP@0.25", "AP@0.50"], index=0)
+    with cfg2:
+        eps_raw = st.text_input("Adaptive DBSCAN eps sweep", "0.20,0.30,0.40,0.50,0.70,0.90")
 
-    eps_values = [float(v.strip()) for v in eps_values_raw.split(",") if v.strip()]
+    try:
+        eps_values = [float(v.strip()) for v in eps_raw.split(",") if v.strip()]
+    except ValueError:
+        st.error("Epsilon list must be numeric (comma-separated).")
+        return
     if len(eps_values) == 0:
-        st.warning("Please provide at least one epsilon value.")
+        st.warning("Provide at least one epsilon value.")
         return
 
-    run_clicked = st.button("🚀 Run Batch Ablation", type="primary", key="run_batch_ablation")
-    if not run_clicked:
-        if st.session_state.get("ablation_study_payload"):
-            st.success("Using cached ablation results from this session.")
-        else:
-            st.info("Click **Run Batch Ablation** to execute controlled variants.")
+    if not st.button("🚀 Run Ablation (rerun selected batch)", type="primary"):
+        payload = st.session_state.get("ablation_study_payload")
+        if payload:
+            st.caption("Cached ablation results available below.")
+            st.dataframe(pd.DataFrame(payload), use_container_width=True)
         return
 
     detection_mod = _load_detection_page_module()
@@ -627,160 +672,92 @@ def _render_ablation_study_runner():
     else:
         base_params = detection_mod.default_detection_params()
         detection_mod.ensure_detection_params(base_params)
-
-    preloaded_bbox_data = st.session_state.get("_batch_bbox_data")
-
-    experiment_runs: List[Dict] = []
-    total_queued = len(selected_batch_samples)
     base_original = copy.deepcopy(base_params)
+    preloaded_bbox_data = st.session_state.get("_batch_bbox_data")
+    total_queued = len(selected_batch)
 
+    rows: List[Dict] = []
     ground_variants: List[Tuple[str, Dict]] = []
     p_auto = copy.deepcopy(base_original)
     ground_variants.append(("scene-aware-ground", p_auto))
-
     p_outdoor = copy.deepcopy(base_original)
     p_outdoor["pipeline_indoor"] = copy.deepcopy(p_outdoor["pipeline"])
     ground_variants.append(("single-outdoor-ground", p_outdoor))
-
     p_indoor = copy.deepcopy(base_original)
     p_indoor["pipeline"] = copy.deepcopy(p_indoor["pipeline_indoor"])
     ground_variants.append(("single-indoor-ground", p_indoor))
 
-    st.markdown("**Ground-removal ablation in progress...**")
+    st.markdown("**Running ground-removal ablation...**")
     for variant_name, params_variant in ground_variants:
-        results = _run_batch_with_params(
-            detection_mod=detection_mod,
-            batch_samples=selected_batch_samples,
-            params=params_variant,
-            preloaded_bbox_data=preloaded_bbox_data,
-        )
+        results = _run_batch_with_params(detection_mod, selected_batch, params_variant, preloaded_bbox_data)
         stats_all = _compute_eval_stats(results, total_queued=total_queued)
-        for bucket in ["indoor", "outdoor"]:
-            filtered = [
-                r for r in results
-                if _infer_scene_bucket(r.get("metadata", {})) == bucket
-            ]
-            if len(filtered) == 0:
-                continue
-            stats_bucket = _compute_eval_stats(filtered, total_queued=len(filtered))
-            experiment_runs.append({
-                "study": "ground_removal",
-                "variant": variant_name,
-                "scene": bucket,
-                **stats_bucket,
-            })
-        experiment_runs.append({
-            "study": "ground_removal",
-            "variant": variant_name,
-            "scene": "all",
-            **stats_all,
-        })
+        rows.append({"study": "ground_removal", "variant": variant_name, "scene": "all", **stats_all})
+        for scene in ["indoor", "outdoor"]:
+            subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
+            if subset:
+                rows.append({"study": "ground_removal", "variant": variant_name, "scene": scene, **_compute_eval_stats(subset, len(subset))})
 
-    st.markdown("**DBSCAN epsilon ablation in progress...**")
+    st.markdown("**Running adaptive DBSCAN epsilon ablation...**")
     for eps in eps_values:
         p_eps = copy.deepcopy(base_original)
         p_eps["clustering"]["clustering_algorithm"] = "adaptive_dbscan"
         p_eps["clustering"]["adaptive_dbscan_base_eps"] = float(eps)
-        results = _run_batch_with_params(
-            detection_mod=detection_mod,
-            batch_samples=selected_batch_samples,
-            params=p_eps,
-            preloaded_bbox_data=preloaded_bbox_data,
-        )
+        results = _run_batch_with_params(detection_mod, selected_batch, p_eps, preloaded_bbox_data)
         stats_all = _compute_eval_stats(results, total_queued=total_queued)
-        for bucket in ["indoor", "outdoor"]:
-            filtered = [
-                r for r in results
-                if _infer_scene_bucket(r.get("metadata", {})) == bucket
-            ]
-            if len(filtered) == 0:
-                continue
-            stats_bucket = _compute_eval_stats(filtered, total_queued=len(filtered))
-            experiment_runs.append({
-                "study": "dbscan_eps",
-                "variant": f"eps={eps:.2f}",
-                "eps": float(eps),
-                "scene": bucket,
-                **stats_bucket,
-            })
-        experiment_runs.append({
-            "study": "dbscan_eps",
-            "variant": f"eps={eps:.2f}",
-            "eps": float(eps),
-            "scene": "all",
-            **stats_all,
-        })
+        rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": "all", **stats_all})
+        for scene in ["indoor", "outdoor"]:
+            subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
+            if subset:
+                rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": scene, **_compute_eval_stats(subset, len(subset))})
 
     st.session_state.params = base_original
-    st.session_state.ablation_study_payload = experiment_runs
-    st.success("Ablation completed.")
-
-    df_ablation = pd.DataFrame(experiment_runs)
-    st.dataframe(df_ablation, use_container_width=True)
+    st.session_state.ablation_study_payload = rows
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True)
     st.download_button(
         "⬇️ Download ablation metrics (CSV)",
-        data=df_ablation.to_csv(index=False),
+        data=df.to_csv(index=False),
         file_name="ablation_metrics.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
-    metric_column = "f125" if iou_for_report == "F1@0.25" else ("ap25" if iou_for_report == "AP@0.25" else "ap50")
-
-    ground_df = df_ablation[df_ablation["study"] == "ground_removal"].copy()
+    metric_col = "f125" if primary_metric == "F1@0.25" else ("ap25" if primary_metric == "AP@0.25" else "ap50")
+    ground_df = df[df["study"] == "ground_removal"]
     if not ground_df.empty:
         fig1, ax1 = plt.subplots(figsize=(10, 5), dpi=140)
-        display_order = ["scene-aware-ground", "single-outdoor-ground", "single-indoor-ground"]
-        x = np.arange(len(display_order))
-        width = 0.24
+        variants = ["scene-aware-ground", "single-outdoor-ground", "single-indoor-ground"]
         scenes = [s for s in ["indoor", "outdoor", "all"] if s in set(ground_df["scene"].tolist())]
-        for idx, scene in enumerate(scenes):
+        x = np.arange(len(variants))
+        w = 0.24
+        for i, scene in enumerate(scenes):
             ys = []
-            for variant in display_order:
-                row = ground_df[(ground_df["variant"] == variant) & (ground_df["scene"] == scene)]
-                ys.append(float(row.iloc[0][metric_column]) * 100 if not row.empty else 0.0)
-            ax1.bar(x + (idx - 1) * width, ys, width=width, label=scene)
+            for v in variants:
+                rr = ground_df[(ground_df["variant"] == v) & (ground_df["scene"] == scene)]
+                ys.append(float(rr.iloc[0][metric_col]) * 100 if not rr.empty else 0.0)
+            ax1.bar(x + (i - 1) * w, ys, width=w, label=scene)
         ax1.set_xticks(x)
-        ax1.set_xticklabels(display_order, rotation=10)
-        ax1.set_ylabel(f"{iou_for_report} (%)")
-        ax1.set_title("Ground-Removal Ablation by Scene Type")
+        ax1.set_xticklabels(variants, rotation=10)
+        ax1.set_ylabel(f"{primary_metric} (%)")
+        ax1.set_title("Ground Removal Ablation")
         ax1.grid(True, axis="y", linestyle="--", alpha=0.35)
         ax1.legend()
         st.pyplot(fig1, use_container_width=True)
         _make_download_buttons(fig1, "ablation_ground_removal")
 
-    eps_df = df_ablation[df_ablation["study"] == "dbscan_eps"].copy()
+    eps_df = df[df["study"] == "dbscan_eps"]
     if not eps_df.empty:
         fig2, ax2 = plt.subplots(figsize=(10, 5), dpi=140)
         for scene in [s for s in ["indoor", "outdoor", "all"] if s in set(eps_df["scene"].tolist())]:
-            cur = eps_df[eps_df["scene"] == scene].sort_values("eps")
-            ax2.plot(
-                cur["eps"].to_numpy(dtype=float),
-                cur[metric_column].to_numpy(dtype=float) * 100,
-                marker="o",
-                linewidth=2.0,
-                label=scene,
-            )
+            dd = eps_df[eps_df["scene"] == scene].sort_values("eps")
+            ax2.plot(dd["eps"].to_numpy(dtype=float), dd[metric_col].to_numpy(dtype=float) * 100, marker="o", linewidth=2.0, label=scene)
         ax2.set_xlabel("Adaptive DBSCAN base epsilon")
-        ax2.set_ylabel(f"{iou_for_report} (%)")
+        ax2.set_ylabel(f"{primary_metric} (%)")
         ax2.set_title("Adaptive DBSCAN Epsilon Sensitivity")
         ax2.grid(True, linestyle="--", alpha=0.35)
         ax2.legend()
         st.pyplot(fig2, use_container_width=True)
         _make_download_buttons(fig2, "ablation_dbscan_epsilon")
-
-
-def _render_batch_detection_only(batch_results: List[Dict]):
-    """Show basic detection counts when GT is not available."""
-    st.subheader("📈 Detection Summary (no GT)")
-    rows = []
-    for i, r in enumerate(batch_results):
-        rows.append({
-            "Frame": i,
-            "Sample": r.get("metadata", {}).get("sample_index", str(i)),
-            "Detections": len(r.get("detected_cuboids", [])),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
 # ---------------------------------------------------------------------------

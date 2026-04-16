@@ -16,145 +16,6 @@ import cv2
 
 
 # =============================================================================
-# Category labels (SUNRGBD / open-vocab alignment)
-# =============================================================================
-
-
-def canonical_eval_category(name: Optional[str]) -> str:
-    """
-    Normalize a class label for evaluation: lowercase, strip SUNRGBD-style
-    suffixes after ':', collapse spaces/hyphens to underscores.
-    """
-    if name is None:
-        return "unknown"
-    s = str(name).strip().lower()
-    if not s:
-        return "unknown"
-    base = s.split(":", 1)[0].strip()
-    base = base.replace("-", "_").replace(" ", "_")
-    while "__" in base:
-        base = base.replace("__", "_")
-    return base or "unknown"
-
-
-def target_categories_from_detections(detected_cuboids: List[Dict]) -> Set[str]:
-    """Unique canonical categories from detections (excludes unknown)."""
-    out: Set[str] = set()
-    for det in detected_cuboids or []:
-        lab = canonical_eval_category(det.get("category", det.get("class")))
-        if lab != "unknown":
-            out.add(lab)
-    return out
-
-
-def filter_ground_truth_for_class_eval(
-    ground_truth_cuboids: List[Dict],
-    detected_cuboids: List[Dict],
-    dataset_type: Optional[str],
-) -> Tuple[List[Dict], Set[str]]:
-    """
-    For SUNRGBD, restrict GT to objects whose category matches a detected class.
-
-    When there are no detections, returns the full GT list (caller may show
-    all annotations). For other dataset types, returns the input unchanged.
-    """
-    if str(dataset_type or "").lower() != "sunrgbd":
-        return list(ground_truth_cuboids or []), set()
-
-    targets = target_categories_from_detections(detected_cuboids)
-    if not targets:
-        return list(ground_truth_cuboids or []), set()
-
-    filtered: List[Dict] = []
-    for gt in ground_truth_cuboids or []:
-        gt_lab = canonical_eval_category(gt.get("category", gt.get("class")))
-        if gt_lab in targets:
-            filtered.append(gt)
-    return filtered, targets
-
-
-def normalize_cuboid_categories_for_matching(cuboids: List[Dict]) -> List[Dict]:
-    """Shallow copies with ``category`` set to ``canonical_eval_category``."""
-    out: List[Dict] = []
-    for c in cuboids or []:
-        cc = dict(c)
-        cc["category"] = canonical_eval_category(cc.get("category", cc.get("class")))
-        out.append(cc)
-    return out
-
-
-def greedy_detection_gt_match_rows(
-    detected_cuboids: List[Dict],
-    ground_truth_boxes: List[Dict],
-) -> List[Dict]:
-    """
-    Greedy one-to-one matching by 3D IoU (highest pairs first).
-
-    Used when ``source_bbox_idx`` does not align with filtered GT lists
-    (e.g. SUNRGBD class-filtered evaluation).
-    """
-    if not detected_cuboids:
-        return []
-
-    n_d = len(detected_cuboids)
-    n_g = len(ground_truth_boxes or [])
-    if n_g == 0:
-        return [
-            {
-                "GT Index": None,
-                "Category": det.get("category", "Unknown"),
-                "GT Category": "N/A",
-                "3D IoU": 0.0,
-                "2D IoU": det.get("iou", None),
-            }
-            for det in detected_cuboids
-        ]
-
-    pairs: List[Tuple[float, int, int]] = []
-    for di in range(n_d):
-        for gi in range(n_g):
-            iou = compute_3d_iou(detected_cuboids[di], ground_truth_boxes[gi])
-            pairs.append((float(iou), di, gi))
-    pairs.sort(reverse=True)
-
-    matched_d: Set[int] = set()
-    matched_g: Set[int] = set()
-    det_to_match: Dict[int, Tuple[int, float]] = {}
-    for iou, di, gi in pairs:
-        if di in matched_d or gi in matched_g:
-            continue
-        matched_d.add(di)
-        matched_g.add(gi)
-        det_to_match[di] = (gi, iou)
-
-    rows: List[Dict] = []
-    for di, det in enumerate(detected_cuboids):
-        if di in det_to_match:
-            gi, iou = det_to_match[di]
-            gt_box = ground_truth_boxes[gi]
-            rows.append(
-                {
-                    "GT Index": gi,
-                    "Category": det.get("category", "Unknown"),
-                    "GT Category": gt_box.get("category", gt_box.get("class", "Unknown")),
-                    "3D IoU": iou,
-                    "2D IoU": det.get("iou", None),
-                }
-            )
-        else:
-            rows.append(
-                {
-                    "GT Index": None,
-                    "Category": det.get("category", "Unknown"),
-                    "GT Category": "Unmatched",
-                    "3D IoU": 0.0,
-                    "2D IoU": det.get("iou", None),
-                }
-            )
-    return rows
-
-
-# =============================================================================
 # 3D IoU Calculation Functions
 # =============================================================================
 
@@ -895,13 +756,12 @@ def compute_batch_statistics(
             ap_50 (full result dict), ap_25 (full result dict).
     """
     n_total = len(batch_results)
-    # Include frames with an explicit empty GT list (valid annotated empty scenes).
-    results_with_gt = [r for r in batch_results if r.get("ground_truth_cuboids") is not None]
+    results_with_gt = [r for r in batch_results if r.get("ground_truth_cuboids")]
     n_with_gt = len(results_with_gt)
     n_failed = max(0, total_queued - n_total)
 
     total_detections = sum(len(r.get("detected_cuboids", [])) for r in batch_results)
-    total_gt = sum(len(r.get("ground_truth_cuboids") or []) for r in results_with_gt)
+    total_gt = sum(len(r.get("ground_truth_cuboids", [])) for r in results_with_gt)
 
     ap_50 = compute_batch_ap(results_with_gt, iou_threshold=0.5, match_by_category=match_by_category)
     ap_25 = compute_batch_ap(results_with_gt, iou_threshold=0.25, match_by_category=match_by_category)

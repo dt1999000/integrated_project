@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 import numpy as np
 import cv2
+import open3d as o3d
 from scipy.spatial.transform import Rotation as R
 
 # Add parent directory to path for imports
@@ -17,6 +18,7 @@ from .kitti_dataset_loader import KITTIDatasetLoader
 from .nuscenes_dataset_loader import NuScenesDatasetLoader
 from .sunrgbd_dataset_loader import SUNRGBDDatasetLoader
 from .dataset_loader import LinkedDataHandler
+from components.core.pointcloud_projection import load_sunrgbd_intrinsics
 
 
 def detect_dataset_type(dataset_path: str) -> Optional[str]:
@@ -94,7 +96,11 @@ def load_dataset_sample(
     dataset_path: str,
     sample_index: int = 0,
     dataset_type: Optional[str] = None,
-    filter_forward_only: bool = True
+    filter_forward_only: bool = True,
+    use_saved_media_paths: bool = False,
+    saved_image_path: Optional[str] = None,
+    saved_point_cloud_path: Optional[str] = None,
+    sunrgbd_keep_fraction: Optional[float] = None,
 ) -> Tuple[Optional[Dict], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Load sample from dataset (KITTI, nuScenes, sim, or SUNRGBD format).
@@ -107,6 +113,9 @@ def load_dataset_sample(
         sample_index: Index or token of sample to load (int for KITTI, str for nuScenes/sim)
         dataset_type: 'kitti', 'nuscenes', 'sim', 'sunrgbd', or None (auto-detect)
         filter_forward_only: Whether to keep only forward-facing points (x > 0) - for KITTI
+        use_saved_media_paths: For SUNRGBD, prefer pre-saved image/point cloud paths
+        saved_image_path: Optional pre-saved image path for SUNRGBD batch mode
+        saved_point_cloud_path: Optional pre-saved PCD path for SUNRGBD batch mode
         
     Returns:
         Tuple of (sample_meta_data dict, image array, point_cloud array)
@@ -127,7 +136,14 @@ def load_dataset_sample(
     elif dataset_type == "sim":
         return _load_sim_sample(dataset_path, sample_index)
     elif dataset_type == "sunrgbd":
-        return _load_sunrgbd_sample(dataset_path, sample_index)
+        return _load_sunrgbd_sample(
+            dataset_path,
+            sample_index,
+            use_saved_media_paths=use_saved_media_paths,
+            saved_image_path=saved_image_path,
+            saved_point_cloud_path=saved_point_cloud_path,
+            keep_fraction=sunrgbd_keep_fraction,
+        )
     elif dataset_type == "rosbag":
         # For rosbag we expect dataset_path to point to an extracted folder
         # produced by components.dataset_loaders.rosbag_extractor.extract_bag_to_folder.
@@ -481,13 +497,73 @@ def _load_sim_sample(
 
 def _load_sunrgbd_sample(
     dataset_path: str,
-    sample_index: int
+    sample_index: int,
+    use_saved_media_paths: bool = False,
+    saved_image_path: Optional[str] = None,
+    saved_point_cloud_path: Optional[str] = None,
+    keep_fraction: Optional[float] = None,
 ) -> Tuple[Optional[Dict], Optional[np.ndarray], Optional[np.ndarray]]:
-    """Load SUNRGBD sample and reconstruct point cloud from RGB-D."""
+    """Load SUNRGBD sample; optionally bypass RGB-D reconstruction with saved media."""
     loader = SUNRGBDDatasetLoader(dataroot=str(dataset_path))
     loader.load_dataset()
-    sample_data = loader.load_sunrgbd_data(sample_index=int(sample_index))
+    sample_idx = int(sample_index)
+    if sample_idx < 0 or sample_idx >= len(loader.samples):
+        print(f"Error: SUNRGBD sample_index out of range: {sample_idx} (n={len(loader.samples)})")
+        return None, None, None
 
+    sample = loader.samples[sample_idx]
+
+    if use_saved_media_paths:
+        image_file = Path(saved_image_path).expanduser() if saved_image_path else Path(sample["image_path"])
+        pcd_file = Path(saved_point_cloud_path).expanduser() if saved_point_cloud_path else None
+
+        image_bgr = cv2.imread(str(image_file))
+        if image_bgr is None:
+            print(f"Error: Could not load image from {image_file}")
+            return None, None, None
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        if pcd_file is None or not pcd_file.exists():
+            print(f"Error: Saved SUNRGBD point cloud file not found for sample {sample_idx}: {pcd_file}")
+            return None, None, None
+        pcd = o3d.io.read_point_cloud(str(pcd_file))
+        point_cloud = np.asarray(pcd.points, dtype=np.float32)
+        if point_cloud.size == 0:
+            print(f"Error: Saved SUNRGBD point cloud is empty for sample {sample_idx}: {pcd_file}")
+            return None, None, None
+
+        camera_intrinsic = load_sunrgbd_intrinsics(sample["intrinsics_path"])
+        camera_to_lidar_transform = SUNRGBDDatasetLoader._sunrgbd_camera_to_pipeline_lidar_transform()
+        gt_boxes_cam = SUNRGBDDatasetLoader._load_ground_truth_boxes(
+            sample.get("annotation_path"),
+            image_rgb.shape,
+        )
+        gt_boxes = SUNRGBDDatasetLoader._transform_gt_boxes_to_pipeline_lidar(
+            gt_boxes_cam,
+            camera_to_lidar_transform,
+        )
+        sample_meta_data = {
+            "image_path": str(image_file),
+            "point_cloud_path": str(pcd_file),
+            "camera_intrinsic": camera_intrinsic,
+            "camera_extrinsic": np.eye(4, dtype=np.float64),
+            "camera_to_lidar_transform": camera_to_lidar_transform,
+            "ground_truth_boxes": gt_boxes,
+            "sample_index": sample_idx,
+            "dataset_type": "sunrgbd",
+            "scene_id": sample.get("scene_id"),
+            "depth_scale": 10000.0,
+            "image_shape": image_rgb.shape[:2],
+        }
+        return sample_meta_data, image_rgb, point_cloud
+
+    if keep_fraction is None:
+        keep_fraction = 0.8
+
+    sample_data = loader.load_sunrgbd_data(
+        sample_index=sample_idx,
+        keep_fraction=float(keep_fraction),
+    )
     image_path = sample_data["image_path"]
     image = cv2.imread(image_path)
     if image is None:
@@ -497,7 +573,7 @@ def _load_sunrgbd_sample(
 
     point_cloud = sample_data["point_cloud"]
     if point_cloud is None or len(point_cloud) == 0:
-        print(f"Error: Reconstructed SUNRGBD point cloud is empty for sample {sample_index}")
+        print(f"Error: Reconstructed SUNRGBD point cloud is empty for sample {sample_idx}")
         return None, None, None
 
     sample_meta_data = {
@@ -507,7 +583,7 @@ def _load_sunrgbd_sample(
         "camera_extrinsic": sample_data.get("camera_extrinsic", np.eye(4)),
         "camera_to_lidar_transform": sample_data["camera_to_lidar_transform"],
         "ground_truth_boxes": sample_data.get("ground_truth_boxes", []),
-        "sample_index": int(sample_index),
+        "sample_index": sample_idx,
         "dataset_type": "sunrgbd",
         "scene_id": sample_data.get("scene_id"),
         "depth_scale": sample_data.get("depth_scale", 10000.0),

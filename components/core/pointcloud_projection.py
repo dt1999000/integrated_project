@@ -1050,6 +1050,7 @@ class PointCloud:
         depth_scale: float = 10000.0,
         depth_trunc: float = 10.0,
         stride: int = 1,
+        keep_fraction: float = 0.8,
     ) -> "PointCloud":
         """
         Create a PointCloud from an RGBD image pair following the SunRGBD dataset conventions.
@@ -1076,7 +1077,17 @@ class PointCloud:
             A ``PointCloud`` instance whose ``.original_point_cloud`` is Nx3 in
             camera coords and ``.colors`` is the corresponding Nx3 RGB array.
         """
-        depth_m = depth_image.astype(np.float64) / depth_scale
+        print(
+            "[SUNRGBD_RGBD_PC] from_rgbd_sunrgbd called "
+            f"rgb_shape={getattr(rgb_image, 'shape', None)} "
+            f"depth_shape={getattr(depth_image, 'shape', None)} "
+            f"depth_dtype={getattr(depth_image, 'dtype', None)} "
+            f"depth_scale={depth_scale} depth_trunc={depth_trunc} stride={stride} "
+            f"keep_fraction={keep_fraction}"
+        )
+
+        # Convert depth to metres using float32 to reduce memory footprint.
+        depth_m = depth_image.astype(np.float32) / float(depth_scale)
 
         h, w = depth_m.shape
         u_coords, v_coords = np.meshgrid(
@@ -1089,6 +1100,23 @@ class PointCloud:
 
         valid = (z > 0.0) & (z <= depth_trunc)
         u, v, z = u[valid], v[valid], z[valid]
+
+        # Optional random downsampling to limit point count for memory-intensive
+        # operations such as DBSCAN in batch mode.
+        n_valid = z.size
+        if n_valid > 0:
+            if keep_fraction <= 0.0:
+                keep_fraction = 0.0
+            if keep_fraction < 1.0:
+                target_n = int(float(n_valid) * float(keep_fraction))
+                if target_n <= 0:
+                    target_n = 1
+                if target_n < n_valid:
+                    rng = np.random.default_rng()
+                    keep_idx = rng.choice(n_valid, size=target_n, replace=False)
+                    u = u[keep_idx]
+                    v = v[keep_idx]
+                    z = z[keep_idx]
 
         fx = camera_intrinsic[0, 0]
         fy = camera_intrinsic[1, 1]
@@ -1104,12 +1132,10 @@ class PointCloud:
         pc = PointCloud(points)
         pc.colors = colors
 
-        print(f"SunRGBD point cloud: {len(points):,} points from {h}×{w} RGBD "
-              f"(stride={stride}, depth_scale={depth_scale}, trunc={depth_trunc}m)")
-        if len(points) > 0:
-            print(f"  X [{points[:, 0].min():.2f}, {points[:, 0].max():.2f}]  "
-                  f"Y [{points[:, 1].min():.2f}, {points[:, 1].max():.2f}]  "
-                  f"Z [{points[:, 2].min():.2f}, {points[:, 2].max():.2f}]")
+        print(
+            "[SUNRGBD_RGBD_PC] from_rgbd_sunrgbd finished "
+            f"valid_points={len(points)}"
+        )
 
         return pc
 
@@ -1178,8 +1204,5 @@ def create_o3d_pointcloud_from_rgbd_sunrgbd(
     )
 
     pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, o3d_intrinsic)
-
-    print(f"Open3D SunRGBD point cloud: {len(pcd.points):,} points "
-          f"(depth_scale={depth_scale}, trunc={depth_trunc}m)")
 
     return pcd

@@ -89,6 +89,16 @@ def _every_nth_indices(total_count: int, stride: int, start: int = 0) -> np.ndar
     return np.arange(start, total_count, stride, dtype=int)
 
 
+def _seeded_random_indices(total_count: int, sample_size: int, seed: int) -> np.ndarray:
+    """Return a sorted array of unique random indices in [0, total_count)."""
+    if total_count <= 0:
+        return np.array([], dtype=int)
+    n = min(int(sample_size), total_count)
+    rng = np.random.default_rng(int(seed))
+    picked = rng.choice(total_count, size=n, replace=False)
+    return np.sort(picked.astype(int))
+
+
 def _sim_rgb_path_for_link(dataset_path: str, subset_name: str, link: Dict) -> Optional[Path]:
     """Resolve on-disk path for a sim link's RGB sample (same rules as filter_sim_images)."""
     rgb_sample = link.get("samples", {}).get("rgb", {})
@@ -138,7 +148,6 @@ def _save_sunrgbd_batch_sample(
         "image_path": str(image_out),
         "point_cloud_path": str(point_cloud_out),
     }
-
 
 def ensure_filter_state(prefix: str) -> None:
     """Ensure st.session_state[f'{prefix}_filter_params'] exists with defaults."""
@@ -340,6 +349,8 @@ def main():
     # Batch mode is False by default; only "Load all ... for detection" sets it to True.
     if 'process_all_samples' not in st.session_state:
         st.session_state.process_all_samples = False
+    if "batch_samples_saved" not in st.session_state:
+        st.session_state.batch_samples_saved = False
     # Ensure global params dict exists so we can store bag frequency for tracking.
     if 'params' not in st.session_state:
         st.session_state.params = {}
@@ -531,6 +542,7 @@ def main():
                                     })
                                 st.session_state.batch_samples = batch_samples
                                 st.session_state.process_all_samples = True
+                                st.session_state.batch_samples_saved = True
                                 st.success(f"✅ Prepared {len(batch_samples)} KITTI samples. Go to **2_Detection** and click **Process entire batch**.")
                                 st.rerun()
             except Exception as e:
@@ -669,6 +681,23 @@ def main():
                 st.error("❌ No SUNRGBD samples found (expected scenes with image/depth_bfx/intrinsics.txt).")
             else:
                 st.info(f"SUNRGBD detected with {num_samples} indexed scenes.")
+
+                # Control how densely SUNRGBD RGB-D is backprojected into a point cloud.
+                # Value is the fraction of valid depth pixels to keep (0–1).
+                if "sunrgbd_keep_fraction" not in st.session_state:
+                    st.session_state["sunrgbd_keep_fraction"] = 0.8
+                sun_keep_pct = st.slider(
+                    "SUNRGBD point cloud keep %",
+                    5,
+                    100,
+                    int(100.0 * float(st.session_state["sunrgbd_keep_fraction"])),
+                    1,
+                    help="Fraction of valid depth pixels kept when reconstructing SUNRGBD point clouds "
+                    "(lower = fewer points, lower RAM usage).",
+                    key="sunrgbd_keep_pct",
+                )
+                st.session_state["sunrgbd_keep_fraction"] = float(sun_keep_pct) / 100.0
+
                 sample_index = st.number_input(
                     "Sample Index",
                     min_value=0,
@@ -681,7 +710,8 @@ def main():
                         sample_meta_data, image, point_cloud = load_dataset_sample(
                             dataset_path=dataset_path,
                             sample_index=int(sample_index),
-                            dataset_type=dataset_type
+                            dataset_type=dataset_type,
+                            sunrgbd_keep_fraction=st.session_state["sunrgbd_keep_fraction"],
                         )
                         if sample_meta_data and image is not None and point_cloud is not None:
                             sun_gt = sample_meta_data.get("ground_truth_boxes", [])
@@ -703,37 +733,73 @@ def main():
                 st.markdown("---")
                 st.subheader("🖼️ Batch Preparation (SUNRGBD)")
                 st.markdown(
-                    "Prepare a SUNRGBD batch by taking every n-th indexed scene. "
-                    "Each scene will be loaded with reconstructed point cloud and 2D/3D annotations for evaluation."
+                    "Subsample indexed scenes (**every n-th** or a **seeded random subset**), click **Prepare batch** "
+                    "to preview the selection, then **Load samples for detection** to load each scene, save RGB + "
+                    "point cloud under your output directory, and register the batch for **2_Detection**."
                 )
 
-                col_s1, col_s2 = st.columns(2)
-                with col_s1:
-                    sun_stride = st.number_input(
-                        "Take every n-th scene (SUNRGBD)",
-                        min_value=1,
-                        max_value=max(1, num_samples),
-                        value=min(10, max(1, num_samples)),
-                        step=1,
-                        key="sunrgbd_stride_every_nth",
-                    )
-                with col_s2:
-                    sun_start = st.number_input(
-                        "Start index (SUNRGBD)",
-                        min_value=0,
-                        max_value=max(0, num_samples - 1),
-                        value=0,
-                        step=1,
-                        key="sunrgbd_every_nth_start",
-                    )
+                sunrgbd_sampling_mode = st.radio(
+                    "SUNRGBD batch sampling",
+                    ("Every n-th scene", "Random subset (fixed size + seed)"),
+                    horizontal=True,
+                    key="sunrgbd_sampling_mode",
+                )
 
-                if st.button("📚 Prepare SUNRGBD batch (every n-th scene)", type="primary", key="prepare_sunrgbd_batch"):
-                    with st.spinner("Preparing SUNRGBD batch..."):
-                        step = int(sun_stride)
-                        start_idx = int(sun_start)
-                        indices_every_nth = _every_nth_indices(num_samples, step, start_idx)
+                if sunrgbd_sampling_mode == "Every n-th scene":
+                    col_s1, col_s2 = st.columns(2)
+                    with col_s1:
+                        sun_stride = st.number_input(
+                            "Take every n-th scene (SUNRGBD)",
+                            min_value=1,
+                            max_value=max(1, num_samples),
+                            value=min(10, max(1, num_samples)),
+                            step=1,
+                            key="sunrgbd_stride_every_nth",
+                        )
+                    with col_s2:
+                        sun_start = st.number_input(
+                            "Start index (SUNRGBD)",
+                            min_value=0,
+                            max_value=max(0, num_samples - 1),
+                            value=0,
+                            step=1,
+                            key="sunrgbd_every_nth_start",
+                        )
+                else:
+                    col_r1, col_r2 = st.columns(2)
+                    with col_r1:
+                        sun_batch_size = st.number_input(
+                            "Batch size (SUNRGBD)",
+                            min_value=1,
+                            max_value=max(1, num_samples),
+                            value=min(50, max(1, num_samples)),
+                            step=1,
+                            key="sunrgbd_random_batch_size",
+                        )
+                    with col_r2:
+                        sun_seed = st.number_input(
+                            "Random seed (SUNRGBD)",
+                            min_value=0,
+                            value=42,
+                            step=1,
+                            key="sunrgbd_random_seed",
+                        )
+
+                if st.button("📚 Prepare SUNRGBD batch", type="primary", key="prepare_sunrgbd_batch"):
+                    with st.spinner("Preparing SUNRGBD batch selection..."):
+                        if sunrgbd_sampling_mode == "Every n-th scene":
+                            step = int(sun_stride)
+                            start_idx = int(sun_start)
+                            indices = _every_nth_indices(num_samples, step, start_idx)
+                            mode_desc = f"every n-th (start={start_idx}, step={step})"
+                        else:
+                            indices = _seeded_random_indices(
+                                num_samples, int(sun_batch_size), int(sun_seed)
+                            )
+                            mode_desc = f"random subset (size={len(indices)}, seed={int(sun_seed)})"
+
                         filtered_batch = []
-                        for idx in indices_every_nth:
+                        for idx in indices:
                             sample = sun_samples[int(idx)]
                             filtered_batch.append(
                                 {
@@ -744,9 +810,11 @@ def main():
                                 }
                             )
                         st.session_state.filtered_batch = filtered_batch
+                        st.session_state.batch_samples_saved = False
+
                     st.success(
-                        f"✅ Prepared {len(st.session_state.filtered_batch)} SUNRGBD scenes "
-                        f"using start={start_idx}, step={step}."
+                        f"✅ Prepared {len(filtered_batch)} SUNRGBD scenes ({mode_desc}). "
+                        "Use **Load samples for detection** below to save and register for **2_Detection**."
                     )
                     st.rerun()
 
@@ -772,34 +840,41 @@ def main():
                             else:
                                 st.caption(f"#{item['sample_index']} {item.get('scene_id', '')}")
 
-                    if st.button("📚 Load all SUNRGBD batch samples for detection", key="load_all_sunrgbd_for_detection"):
+                    if st.button("📥 Load samples for detection", key="load_all_sunrgbd_for_detection"):
                         if not st.session_state.output_root_dir:
-                            st.error("Please set an output folder before preparing SUNRGBD batch files.")
+                            st.error("❌ Please set the output root directory first")
                         else:
-                            with st.spinner("Saving SUNRGBD images and point clouds to output folder..."):
-                                batch_samples = []
+                            with st.spinner("Loading and saving SUNRGBD batch samples..."):
+                                batch_samples: List[Dict[str, Any]] = []
                                 for item in filtered_batch:
-                                    sample_idx = int(item["sample_index"])
                                     sample_meta_data, image, point_cloud = load_dataset_sample(
                                         dataset_path=dataset_path,
-                                        sample_index=sample_idx,
-                                        dataset_type="sunrgbd",
+                                        sample_index=item["sample_index"],
+                                        dataset_type=dataset_type,
+                                        sunrgbd_keep_fraction=st.session_state.get(
+                                            "sunrgbd_keep_fraction", 0.8
+                                        ),
                                     )
-                                    if sample_meta_data is None or image is None or point_cloud is None:
-                                        continue
-                                    saved_desc = _save_sunrgbd_batch_sample(
-                                        dataset_path=dataset_path,
-                                        sample_index=sample_idx,
-                                        image=image,
-                                        point_cloud=point_cloud,
-                                        output_root=st.session_state.output_root_dir,
-                                    )
-                                    batch_samples.append(saved_desc)
-                            st.session_state.batch_samples = batch_samples
-                            st.session_state.process_all_samples = True
+                                    if sample_meta_data and image is not None and point_cloud is not None:
+                                        saved_desc = _save_sunrgbd_batch_sample(
+                                            dataset_path=dataset_path,
+                                            sample_index=item["sample_index"],
+                                            image=image,
+                                            point_cloud=point_cloud,
+                                            output_root=st.session_state.output_root_dir,
+                                        )
+                                        batch_samples.append(saved_desc)
+
+                                st.session_state.batch_samples = batch_samples
+                                st.session_state.process_all_samples = True
+                                st.session_state.batch_samples_saved = True
+
+                            n_ok = len(batch_samples)
+                            n_req = len(filtered_batch)
+                            if n_ok < n_req:
+                                st.warning(f"⚠️ Saved {n_ok} of {n_req} samples (some loads failed).")
                             st.success(
-                                f"✅ Prepared and saved {len(batch_samples)} SUNRGBD samples under "
-                                f"`{Path(st.session_state.output_root_dir).expanduser() / 'SUNRGBD'}`. "
+                                f"✅ Saved {n_ok} SUNRGBD samples. "
                                 "Go to **2_Detection** and click **Process entire batch**."
                             )
                             st.rerun()

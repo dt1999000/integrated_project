@@ -142,12 +142,83 @@ class SUNRGBDDatasetLoader:
 
         return gt_boxes
 
+    @staticmethod
+    def _sunrgbd_camera_to_pipeline_lidar_transform() -> np.ndarray:
+        """
+        Return a rigid transform that maps SUNRGBD camera coordinates
+        (x-right, y-down, z-front) to the pipeline LiDAR-like frame
+        (x-front, y-left, z-up).
+
+        Mapping:
+          x_l =  z_c
+          y_l = -x_c
+          z_l = -y_c
+        """
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        return transform
+
+    @staticmethod
+    def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+        if points.size == 0:
+            return points.reshape(-1, 3)
+        pts = np.asarray(points, dtype=np.float64)
+        ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+        pts_h = np.hstack([pts[:, :3], ones])
+        pts_t = (transform @ pts_h.T).T[:, :3]
+        return pts_t.astype(np.float32)
+
+    @staticmethod
+    def _transform_gt_boxes_to_pipeline_lidar(gt_boxes: List[Dict], transform: np.ndarray) -> List[Dict]:
+        """
+        Convert axis-aligned SUNRGBD camera-frame min/max boxes into
+        axis-aligned bounds in the pipeline LiDAR-like frame.
+        """
+        transformed_boxes: List[Dict] = []
+        for box in gt_boxes:
+            min_x, max_x = float(box["min_x"]), float(box["max_x"])
+            min_y, max_y = float(box["min_y"]), float(box["max_y"])
+            min_z, max_z = float(box["min_z"]), float(box["max_z"])
+
+            corners_cam = np.array(
+                [
+                    [min_x, min_y, min_z],
+                    [max_x, min_y, min_z],
+                    [max_x, max_y, min_z],
+                    [min_x, max_y, min_z],
+                    [min_x, min_y, max_z],
+                    [max_x, min_y, max_z],
+                    [max_x, max_y, max_z],
+                    [min_x, max_y, max_z],
+                ],
+                dtype=np.float64,
+            )
+            corners_lidar = SUNRGBDDatasetLoader._transform_points(corners_cam, transform)
+
+            transformed_box = dict(box)
+            transformed_box["min_x"] = float(np.min(corners_lidar[:, 0]))
+            transformed_box["max_x"] = float(np.max(corners_lidar[:, 0]))
+            transformed_box["min_y"] = float(np.min(corners_lidar[:, 1]))
+            transformed_box["max_y"] = float(np.max(corners_lidar[:, 1]))
+            transformed_box["min_z"] = float(np.min(corners_lidar[:, 2]))
+            transformed_box["max_z"] = float(np.max(corners_lidar[:, 2]))
+            transformed_boxes.append(transformed_box)
+        return transformed_boxes
+
     def load_sunrgbd_data(
         self,
         sample_index: int,
         depth_scale: float = 10000.0,
         depth_trunc: float = 10.0,
         stride: int = 1,
+        keep_fraction: float = 0.8,
     ) -> Dict:
         if len(self.samples) == 0:
             self.load_dataset()
@@ -173,12 +244,19 @@ class SUNRGBDDatasetLoader:
             depth_scale=depth_scale,
             depth_trunc=depth_trunc,
             stride=stride,
+            keep_fraction=keep_fraction,
         )
 
-        gt_boxes = self._load_ground_truth_boxes(sample.get("annotation_path"), image_rgb.shape)
-
-        # SUNRGBD is RGB-D only, so we treat camera and point cloud frame as the same.
-        camera_to_lidar_transform = np.eye(4, dtype=np.float64)
+        gt_boxes_cam = self._load_ground_truth_boxes(sample.get("annotation_path"), image_rgb.shape)
+        camera_to_lidar_transform = self._sunrgbd_camera_to_pipeline_lidar_transform()
+        point_cloud_lidar = self._transform_points(
+            point_cloud_obj.original_point_cloud,
+            camera_to_lidar_transform,
+        )
+        gt_boxes = self._transform_gt_boxes_to_pipeline_lidar(
+            gt_boxes_cam,
+            camera_to_lidar_transform,
+        )
 
         return {
             "sample_index": sample_index,
@@ -186,7 +264,7 @@ class SUNRGBDDatasetLoader:
             "image_path": sample["image_path"],
             "depth_path": sample["depth_path"],
             "intrinsics_path": sample["intrinsics_path"],
-            "point_cloud": point_cloud_obj.original_point_cloud,
+            "point_cloud": point_cloud_lidar,
             "point_cloud_colors": getattr(point_cloud_obj, "colors", None),
             "camera_intrinsic": camera_intrinsic,
             "camera_extrinsic": np.eye(4, dtype=np.float64),
@@ -197,4 +275,5 @@ class SUNRGBDDatasetLoader:
             "depth_scale": depth_scale,
             "depth_trunc": depth_trunc,
             "stride": stride,
+            "keep_fraction": keep_fraction,
         }
