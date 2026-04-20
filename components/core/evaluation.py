@@ -7,6 +7,7 @@ detected cuboids to ground truth annotations.
 
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Set
+import math
 import numpy as np
 
 from shapely.geometry import Polygon
@@ -517,6 +518,59 @@ def _normalize_gt_cuboids(cuboids: List[Dict]) -> List[Dict]:
     return normalized
 
 
+def greedy_iou_match(
+    gt_cuboids: List[Dict],
+    detected_cuboids: List[Dict],
+    iou_threshold: float,
+    match_by_category: bool,
+) -> Tuple[List[Tuple[int, int]], Set[int], Set[int]]:
+    """
+    Greedy maximum-IoU matching: pairs sorted by IoU descending, each GT/det used once.
+
+    Returns:
+        tp_pairs: list of (gt_idx, det_idx) for matched pairs (IoU >= threshold)
+        unmatched_gt: GT indices with no matched detection
+        unmatched_det: detection indices with no matched GT
+    """
+    n_gt = len(gt_cuboids)
+    n_det = len(detected_cuboids)
+    if n_gt == 0 or n_det == 0:
+        return (
+            [],
+            set(range(n_gt)),
+            set(range(n_det)),
+        )
+
+    iou_matrix = np.zeros((n_gt, n_det), dtype=np.float64)
+    for gi, gt in enumerate(gt_cuboids):
+        gt_cat = gt.get("category", "Unknown")
+        for di, det in enumerate(detected_cuboids):
+            if match_by_category and gt_cat != det.get("category", "Unknown"):
+                continue
+            iou_matrix[gi, di] = compute_3d_iou(gt, det)
+
+    pairs = [
+        (iou_matrix[gi, di], gi, di)
+        for gi in range(n_gt)
+        for di in range(n_det)
+        if iou_matrix[gi, di] >= iou_threshold
+    ]
+    pairs.sort(reverse=True)
+
+    matched_gt: Set[int] = set()
+    matched_det: Set[int] = set()
+    tp_pairs: List[Tuple[int, int]] = []
+    for _, gi, di in pairs:
+        if gi not in matched_gt and di not in matched_det:
+            matched_gt.add(gi)
+            matched_det.add(di)
+            tp_pairs.append((gi, di))
+
+    unmatched_gt = set(range(n_gt)) - matched_gt
+    unmatched_det = set(range(n_det)) - matched_det
+    return tp_pairs, unmatched_gt, unmatched_det
+
+
 def compute_frame_metrics_at_iou(
     gt_cuboids: List[Dict],
     detected_cuboids: List[Dict],
@@ -577,44 +631,23 @@ def compute_frame_metrics_at_iou(
             "n_gt": n_gt, "n_det": 0, "per_class": per_class,
         }
 
-    # Build IoU matrix
-    iou_matrix = np.zeros((n_gt, n_det), dtype=np.float64)
-    for gi, gt in enumerate(gt_cuboids):
-        gt_cat = gt.get("category", "Unknown")
-        for di, det in enumerate(detected_cuboids):
-            if match_by_category and gt_cat != det.get("category", "Unknown"):
-                continue
-            iou_matrix[gi, di] = compute_3d_iou(gt, det)
+    tp_pairs, unmatched_gt, unmatched_det = greedy_iou_match(
+        gt_cuboids, detected_cuboids, iou_threshold, match_by_category
+    )
 
-    # Greedy matching sorted by IoU descending
-    pairs = [
-        (iou_matrix[gi, di], gi, di)
-        for gi in range(n_gt)
-        for di in range(n_det)
-        if iou_matrix[gi, di] >= iou_threshold
-    ]
-    pairs.sort(reverse=True)
+    for gi, di in tp_pairs:
+        cat = gt_cuboids[gi].get("category", "Unknown")
+        per_class_tp[cat] = per_class_tp.get(cat, 0) + 1
 
-    matched_gt: Set[int] = set()
-    matched_det: Set[int] = set()
-    for _, gi, di in pairs:
-        if gi not in matched_gt and di not in matched_det:
-            matched_gt.add(gi)
-            matched_det.add(di)
-            cat = gt_cuboids[gi].get("category", "Unknown")
-            per_class_tp[cat] = per_class_tp.get(cat, 0) + 1
+    for di in unmatched_det:
+        cat = detected_cuboids[di].get("category", "Unknown")
+        per_class_fp[cat] = per_class_fp.get(cat, 0) + 1
 
-    for di, det in enumerate(detected_cuboids):
-        if di not in matched_det:
-            cat = det.get("category", "Unknown")
-            per_class_fp[cat] = per_class_fp.get(cat, 0) + 1
+    for gi in unmatched_gt:
+        cat = gt_cuboids[gi].get("category", "Unknown")
+        per_class_fn[cat] = per_class_fn.get(cat, 0) + 1
 
-    for gi, gt in enumerate(gt_cuboids):
-        if gi not in matched_gt:
-            cat = gt.get("category", "Unknown")
-            per_class_fn[cat] = per_class_fn.get(cat, 0) + 1
-
-    tp = len(matched_gt)
+    tp = len(tp_pairs)
     fp = n_det - tp
     fn = n_gt - tp
 
@@ -646,12 +679,13 @@ def compute_batch_ap(
     match_by_category: bool = False,
 ) -> Dict:
     """
-    Compute batch-level AP at a given IoU threshold.
+    Batch-level detection metrics at a fixed 3D IoU threshold.
 
-    Since per-detection confidence scores are not available, AP is estimated
-    as the F1 score (harmonic mean of precision and recall) computed globally
-    over all frames.  A per-class breakdown and per-frame metrics are also
-    returned.
+    True Average Precision (area under the precision–recall curve) is not
+    computed because per-detection confidence scores are not available.
+    Instead this returns **micro** precision/recall/F1 over all TPs/FPs/FNs
+    pooled across frames, and **macro_f1**: the unweighted mean of each
+    class's F1 (each class F1 uses micro TP/FP/FN pooled for that class).
 
     Args:
         batch_results: List of sample dicts from
@@ -662,8 +696,9 @@ def compute_batch_ap(
             pairs with the same category label.
 
     Returns:
-        Dict with ap, precision, recall, f1, total_tp/fp/fn,
-        per_frame_metrics (list), per_class (dict), and iou_threshold.
+        Dict with macro_f1, precision, recall, f1 (micro), total_tp/fp/fn,
+        per_frame_metrics (list), per_class (dict with precision, recall, f1),
+        and iou_threshold.
     """
     total_tp = 0
     total_fp = 0
@@ -698,7 +733,7 @@ def compute_batch_ap(
 
     all_cats = set(list(class_tp) + list(class_fp) + list(class_fn))
     per_class: Dict[str, Dict] = {}
-    ap_per_class: List[float] = []
+    f1_per_class: List[float] = []
     for cat in all_cats:
         tp_c = class_tp.get(cat, 0)
         fp_c = class_fp.get(cat, 0)
@@ -708,15 +743,14 @@ def compute_batch_ap(
         f1_c = 2 * p_c * r_c / (p_c + r_c) if (p_c + r_c) > 0 else 0.0
         per_class[cat] = {
             "TP": tp_c, "FP": fp_c, "FN": fn_c,
-            "precision": p_c, "recall": r_c, "ap": f1_c,
+            "precision": p_c, "recall": r_c, "f1": f1_c,
         }
-        ap_per_class.append(f1_c)
+        f1_per_class.append(f1_c)
 
-    # Mean AP is the mean F1 per class; falls back to global F1 if no classes found
-    mean_ap = float(np.mean(ap_per_class)) if ap_per_class else f1
+    macro_f1 = float(np.mean(f1_per_class)) if f1_per_class else f1
 
     return {
-        "ap": mean_ap,
+        "macro_f1": macro_f1,
         "precision": precision,
         "recall": recall,
         "f1": f1,
@@ -729,25 +763,220 @@ def compute_batch_ap(
     }
 
 
+def _azimuth_deg_xy(x: float, y: float) -> float:
+    """atan2(y, x) in degrees, range (-180, 180]."""
+    return math.degrees(math.atan2(float(y), float(x)))
+
+
+def _wrap360(deg: float) -> float:
+    return (deg + 360.0) % 360.0
+
+
+def _azimuth_bin_index(
+    x: float,
+    y: float,
+    n_bins: int,
+    *,
+    angular_mode: str = "full360",
+    angle_offset_deg: float = 0.0,
+    angle_span_deg: float = 360.0,
+) -> int:
+    """
+    Map (x, y) to an angular bin index.
+
+    ``angular_mode``:
+    - ``full360``: uniform bins on ``(atan2_deg wrapped to [0,360) - offset) % 360``.
+    - ``rot_clip``: same rotation then clip to ``[0, angle_span_deg)`` before binning
+      (values beyond the span map to the last bin; useful when detections sit in a
+      camera-forward arc such as former 90°–270° after a 90° offset → 0°–180°).
+    - ``abs180``: bins on ``abs(atan2_deg)`` in ``[0, 180°]`` (symmetric about +x).
+    """
+    n_bins = max(1, int(n_bins))
+    deg = _azimuth_deg_xy(x, y)
+    a360 = _wrap360(deg)
+
+    if angular_mode == "abs180":
+        span = 180.0
+        u = abs(deg)
+        if u >= span:
+            u = span - 1e-9
+        width = span / float(n_bins)
+        idx = int(u / width)
+    elif angular_mode == "rot_clip":
+        span = max(1e-9, float(angle_span_deg))
+        u = (a360 - float(angle_offset_deg) + 360.0) % 360.0
+        u_clipped = min(max(u, 0.0), span - 1e-9)
+        width = span / float(n_bins)
+        idx = int(u_clipped / width)
+    else:
+        # full360
+        span = 360.0
+        u = (a360 - float(angle_offset_deg) + 360.0) % 360.0
+        width = span / float(n_bins)
+        idx = int(u / width)
+
+    if idx >= n_bins:
+        idx = n_bins - 1
+    return idx
+
+
+def _azimuth_bin_label(
+    i: int,
+    n_bins: int,
+    *,
+    angular_mode: str = "full360",
+    angle_offset_deg: float = 0.0,
+    angle_span_deg: float = 360.0,
+) -> str:
+    if angular_mode == "abs180":
+        span = 180.0
+        lo = i * span / float(n_bins)
+        hi = (i + 1) * span / float(n_bins)
+        return f"|θ| {lo:.0f}°–{hi:.0f}°"
+
+    span = 360.0 if angular_mode == "full360" else max(1e-9, float(angle_span_deg))
+    lo = i * span / float(n_bins)
+    hi = (i + 1) * span / float(n_bins)
+    w_lo = (lo + float(angle_offset_deg)) % 360.0
+    w_hi = (hi + float(angle_offset_deg)) % 360.0
+    return f"{w_lo:.0f}°–{w_hi:.0f}°"
+
+
+def compute_batch_azimuth_bin_metrics(
+    batch_results: List[Dict],
+    iou_threshold: float,
+    n_bins: int,
+    match_by_category: bool,
+    *,
+    angular_mode: str = "full360",
+    angle_offset_deg: float = 0.0,
+    angle_span_deg: float = 360.0,
+) -> Dict:
+    """
+    Per horizontal azimuth bin: TP, FP, FN and precision (per-bin precision = TP/(TP+FP)).
+
+    Objects are assigned using the 3D center of the GT (TP, FN) or detection (FP).
+    Default ``full360`` matches the legacy behaviour: ``atan2(y, x)`` wrapped to
+    ``[0, 360°)``, 0° along +x, equal-width bins.
+
+    Args:
+        batch_results: Evaluable samples (``ground_truth_cuboids`` may be empty lists).
+        iou_threshold: Same IoU rule as ``compute_frame_metrics_at_iou``.
+        n_bins: Number of equal angular bins (>= 1).
+        match_by_category: Same as other batch metrics.
+        angular_mode: ``full360`` | ``rot_clip`` | ``abs180`` (see ``_azimuth_bin_index``).
+        angle_offset_deg: Subtracted after wrapping to ``[0, 360)`` (for ``full360`` /
+            ``rot_clip``). Typical sim “camera-forward” remap: ``90`` with ``rot_clip``
+            and ``angle_span_deg=180`` maps the former ``90°–270°`` arc onto ``0°–180°``.
+        angle_span_deg: Span of the binned axis after rotation (``rot_clip`` only;
+            clipped to this interval before binning).
+
+    Returns:
+        Dict with ``bins``, ``n_bins``, ``iou_threshold``, and angular metadata.
+    """
+    n_bins = max(1, int(n_bins))
+    tp_bins = [0] * n_bins
+    fp_bins = [0] * n_bins
+    fn_bins = [0] * n_bins
+
+    for sample in batch_results:
+        gt = _normalize_gt_cuboids(sample.get("ground_truth_cuboids", []))
+        det = sample.get("detected_cuboids", [])
+
+        tp_pairs, unmatched_gt, unmatched_det = greedy_iou_match(
+            gt, det, iou_threshold, match_by_category
+        )
+
+        for gi, _di in tp_pairs:
+            c = CuboidMatcher.get_cuboid_center(gt[gi])
+            bi = _azimuth_bin_index(
+                float(c[0]),
+                float(c[1]),
+                n_bins,
+                angular_mode=angular_mode,
+                angle_offset_deg=angle_offset_deg,
+                angle_span_deg=angle_span_deg,
+            )
+            tp_bins[bi] += 1
+
+        for di in unmatched_det:
+            c = CuboidMatcher.get_cuboid_center(det[di])
+            bi = _azimuth_bin_index(
+                float(c[0]),
+                float(c[1]),
+                n_bins,
+                angular_mode=angular_mode,
+                angle_offset_deg=angle_offset_deg,
+                angle_span_deg=angle_span_deg,
+            )
+            fp_bins[bi] += 1
+
+        for gi in unmatched_gt:
+            c = CuboidMatcher.get_cuboid_center(gt[gi])
+            bi = _azimuth_bin_index(
+                float(c[0]),
+                float(c[1]),
+                n_bins,
+                angular_mode=angular_mode,
+                angle_offset_deg=angle_offset_deg,
+                angle_span_deg=angle_span_deg,
+            )
+            fn_bins[bi] += 1
+
+    bins_out: List[Dict] = []
+    for i in range(n_bins):
+        tpi, fpi, fni = tp_bins[i], fp_bins[i], fn_bins[i]
+        prec = tpi / (tpi + fpi) if (tpi + fpi) > 0 else 0.0
+        bins_out.append({
+            "bin_index": i,
+            "label": _azimuth_bin_label(
+                i,
+                n_bins,
+                angular_mode=angular_mode,
+                angle_offset_deg=angle_offset_deg,
+                angle_span_deg=angle_span_deg,
+            ),
+            "TP": tpi,
+            "FP": fpi,
+            "FN": fni,
+            "precision": prec,
+        })
+
+    span_used = (
+        180.0
+        if angular_mode == "abs180"
+        else (360.0 if angular_mode == "full360" else max(1e-9, float(angle_span_deg)))
+    )
+
+    return {
+        "bins": bins_out,
+        "n_bins": n_bins,
+        "iou_threshold": iou_threshold,
+        "angular_mode": angular_mode,
+        "angle_offset_deg": float(angle_offset_deg),
+        "angle_span_deg": float(angle_span_deg),
+        "binned_span_deg": span_used,
+    }
+
+
 def compute_batch_statistics(
     batch_results: List[Dict],
     total_queued: int = 0,
     match_by_category: bool = False,
 ) -> Dict:
     """
-    Compute comprehensive batch evaluation statistics including AP_50 and AP_25.
+    Compute comprehensive batch evaluation statistics at IoU 0.5 and 0.25.
 
-    AP_50 (AP at IoU ≥ 0.5) is the standard benchmark metric used by KITTI
-    and ScanNet.  AP_25 (AP at IoU ≥ 0.25) is a looser threshold used in
-    indoor benchmarks (e.g. ScanRefer).  Both are computed as the mean F1
-    score per category across all evaluable frames.
+    ``ap_50`` / ``ap_25`` hold micro precision/recall/F1, macro-F1 per class,
+    and per-frame breakdowns (see ``compute_batch_ap``). True AP is not
+    computed without detection scores.
 
     Args:
         batch_results: List of sample dicts from
             ``batch_export_results['samples']``.
         total_queued: Number of samples originally queued for processing
             (from ``batch_samples``).  Used to compute failure count.
-        match_by_category: Forwarded to the underlying AP computation.
+        match_by_category: Forwarded to the underlying batch metric computation.
 
     Returns:
         Dict with:
@@ -756,7 +985,7 @@ def compute_batch_statistics(
             ap_50 (full result dict), ap_25 (full result dict).
     """
     n_total = len(batch_results)
-    results_with_gt = [r for r in batch_results if r.get("ground_truth_cuboids")]
+    results_with_gt = [r for r in batch_results if r.get("ground_truth_cuboids") is not None]
     n_with_gt = len(results_with_gt)
     n_failed = max(0, total_queued - n_total)
 

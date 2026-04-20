@@ -1018,8 +1018,6 @@ def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) 
         )
     else:
         class_names = params.get('class_names', [])
-        if not class_names:
-            class_names = ['car', 'person', 'bicycle']
         print(f'class_names: {class_names}')
         step_3_result = step_3_sam_segmentation(
             sample_meta_data=st.session_state.sample['sample_meta_data'],
@@ -1085,10 +1083,9 @@ def _run_pipeline_for_batch_sample(
         f"dataset_path={dataset_path}, dataset_type={dataset_type}, "
         f"sample_index={sample_index}, frame_index={frame_index}"
     )
-    use_saved_media_paths = (
-        dataset_type.lower() == "sunrgbd"
-        and bool(st.session_state.get("batch_samples_saved"))
-    )
+    # SUNRGBD is always loaded directly from the dataset (depth .mat + label .txt).
+    # We no longer rely on pre-saved PCD scenes for batch mode.
+    use_saved_media_paths = False
     print(f'st.session_state.get("batch_samples_saved"): {st.session_state.get("batch_samples_saved")}')
     print(f'dataset_type.lower(): {dataset_type.lower()}')
     print(f'bool(st.session_state.get("batch_samples_saved")): {bool(st.session_state.get("batch_samples_saved"))}')
@@ -1606,6 +1603,12 @@ def main():
         help="Enter class names separated by commas (e.g., 'car, person, bicycle')"
     )
 
+    # Parse class names from sidebar input for all dataset types.
+    parsed_class_names: List[str] = []
+    if class_names_input:
+        parsed_class_names = [name.strip() for name in class_names_input.split(',') if name.strip()]
+    st.session_state.params['class_names'] = parsed_class_names
+
     # For SUNRGBD (indoor-only) dataset, skip LLM initialization entirely.
     is_sunrgbd_dataset = sidebar_dataset_type == "sunrgbd"
 
@@ -1680,16 +1683,14 @@ def main():
 
             st.sidebar.caption("💡 LLM is used when semantic similarity doesn't find a match (similarity < 0.75)")
 
-        # Parse class names and pre-compute dimensions via LLM
-        if class_names_input:
-            class_names = [name.strip() for name in class_names_input.split(',') if name.strip()]
-
+        # Pre-compute dimensions via LLM for parsed class names.
+        if parsed_class_names:
             # Check if class names have changed
             previous_class_names = st.session_state.get('previous_class_names', [])
-            if set(class_names) != set(previous_class_names):
+            if set(parsed_class_names) != set(previous_class_names):
                 with st.sidebar.spinner("Pre-computing dimensions for class names..."):
                     dims_by_class = {}
-                    for class_name in class_names:
+                    for class_name in parsed_class_names:
                         length, width, height = query_llm_for_dimensions(class_name)
                         dims_by_class[class_name] = (length, width, height)
 
@@ -1700,18 +1701,15 @@ def main():
                         for k, v in dims_by_class.items()
                     }
 
-                st.session_state.previous_class_names = class_names.copy()
-
-            st.session_state.params['class_names'] = class_names
-        else:
-            st.session_state.params['class_names'] = []
+                st.session_state.previous_class_names = parsed_class_names.copy()
 
         if not st.session_state.params['class_names']:
             st.sidebar.warning("⚠️ Please enter at least one class name")
     else:
         # For SUNRGBD, do not initialize or query any LLM components.
-        st.session_state.params['class_names'] = []
         st.sidebar.info("LLM-based dimension lookup is disabled for SUNRGBD dataset.")
+        if not st.session_state.params['class_names']:
+            st.sidebar.warning("⚠️ Please enter at least one class name")
     
     is_sam2 = st.session_state.params['sam_model_type'].startswith('sam2')
     if is_sam2:
@@ -1893,7 +1891,8 @@ def main():
                     saved_image_path=str(sample_desc.get("image_path") or ""),
                     saved_point_cloud_path=str(sample_desc.get("point_cloud_path") or ""),
                 )
-                prev_image = st.session_state.sample.get("image") if "sample" in st.session_state else None
+                sample_state = st.session_state.get("sample")
+                prev_image = sample_state.get("image") if isinstance(sample_state, dict) else None
                 if export_res is not None:
                     results_list.append(export_res)
                 else:
@@ -1902,6 +1901,9 @@ def main():
                 "samples": results_list,
                 "batch_tracking_enabled": do_batch_tracking,
             }
+            if results_list:
+                # Keep per-sample export consumers working after batch runs.
+                st.session_state.export_results = results_list[-1]
             print(f"[batch] collected {len(results_list)} successful samples")
             if do_batch_tracking:
                 datumaro_state = tracker.build_datumaro_state()

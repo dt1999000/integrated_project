@@ -4,30 +4,32 @@ SUNRGBD dataset loader.
 This loader indexes SUNRGBD scenes and provides a normalized sample output
 compatible with the rest of the pipeline:
   - RGB image stream: HxWx3 RGB numpy array
-  - Point cloud stream: Nx3 numpy array reconstructed from depth
+  - Point cloud stream: Nx3 numpy array loaded from depth .mat
   - Metadata with camera intrinsics and optional ground-truth boxes
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional
-import json
+from typing import Dict, List, Optional, Tuple
+import re
 
 import cv2
 import numpy as np
+from scipy.io import loadmat
 
-from components.core.pointcloud_projection import PointCloud, load_sunrgbd_intrinsics
+from components.core.pointcloud_projection import load_sunrgbd_calibration
 
 
 class SUNRGBDDatasetLoader:
     """
     Loader for SUNRGBD directory trees.
 
-    Expected per-scene layout:
-      <scene_root>/
-        image/<name>.jpg
-        depth_bfx/<name>.png
-        intrinsics.txt
-        annotation2D3D/index.json   (optional)
+    Expected SUNRGBD trainval layout:
+      <dataroot>/sunrgbd_trainval/
+        calib/<id>.txt
+        depth/<id>.mat
+        image/<id>.jpg
+        label/<id>.txt      (preferred, version 2)
+        label_v1/<id>.txt   (fallback)
     """
 
     def __init__(self, dataroot: str):
@@ -39,33 +41,51 @@ class SUNRGBDDatasetLoader:
             raise FileNotFoundError(f"SUNRGBD root not found: {self.dataroot}")
 
         self.samples = []
-        intrinsics_files = sorted(self.dataroot.glob("**/intrinsics.txt"))
-        for intr_file in intrinsics_files:
-            scene_root = intr_file.parent
-            image_dir = scene_root / "image"
-            depth_dir = scene_root / "depth_bfx"
-            if not image_dir.exists() or not depth_dir.exists():
-                continue
+        trainval_root = self.dataroot / "sunrgbd_trainval"
+        data_root = trainval_root if trainval_root.exists() else self.dataroot
 
-            image_files = sorted([p for p in image_dir.iterdir() if p.suffix.lower() in {".jpg", ".png"}])
-            depth_files = sorted([p for p in depth_dir.iterdir() if p.suffix.lower() == ".png"])
-            if len(image_files) == 0 or len(depth_files) == 0:
-                continue
+        calib_dir = data_root / "calib"
+        depth_dir = data_root / "depth"
+        image_dir = data_root / "image"
+        label_dir = data_root / "label"
+        label_v1_dir = data_root / "label_v1"
 
-            image_path = image_files[0]
-            depth_path = depth_files[0]
-            annotation_path = scene_root / "annotation2D3D" / "index.json"
-            if not annotation_path.exists():
+        if not calib_dir.exists() or not depth_dir.exists() or not image_dir.exists():
+            return self.samples
+
+        image_map: Dict[str, Path] = {}
+        for p in sorted(image_dir.iterdir()):
+            if p.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+                image_map[p.stem] = p
+
+        depth_map: Dict[str, Path] = {}
+        for p in sorted(depth_dir.iterdir()):
+            if p.suffix.lower() == ".mat":
+                depth_map[p.stem] = p
+
+        calib_map: Dict[str, Path] = {}
+        for p in sorted(calib_dir.iterdir()):
+            if p.suffix.lower() == ".txt":
+                calib_map[p.stem] = p
+
+        sample_ids = sorted(set(image_map.keys()) & set(depth_map.keys()) & set(calib_map.keys()))
+        for sample_id in sample_ids:
+            annotation_v2_path = label_dir / f"{sample_id}.txt"
+            annotation_v1_path = label_v1_dir / f"{sample_id}.txt"
+            if annotation_v2_path.exists():
+                annotation_path = annotation_v2_path
+            elif annotation_v1_path.exists():
+                annotation_path = annotation_v1_path
+            else:
                 annotation_path = None
-
             self.samples.append(
                 {
-                    "scene_root": str(scene_root),
-                    "scene_id": scene_root.name,
-                    "image_path": str(image_path),
-                    "depth_path": str(depth_path),
-                    "intrinsics_path": str(intr_file),
-                    "annotation_path": str(annotation_path) if annotation_path else None,
+                    "scene_root": str(data_root),
+                    "scene_id": sample_id,
+                    "image_path": str(image_map[sample_id]),
+                    "depth_path": str(depth_map[sample_id]),
+                    "intrinsics_path": str(calib_map[sample_id]),
+                    "annotation_path": str(annotation_path) if annotation_path is not None else None,
                 }
             )
 
@@ -79,90 +99,180 @@ class SUNRGBDDatasetLoader:
         if annotation_path is None:
             return []
 
-        with open(annotation_path, "r", encoding="utf-8") as f:
-            ann = json.load(f)
-
-        objects = ann.get("objects", [])
-        frames = ann.get("frames", [])
-        frame_polygons = []
-        if len(frames) > 0:
-            frame_polygons = frames[0].get("polygon", [])
-
         h, w = image_shape[:2]
         gt_boxes: List[Dict] = []
+        with open(annotation_path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
 
-        for poly2d in frame_polygons:
-            obj_idx = poly2d.get("object")
-            if obj_idx is None or obj_idx < 0 or obj_idx >= len(objects):
+        float_pattern = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+        for line in lines:
+            tokens = line.split()
+            if len(tokens) < 2:
                 continue
 
-            obj = objects[obj_idx]
-            name = obj.get("name", "Unknown")
-            base_name = name.split(":")[0] if ":" in name else name
-            poly3d_list = obj.get("polygon", [])
-            if len(poly3d_list) == 0:
+            label = tokens[0]
+            numeric_values = [float(tok) for tok in tokens[1:] if float_pattern.match(tok)]
+            if len(numeric_values) < 6:
                 continue
 
-            poly3d = poly3d_list[0]
-            xs = np.asarray(poly3d.get("X", []), dtype=np.float64)
-            zs = np.asarray(poly3d.get("Z", []), dtype=np.float64)
-            ymin = float(poly3d.get("Ymin", 0.0))
-            ymax = float(poly3d.get("Ymax", 0.0))
-            if xs.size == 0 or zs.size == 0:
-                continue
-
-            # SUNRGBD stores "up/down" limits in Ymin/Ymax; normalize to min/max.
-            y_low = min(ymin, ymax)
-            y_high = max(ymin, ymax)
-
-            x2d = np.asarray(poly2d.get("x", []), dtype=np.float64)
-            y2d = np.asarray(poly2d.get("y", []), dtype=np.float64)
             bbox_2d = None
-            if x2d.size > 0 and y2d.size > 0:
-                left = int(np.clip(np.min(x2d), 0, w - 1))
-                right = int(np.clip(np.max(x2d), 0, w - 1))
-                top = int(np.clip(np.min(y2d), 0, h - 1))
-                bottom = int(np.clip(np.max(y2d), 0, h - 1))
+            if len(numeric_values) >= 4:
+                left = int(np.clip(round(numeric_values[0]), 0, w - 1))
+                top = int(np.clip(round(numeric_values[1]), 0, h - 1))
+                right = int(np.clip(round(numeric_values[2]), 0, w - 1))
+                bottom = int(np.clip(round(numeric_values[3]), 0, h - 1))
                 if right > left and bottom > top:
                     bbox_2d = {"left": left, "top": top, "right": right, "bottom": bottom}
 
+            if len(numeric_values) >= 11:
+                # Common SUNRGBD txt convention:
+                # ... h, w, l, cx, cy, cz, heading
+                h3d, w3d, l3d, cx, cy, cz = numeric_values[-7:-1]
+                min_x = float(cx - (l3d * 0.5))
+                max_x = float(cx + (l3d * 0.5))
+                min_y = float(cy - (h3d * 0.5))
+                max_y = float(cy + (h3d * 0.5))
+                min_z = float(cz - (w3d * 0.5))
+                max_z = float(cz + (w3d * 0.5))
+            else:
+                min_x, min_y, min_z, max_x, max_y, max_z = numeric_values[-6:]
+
             gt_boxes.append(
                 {
-                    "category": base_name if base_name else "Unknown",
-                    "class": base_name if base_name else "Unknown",
+                    "category": label if label else "Unknown",
+                    "class": label if label else "Unknown",
                     "bbox_2d": bbox_2d,
-                    "min_x": float(np.min(xs)),
-                    "max_x": float(np.max(xs)),
-                    "min_y": float(y_low),
-                    "max_y": float(y_high),
-                    "min_z": float(np.min(zs)),
-                    "max_z": float(np.max(zs)),
+                    "min_x": float(min(min_x, max_x)),
+                    "max_x": float(max(min_x, max_x)),
+                    "min_y": float(min(min_y, max_y)),
+                    "max_y": float(max(min_y, max_y)),
+                    "min_z": float(min(min_z, max_z)),
+                    "max_z": float(max(min_z, max_z)),
                 }
             )
 
         return gt_boxes
 
     @staticmethod
-    def _sunrgbd_camera_to_pipeline_lidar_transform() -> np.ndarray:
-        """
-        Return a rigid transform that maps SUNRGBD camera coordinates
-        (x-right, y-down, z-front) to the pipeline LiDAR-like frame
-        (x-front, y-left, z-up).
+    def _load_point_cloud_from_mat(depth_mat_path: str) -> Dict[str, Optional[np.ndarray]]:
+        mat_data = loadmat(depth_mat_path)
+        candidate_arrays: List[np.ndarray] = []
+        for key, value in mat_data.items():
+            if key.startswith("__"):
+                continue
+            if isinstance(value, np.ndarray) and value.ndim == 2:
+                candidate_arrays.append(value)
 
-        Mapping:
-          x_l =  z_c
-          y_l = -x_c
-          z_l = -y_c
+        if len(candidate_arrays) == 0:
+            return {"points": np.zeros((0, 3), dtype=np.float32), "colors": None}
+
+        best = max(candidate_arrays, key=lambda arr: int(arr.shape[0] * arr.shape[1]))
+        arr = np.asarray(best, dtype=np.float32)
+        if arr.shape[0] in {3, 6} and arr.shape[1] > arr.shape[0]:
+            arr = arr.T
+
+        if arr.shape[1] < 3:
+            return {"points": np.zeros((0, 3), dtype=np.float32), "colors": None}
+
+        points = arr[:, :3].astype(np.float32)
+        colors = None
+        if arr.shape[1] >= 6:
+            rgb = arr[:, 3:6]
+            if np.max(rgb) <= 1.0:
+                rgb = np.clip(rgb * 255.0, 0.0, 255.0)
+            colors = rgb.astype(np.uint8)
+
+        return {"points": points, "colors": colors}
+
+    @staticmethod
+    def _subsample_point_cloud(
+        points: np.ndarray,
+        colors: Optional[np.ndarray],
+        stride: int,
+        keep_fraction: float,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
-        transform = np.eye(4, dtype=np.float64)
-        transform[:3, :3] = np.array(
+        Reduce point count from SUNRGBD ``depth/*.mat`` clouds.
+
+        ``stride`` keeps every n-th row (same ordering as in the .mat array).
+        ``keep_fraction`` randomly retains that fraction of the remaining points
+        (matches the intent of the extraction-page slider / RGBD path).
+        """
+        if points.size == 0:
+            return points, colors
+
+        pts = points
+        clr = colors
+        step = max(1, int(stride))
+        if step > 1:
+            idx_stride = np.arange(0, len(pts), step, dtype=int)
+            pts = pts[idx_stride]
+            if clr is not None:
+                clr = clr[idx_stride]
+
+        n = len(pts)
+        frac = float(keep_fraction)
+        if frac >= 1.0 or n == 0:
+            return pts, clr
+
+        frac = max(0.0, min(1.0, frac))
+        if frac <= 0.0:
+            empty = pts[:0]
+            return empty, clr[:0] if clr is not None else None
+
+        target_n = int(float(n) * frac)
+        if target_n <= 0:
+            target_n = 1
+        if target_n >= n:
+            return pts, clr
+
+        rng = np.random.default_rng()
+        keep_idx = rng.choice(n, size=target_n, replace=False)
+        pts_out = pts[keep_idx]
+        clr_out = clr[keep_idx] if clr is not None else None
+        return pts_out, clr_out
+
+    @staticmethod
+    def _sunrgbd_camera_to_depth_transform(rtilt: np.ndarray) -> np.ndarray:
+        """
+        Build camera->upright-depth transform from SUNRGBD ``Rtilt``.
+
+        The SUNRGBD point cloud stored in ``depth/*.mat`` follows an upright-depth
+        convention used by SUNRGBD preprocessing:
+          - X right
+          - Y forward
+          - Z up
+
+        SUNRGBD depth points are stored in an upright-depth frame while
+        image projection expects camera optical coordinates. In practice, the
+        mapping from upright-depth -> camera combines:
+
+          1) ``Rtilt`` alignment
+          2) axis remap depth->camera:
+             x_c =  x_d
+             y_c = -z_d
+             z_c =  y_d
+
+        Since the projection class consumes ``camera_to_lidar_transform``
+        (camera -> depth-like frame), we return the inverse of that composed
+        depth->camera map.
+        """
+        # depth(upright) -> camera optical axis conversion
+        depth_to_camera_axes = np.array(
             [
-                [0.0, 0.0, 1.0],
-                [-1.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0],
+                [0.0, 1.0, 0.0],
             ],
             dtype=np.float64,
         )
+
+        # depth -> camera
+        depth_to_camera = depth_to_camera_axes @ np.asarray(rtilt, dtype=np.float64)
+
+        # camera -> depth
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = np.linalg.inv(depth_to_camera)
         return transform
 
     @staticmethod
@@ -232,31 +342,20 @@ class SUNRGBDDatasetLoader:
             raise FileNotFoundError(f"Could not read image: {sample['image_path']}")
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-        depth_img = cv2.imread(sample["depth_path"], cv2.IMREAD_UNCHANGED)
-        if depth_img is None:
-            raise FileNotFoundError(f"Could not read depth: {sample['depth_path']}")
+        camera_intrinsic, camera_rtilt = load_sunrgbd_calibration(sample["intrinsics_path"])
+        point_cloud_data = self._load_point_cloud_from_mat(sample["depth_path"])
+        point_cloud_depth = point_cloud_data["points"]
+        point_cloud_colors = point_cloud_data["colors"]
 
-        camera_intrinsic = load_sunrgbd_intrinsics(sample["intrinsics_path"])
-        point_cloud_obj = PointCloud.from_rgbd_sunrgbd(
-            rgb_image=image_rgb,
-            depth_image=depth_img,
-            camera_intrinsic=camera_intrinsic,
-            depth_scale=depth_scale,
-            depth_trunc=depth_trunc,
-            stride=stride,
-            keep_fraction=keep_fraction,
+        point_cloud_depth, point_cloud_colors = self._subsample_point_cloud(
+            point_cloud_depth,
+            point_cloud_colors,
+            stride=int(stride),
+            keep_fraction=float(keep_fraction),
         )
 
-        gt_boxes_cam = self._load_ground_truth_boxes(sample.get("annotation_path"), image_rgb.shape)
-        camera_to_lidar_transform = self._sunrgbd_camera_to_pipeline_lidar_transform()
-        point_cloud_lidar = self._transform_points(
-            point_cloud_obj.original_point_cloud,
-            camera_to_lidar_transform,
-        )
-        gt_boxes = self._transform_gt_boxes_to_pipeline_lidar(
-            gt_boxes_cam,
-            camera_to_lidar_transform,
-        )
+        gt_boxes = self._load_ground_truth_boxes(sample.get("annotation_path"), image_rgb.shape)
+        camera_to_lidar_transform = self._sunrgbd_camera_to_depth_transform(camera_rtilt)
 
         return {
             "sample_index": sample_index,
@@ -264,11 +363,14 @@ class SUNRGBDDatasetLoader:
             "image_path": sample["image_path"],
             "depth_path": sample["depth_path"],
             "intrinsics_path": sample["intrinsics_path"],
-            "point_cloud": point_cloud_lidar,
-            "point_cloud_colors": getattr(point_cloud_obj, "colors", None),
+            "point_cloud": point_cloud_depth,
+            "point_cloud_colors": point_cloud_colors,
             "camera_intrinsic": camera_intrinsic,
+            "camera_rtilt": camera_rtilt,
             "camera_extrinsic": np.eye(4, dtype=np.float64),
             "camera_to_lidar_transform": camera_to_lidar_transform,
+            "camera_frame": "camera_optical",
+            "lidar_frame": "sunrgbd_upright_depth",
             "ground_truth_boxes": gt_boxes,
             "dataset_type": "sunrgbd",
             "image_shape": image_rgb.shape[:2],

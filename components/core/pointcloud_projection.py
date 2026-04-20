@@ -1140,23 +1140,67 @@ class PointCloud:
         return pc
 
 
-def load_sunrgbd_intrinsics(intrinsics_path: str) -> np.ndarray:
+def load_sunrgbd_calibration(intrinsics_path: str) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Load a 3×3 camera intrinsic matrix from a SunRGBD ``intrinsics.txt`` file.
+    Load SUNRGBD calibration entries from a calibration text file.
 
-    The file contains 3 lines with 3 space-separated floats each::
+    Supported formats:
 
-        fx  0  cx
-         0 fy  cy
-         0  0   1
+    1) 18-value SUNRGBD trainval calib file:
+       - first 9 values: ``Rtilt`` (row-major)
+       - second 9 values: ``K`` (column-major flattening in official files)
+
+    2) 9-value intrinsics-only file:
+       - values are interpreted as row-major ``K``.
+       - ``Rtilt`` defaults to identity.
 
     Args:
-        intrinsics_path: Path to the ``intrinsics.txt`` file.
+        intrinsics_path: Path to SUNRGBD calibration file.
+
+    Returns:
+        Tuple ``(K, Rtilt)``, both 3x3 float64 arrays.
+    """
+    values = np.loadtxt(intrinsics_path, dtype=np.float64).reshape(-1)
+    n_values = int(values.size)
+
+    if n_values >= 18:
+        rtilt = values[:9].reshape(3, 3)
+        k_flat = values[9:18]
+        K = k_flat.reshape(3, 3, order="F")
+    elif n_values == 9:
+        K = values.reshape(3, 3)
+        rtilt = np.eye(3, dtype=np.float64)
+    else:
+        raise ValueError(
+            f"Unsupported SUNRGBD calibration format in '{intrinsics_path}': "
+            f"expected 9 or >=18 values, got {n_values}"
+        )
+
+    return K, rtilt
+
+
+def load_sunrgbd_intrinsics(intrinsics_path: str) -> np.ndarray:
+    """
+    Load a 3×3 camera intrinsic matrix from SUNRGBD calibration text.
+
+    Supported formats:
+
+    1) ``intrinsics.txt`` style (3x3, row-major), e.g.::
+
+           fx  0  cx
+            0 fy  cy
+            0  0   1
+
+    2) ``sunrgbd_trainval/calib/*.txt`` style with 18 values:
+       first 9 are Rtilt, second 9 are K flattened in column-major order.
+
+    Args:
+        intrinsics_path: Path to SUNRGBD calibration file.
 
     Returns:
         3×3 numpy float64 intrinsic matrix.
     """
-    K = np.loadtxt(intrinsics_path, dtype=np.float64).reshape(3, 3)
+    K, _ = load_sunrgbd_calibration(intrinsics_path)
     return K
 
 

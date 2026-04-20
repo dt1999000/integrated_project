@@ -5,7 +5,6 @@ Loads and extracts samples from different dataset formats (KITTI, nuScenes, sim)
 import streamlit as st
 import numpy as np
 import cv2
-import open3d as o3d
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 
@@ -112,42 +111,6 @@ def _sim_rgb_path_for_link(dataset_path: str, subset_name: str, link: Dict) -> O
     subset_path = Path(dataset_path) / subset_name
     return subset_path / "samples" / filename
 
-
-def _prepare_sunrgbd_output_dirs(output_root: str) -> Tuple[Path, Path]:
-    sunrgbd_root = Path(output_root).expanduser() / "SUNRGBD"
-    images_dir = sunrgbd_root / "images"
-    lidar_dir = sunrgbd_root / "lidar"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    lidar_dir.mkdir(parents=True, exist_ok=True)
-    return images_dir, lidar_dir
-
-
-def _save_sunrgbd_batch_sample(
-    dataset_path: str,
-    sample_index: int,
-    image: np.ndarray,
-    point_cloud: np.ndarray,
-    output_root: str,
-) -> Dict[str, str]:
-    images_dir, lidar_dir = _prepare_sunrgbd_output_dirs(output_root)
-    frame_stem = f"frame_{int(sample_index):06d}"
-    image_out = images_dir / f"{frame_stem}.png"
-    point_cloud_out = lidar_dir / f"{frame_stem}.pcd"
-
-    image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(str(image_out), image_bgr)
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(point_cloud[:, :3])
-    o3d.io.write_point_cloud(str(point_cloud_out), pcd, write_ascii=True)
-
-    return {
-        "dataset_type": "sunrgbd",
-        "dataset_path": dataset_path,
-        "sample_index": int(sample_index),
-        "image_path": str(image_out),
-        "point_cloud_path": str(point_cloud_out),
-    }
 
 def ensure_filter_state(prefix: str) -> None:
     """Ensure st.session_state[f'{prefix}_filter_params'] exists with defaults."""
@@ -734,8 +697,8 @@ def main():
                 st.subheader("🖼️ Batch Preparation (SUNRGBD)")
                 st.markdown(
                     "Subsample indexed scenes (**every n-th** or a **seeded random subset**), click **Prepare batch** "
-                    "to preview the selection, then **Load samples for detection** to load each scene, save RGB + "
-                    "point cloud under your output directory, and register the batch for **2_Detection**."
+                    "to preview the selection, then **Load samples for detection** to register selected scene indices "
+                    "for **2_Detection**."
                 )
 
                 sunrgbd_sampling_mode = st.radio(
@@ -814,7 +777,7 @@ def main():
 
                     st.success(
                         f"✅ Prepared {len(filtered_batch)} SUNRGBD scenes ({mode_desc}). "
-                        "Use **Load samples for detection** below to save and register for **2_Detection**."
+                        "Use **Load samples for detection** below to register them for **2_Detection**."
                     )
                     st.rerun()
 
@@ -841,43 +804,29 @@ def main():
                                 st.caption(f"#{item['sample_index']} {item.get('scene_id', '')}")
 
                     if st.button("📥 Load samples for detection", key="load_all_sunrgbd_for_detection"):
-                        if not st.session_state.output_root_dir:
-                            st.error("❌ Please set the output root directory first")
-                        else:
-                            with st.spinner("Loading and saving SUNRGBD batch samples..."):
-                                batch_samples: List[Dict[str, Any]] = []
-                                for item in filtered_batch:
-                                    sample_meta_data, image, point_cloud = load_dataset_sample(
-                                        dataset_path=dataset_path,
-                                        sample_index=item["sample_index"],
-                                        dataset_type=dataset_type,
-                                        sunrgbd_keep_fraction=st.session_state.get(
-                                            "sunrgbd_keep_fraction", 0.8
-                                        ),
-                                    )
-                                    if sample_meta_data and image is not None and point_cloud is not None:
-                                        saved_desc = _save_sunrgbd_batch_sample(
-                                            dataset_path=dataset_path,
-                                            sample_index=item["sample_index"],
-                                            image=image,
-                                            point_cloud=point_cloud,
-                                            output_root=st.session_state.output_root_dir,
-                                        )
-                                        batch_samples.append(saved_desc)
+                        with st.spinner("Registering SUNRGBD batch samples..."):
+                            batch_samples: List[Dict[str, Any]] = []
+                            for item in filtered_batch:
+                                batch_samples.append(
+                                    {
+                                        "dataset_type": "sunrgbd",
+                                        "dataset_path": dataset_path,
+                                        "sample_index": int(item["sample_index"]),
+                                        "image_path": item.get("image_path", ""),
+                                        # SUNRGBD point cloud is loaded from dataset depth .mat by index.
+                                        "point_cloud_path": "",
+                                    }
+                                )
 
-                                st.session_state.batch_samples = batch_samples
-                                st.session_state.process_all_samples = True
-                                st.session_state.batch_samples_saved = True
+                            st.session_state.batch_samples = batch_samples
+                            st.session_state.process_all_samples = True
+                            st.session_state.batch_samples_saved = True
 
-                            n_ok = len(batch_samples)
-                            n_req = len(filtered_batch)
-                            if n_ok < n_req:
-                                st.warning(f"⚠️ Saved {n_ok} of {n_req} samples (some loads failed).")
-                            st.success(
-                                f"✅ Saved {n_ok} SUNRGBD samples. "
-                                "Go to **2_Detection** and click **Process entire batch**."
-                            )
-                            st.rerun()
+                        st.success(
+                            f"✅ Registered {len(batch_samples)} SUNRGBD samples. "
+                            "Go to **2_Detection** and click **Process entire batch**."
+                        )
+                        st.rerun()
 
         elif dataset_type == "rosbag":
             # ROS bag: configure topics, filter frames, then extract and load batch

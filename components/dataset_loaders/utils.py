@@ -18,7 +18,21 @@ from .kitti_dataset_loader import KITTIDatasetLoader
 from .nuscenes_dataset_loader import NuScenesDatasetLoader
 from .sunrgbd_dataset_loader import SUNRGBDDatasetLoader
 from .dataset_loader import LinkedDataHandler
-from components.core.pointcloud_projection import load_sunrgbd_intrinsics
+from components.core.pointcloud_projection import load_sunrgbd_calibration
+
+
+def _looks_like_sunrgbd_trainval(root: Path) -> bool:
+    """
+    True if ``root`` matches the SUNRGBD trainval release layout:
+    calib/, depth/, image/ (depth holds .mat point clouds; calib holds per-frame intrinsics .txt).
+    """
+    if not root.is_dir():
+        return False
+    return (
+        (root / "calib").is_dir()
+        and (root / "depth").is_dir()
+        and (root / "image").is_dir()
+    )
 
 
 def detect_dataset_type(dataset_path: str) -> Optional[str]:
@@ -29,7 +43,8 @@ def detect_dataset_type(dataset_path: str) -> Optional[str]:
     1. LinkedDataHandler/sim: Check for dataset.json in root
     2. KITTI: Check for training/ or testing/ with image_2/, velodyne/, calib/
     3. nuScenes: Check for samples/, sweeps/, v1.0-*/ folders
-    4. SUNRGBD: Check for nested scenes with intrinsics.txt + image/ + depth_bfx/
+    4. SUNRGBD: ``sunrgbd_trainval/`` with calib/, depth/, image/ (or that layout at dataset root)
+    5. SUNRGBD (legacy): sensor folders + nested scenes with intrinsics.txt + image/ + depth_bfx/
     
     Args:
         dataset_path: Root directory of the dataset
@@ -79,16 +94,21 @@ def detect_dataset_type(dataset_path: str) -> Optional[str]:
     if has_samples and (has_sweeps or has_v1):
         return "nuscenes"
 
-    # Check for SUNRGBD structure
-    # Typical root includes sensor folders (kv1, kv2, realsense, xtion) and many
-    # scene directories that each contain intrinsics.txt, image/, and depth_bfx/.
+    # SUNRGBD — current release layout (matches SUNRGBDDatasetLoader)
+    trainval_root = dataset_path / "sunrgbd_trainval"
+    if _looks_like_sunrgbd_trainval(trainval_root):
+        return "sunrgbd"
+    if _looks_like_sunrgbd_trainval(dataset_path):
+        return "sunrgbd"
+
+    # SUNRGBD — legacy toolbox export (per-scene intrinsics.txt + depth_bfx PNG)
     has_sensor_dirs = any((dataset_path / name).exists() for name in ["kv1", "kv2", "realsense", "xtion"])
     has_intrinsics = any(dataset_path.glob("**/intrinsics.txt"))
     has_rgb_scene = any(dataset_path.glob("**/image/*.jpg")) or any(dataset_path.glob("**/image/*.png"))
     has_depth_scene = any(dataset_path.glob("**/depth_bfx/*.png"))
     if has_sensor_dirs and has_intrinsics and has_rgb_scene and has_depth_scene:
         return "sunrgbd"
-    
+
     return None
 
 
@@ -532,8 +552,8 @@ def _load_sunrgbd_sample(
             print(f"Error: Saved SUNRGBD point cloud is empty for sample {sample_idx}: {pcd_file}")
             return None, None, None
 
-        camera_intrinsic = load_sunrgbd_intrinsics(sample["intrinsics_path"])
-        camera_to_lidar_transform = SUNRGBDDatasetLoader._sunrgbd_camera_to_pipeline_lidar_transform()
+        camera_intrinsic, camera_rtilt = load_sunrgbd_calibration(sample["intrinsics_path"])
+        camera_to_lidar_transform = SUNRGBDDatasetLoader._sunrgbd_camera_to_depth_transform(camera_rtilt)
         gt_boxes_cam = SUNRGBDDatasetLoader._load_ground_truth_boxes(
             sample.get("annotation_path"),
             image_rgb.shape,
@@ -546,8 +566,11 @@ def _load_sunrgbd_sample(
             "image_path": str(image_file),
             "point_cloud_path": str(pcd_file),
             "camera_intrinsic": camera_intrinsic,
+            "camera_rtilt": camera_rtilt,
             "camera_extrinsic": np.eye(4, dtype=np.float64),
             "camera_to_lidar_transform": camera_to_lidar_transform,
+            "camera_frame": "camera_optical",
+            "lidar_frame": "sunrgbd_upright_depth",
             "ground_truth_boxes": gt_boxes,
             "sample_index": sample_idx,
             "dataset_type": "sunrgbd",
@@ -580,14 +603,19 @@ def _load_sunrgbd_sample(
         "image_path": sample_data["image_path"],
         "point_cloud_path": sample_data["depth_path"],
         "camera_intrinsic": sample_data["camera_intrinsic"],
+        "camera_rtilt": sample_data.get("camera_rtilt"),
         "camera_extrinsic": sample_data.get("camera_extrinsic", np.eye(4)),
         "camera_to_lidar_transform": sample_data["camera_to_lidar_transform"],
+        "camera_frame": sample_data.get("camera_frame", "camera_optical"),
+        "lidar_frame": sample_data.get("lidar_frame", "sunrgbd_upright_depth"),
         "ground_truth_boxes": sample_data.get("ground_truth_boxes", []),
         "sample_index": sample_idx,
         "dataset_type": "sunrgbd",
         "scene_id": sample_data.get("scene_id"),
         "depth_scale": sample_data.get("depth_scale", 10000.0),
         "image_shape": image_rgb.shape[:2],
+        "sunrgbd_keep_fraction": float(sample_data.get("keep_fraction", keep_fraction)),
+        "sunrgbd_stride": int(sample_data.get("stride", 1)),
     }
 
     return sample_meta_data, image_rgb, point_cloud

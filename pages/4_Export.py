@@ -415,9 +415,16 @@ def main():
     )
 
     export_results = st.session_state.get("export_results")
+    export_source = "single"
     if not export_results:
-        st.info("No detection results found. Run the pipeline on **2_Detection** first.")
-        return
+        batch_results = st.session_state.get("batch_export_results") or {}
+        batch_samples = batch_results.get("samples") or []
+        if batch_samples:
+            export_results = batch_samples[-1]
+            export_source = "batch_last_sample"
+        else:
+            st.info("No detection results found. Run the pipeline on **2_Detection** first.")
+            return
 
     meta = export_results.get("metadata", {})
     dataset_type = meta.get("dataset_type", "unknown")
@@ -431,6 +438,8 @@ def main():
         st.metric("Sample Index", str(sample_index))
     with col_meta_3:
         st.metric("Image Path", str(image_path))
+    if export_source == "batch_last_sample":
+        st.caption("Using the last successful sample from the most recent batch run.")
 
     output_root = st.session_state.get("output_root_dir", "")
     if not output_root:
