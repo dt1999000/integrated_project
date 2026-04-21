@@ -28,11 +28,12 @@ from components.core.sam_integration import (
 from components.core.pose_estimation import fit_cuboid_to_points_outdoor, fit_cuboid_to_points_indoor
 from components.core.clustering_manager import (
     ClusteringManager,
-    select_best_cluster_points,
+    select_best_cluster_id,
     filter_clusters_by_max_volume,
     scene_is_indoor_from_point_cloud,
 )
 from components.core.tracking import ObjectTracker
+from components.dataset_loaders.sunrgbd_dataset_loader import sunrgbd_keep_fraction_for_load
 from components.dataset_loaders.utils import load_dataset_sample
 from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
@@ -634,7 +635,9 @@ def step_4_clustering(
     filtered. Indoor scans skip that filter.
 
     Returns:
-        Dict with 'mask_cluster_labels', 'clustering_results', 'best_cluster_points'
+        Dict with ``mask_cluster_labels``, ``clustering_results``,
+        ``filtered_mask_sparse_indices``, and ``best_cluster_sparse_indices``
+        (global row indices into ``sparse_points``; avoids duplicate point arrays).
     """
     start_time = time.time()
 
@@ -669,18 +672,20 @@ def step_4_clustering(
             point_cloud=sparse_points
         )
     
-    mask_cluster_labels = {}
-    clustering_results = []
-    best_cluster_points_dict = {}
-    filtered_mask_points_dict = {}
-    
+    mask_cluster_labels: Dict[int, np.ndarray] = {}
+    clustering_results: List[Dict] = []
+    best_cluster_sparse_indices: Dict[int, np.ndarray] = {}
+    filtered_mask_sparse_indices: Dict[int, np.ndarray] = {}
+
     for mask_idx, mask in enumerate(sam_masks):
         if mask is None:
             continue
-        
-        # Get points assigned to this mask
-        mask_points = sparse_points[mask_assignments == mask_idx]
-        
+
+        global_idx = np.flatnonzero(mask_assignments == mask_idx)
+        if global_idx.size == 0:
+            continue
+        mask_points = sparse_points[global_idx]
+
         min_required_points = dbscan_min_samples
         if clustering_algorithm == "hdbscan":
             min_required_points = max(hdbscan_min_samples, hdbscan_min_cluster_size)
@@ -730,15 +735,17 @@ def step_4_clustering(
             )
             mask_points_filtered = mask_points[keep_mask]
             cluster_labels = cluster_labels[keep_mask]
+            idx_f = global_idx[keep_mask]
         else:
             mask_points_filtered = mask_points
             cluster_labels = cluster_labels.copy()
+            idx_f = global_idx
 
-        filtered_mask_points_dict[mask_idx] = mask_points_filtered
+        filtered_mask_sparse_indices[mask_idx] = idx_f.astype(np.int64, copy=False)
 
         if len(mask_points_filtered) < min_required_points:
             # Not enough points left for clustering/selection; use all remaining points
-            best_cluster_points_dict[mask_idx] = mask_points_filtered
+            best_cluster_sparse_indices[mask_idx] = idx_f.astype(np.int64, copy=False)
             unique_clusters = np.unique(cluster_labels)
             n_clusters = np.sum(unique_clusters >= 0)
             n_cluster_points = np.sum(cluster_labels >= 0)
@@ -750,43 +757,31 @@ def step_4_clustering(
                 'Best Cluster Points': len(mask_points),
             })
             continue
-        
+
         mask_cluster_labels[mask_idx] = cluster_labels
         print(f'mask_id: {mask_idx}')
-        # Select best cluster (by 2D IoU with mask when sparse_depth_map is provided)
-        best_cluster_points = select_best_cluster_points(
+        best_id = select_best_cluster_id(
             mask_points=mask_points_filtered,
             mask=mask,
             projection=projection,
             image_shape=(h, w),
             cluster_labels=cluster_labels,
-            clustering_algorithm=clustering_algorithm,
-            dbscan_eps=dbscan_eps,
-            dbscan_min_samples=dbscan_min_samples,
-            adaptive_dbscan_base_eps=adaptive_dbscan_base_eps,
-            adaptive_dbscan_eps_growth_rate=adaptive_dbscan_eps_growth_rate,
-            adaptive_dbscan_reference_distance=adaptive_dbscan_reference_distance,
-            adaptive_dbscan_min_scale=adaptive_dbscan_min_scale,
-            adaptive_dbscan_max_scale=adaptive_dbscan_max_scale,
-            hdbscan_min_cluster_size=hdbscan_min_cluster_size,
-            hdbscan_min_samples=hdbscan_min_samples,
-            sparse_depth_map=sparse_depth_map,
         )
-        
-        if best_cluster_points is not None:
-            best_cluster_points_dict[mask_idx] = best_cluster_points
-        
-        # Statistics
+        if best_id is not None:
+            sel = cluster_labels == best_id
+            best_cluster_sparse_indices[mask_idx] = idx_f[sel].astype(np.int64, copy=False)
+
         unique_clusters = np.unique(cluster_labels)
         n_clusters = np.sum(unique_clusters >= 0)
         n_cluster_points = np.sum(cluster_labels >= 0)
-        
+        n_best = int(np.sum(cluster_labels == best_id)) if best_id is not None else 0
+
         clustering_results.append({
             'Mask ID': mask_idx + 1,
             'Total Points': len(mask_points),
             'Clusters Found': int(n_clusters),
             'Clustered Points': int(n_cluster_points),
-            'Best Cluster Points': len(best_cluster_points) if best_cluster_points is not None else 0
+            'Best Cluster Points': n_best,
         })
     
     elapsed_time = time.time() - start_time
@@ -794,29 +789,31 @@ def step_4_clustering(
     return {
         'mask_cluster_labels': mask_cluster_labels,
         'clustering_results': clustering_results,
-        'best_cluster_points': best_cluster_points_dict,
-        'filtered_mask_points': filtered_mask_points_dict,
+        'best_cluster_sparse_indices': best_cluster_sparse_indices,
+        'filtered_mask_sparse_indices': filtered_mask_sparse_indices,
         'time': elapsed_time
     }
 
 
 def step_5_detection_pose_estimation(
     sample_meta_data: Dict,
-    best_cluster_points: Dict[int, np.ndarray],
+    sparse_points: np.ndarray,
+    best_cluster_sparse_indices: Dict[int, np.ndarray],
     sam_masks: List[np.ndarray],
     ground_z: float,
     cuboid_params: Dict
 ) -> Dict:
     """
     Step 5: Fit cuboids to best cluster points using scoring-based method.
-    
+
     Args:
         sample_meta_data: Sample metadata
-        best_cluster_points: Dict mapping mask_idx to cluster points
+        sparse_points: Nx3 array (same reference frame as Step 2 ``colored_sparse_points``)
+        best_cluster_sparse_indices: Per-mask global row indices into ``sparse_points``
         sam_masks: List of binary masks
         ground_z: Ground plane z value
         cuboid_params: Cuboid fitting parameters
-    
+
     Returns:
         Dict with 'detected_cuboids'
     """
@@ -837,10 +834,11 @@ def step_5_detection_pose_estimation(
     )
     indoor_params = st.session_state.params.get("cuboid_fitting_indoor", {})
 
-    # Fit cuboid to each mask's best cluster
-    for mask_idx, cluster_points in best_cluster_points.items():
-        if len(cluster_points) < 5:
+    # Fit cuboid to each mask's best cluster (materialize from sparse index map)
+    for mask_idx, row_ix in best_cluster_sparse_indices.items():
+        if row_ix is None or len(row_ix) < 5:
             continue
+        cluster_points = sparse_points[row_ix]
         
         # Get category from detected class names (from open-vocab detection)
         category = 'Unknown'
@@ -1051,7 +1049,8 @@ def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) 
     # Step 5: Detection & pose estimation
     step_5_result = step_5_detection_pose_estimation(
         sample_meta_data=st.session_state.sample['sample_meta_data'],
-        best_cluster_points=step_4_result['best_cluster_points'],
+        sparse_points=step_2_result['colored_sparse_points'],
+        best_cluster_sparse_indices=step_4_result['best_cluster_sparse_indices'],
         sam_masks=step_3_result['sam_masks'],
         ground_z=results['step_1']['result']['ground_z'],
         cuboid_params=params['cuboid_fitting']
@@ -1098,6 +1097,7 @@ def _run_pipeline_for_batch_sample(
         use_saved_media_paths=use_saved_media_paths,
         saved_image_path=saved_image_path,
         saved_point_cloud_path=saved_point_cloud_path,
+        sunrgbd_keep_fraction=sunrgbd_keep_fraction_for_load(),
     )
     if meta is None or image is None or point_cloud is None:
         print(
@@ -2584,24 +2584,29 @@ def main():
                     step_3_result = st.session_state.pipeline_state['step_3']['result']
                     mask_assignments = step_3_result['mask_assignments']
                     mask_cluster_labels = result['mask_cluster_labels']
-                    filtered_mask_points = result.get('filtered_mask_points', {})
-                    
+                    filtered_ix = result.get('filtered_mask_sparse_indices', {})
+                    legacy_filtered = result.get('filtered_mask_points', {})
+
                     # Create visualization showing clusters
                     fig = go.Figure()
-                    
+
                     # Generate colors for clusters
                     max_clusters = 0
                     for mask_idx, cluster_labels in mask_cluster_labels.items():
                         unique_labels = np.unique(cluster_labels)
                         unique_labels = unique_labels[unique_labels >= 0]
                         max_clusters = max(max_clusters, len(unique_labels))
-                    
+
                     cluster_colors = generate_distinct_colors(max_clusters * len(mask_cluster_labels))
                     color_idx = 0
-                    
+
                     # Add points for each cluster
                     for mask_idx, cluster_labels in mask_cluster_labels.items():
-                        mask_points = filtered_mask_points.get(mask_idx)
+                        row_ix = filtered_ix.get(mask_idx)
+                        if row_ix is not None and len(row_ix) > 0:
+                            mask_points = sparse_points[row_ix]
+                        else:
+                            mask_points = legacy_filtered.get(mask_idx)
                         if mask_points is None:
                             continue
                         if len(mask_points) == 0:
@@ -2657,27 +2662,33 @@ def main():
                             ))
                     
                     # Highlight best clusters
-                    best_cluster_points = result['best_cluster_points']
-                    for mask_idx, best_points in best_cluster_points.items():
-                        if len(best_points) > 0:
-                            max_points = 2000
-                            if len(best_points) > max_points:
-                                indices = np.random.choice(len(best_points), max_points, replace=False)
-                                best_points = best_points[indices]
-                            
-                            fig.add_trace(go.Scatter3d(
-                                x=best_points[:, 0],
-                                y=best_points[:, 1],
-                                z=best_points[:, 2],
-                                mode='markers',
-                                marker=dict(
-                                    size=3,
-                                    color='red',
-                                    opacity=0.9,
-                                    line=dict(width=1, color='darkred')
-                                ),
-                                name=f'Best Cluster (Mask {mask_idx + 1})'
-                            ))
+                    best_ix = result.get('best_cluster_sparse_indices', {})
+                    legacy_best = result.get('best_cluster_points', {})
+                    for mask_idx, ix in best_ix.items():
+                        if ix is not None and len(ix) > 0:
+                            best_points = sparse_points[ix]
+                        else:
+                            best_points = legacy_best.get(mask_idx)
+                        if best_points is None or len(best_points) == 0:
+                            continue
+                        max_points = 2000
+                        if len(best_points) > max_points:
+                            indices = np.random.choice(len(best_points), max_points, replace=False)
+                            best_points = best_points[indices]
+
+                        fig.add_trace(go.Scatter3d(
+                            x=best_points[:, 0],
+                            y=best_points[:, 1],
+                            z=best_points[:, 2],
+                            mode='markers',
+                            marker=dict(
+                                size=3,
+                                color='red',
+                                opacity=0.9,
+                                line=dict(width=1, color='darkred')
+                            ),
+                            name=f'Best Cluster (Mask {mask_idx + 1})'
+                        ))
                     
                     fig.update_layout(
                         title="3D Clusters (Colored by Cluster ID, Red = Best Clusters)",
@@ -2724,11 +2735,13 @@ def main():
                 with st.spinner("Running Step 5..."):
                     try:
                         step_1_result = st.session_state.pipeline_state['step_1']['result']
+                        step_2_result = st.session_state.pipeline_state['step_2']['result']
                         step_3_result = st.session_state.pipeline_state['step_3']['result']
                         step_4_result = st.session_state.pipeline_state['step_4']['result']
                         result = step_5_detection_pose_estimation(
                             sample_meta_data=sample_meta_data,
-                            best_cluster_points=step_4_result['best_cluster_points'],
+                            sparse_points=step_2_result['colored_sparse_points'],
+                            best_cluster_sparse_indices=step_4_result['best_cluster_sparse_indices'],
                             sam_masks=step_3_result['sam_masks'],
                             ground_z=step_1_result['ground_z'],
                             cuboid_params=st.session_state.params['cuboid_fitting']

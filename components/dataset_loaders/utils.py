@@ -554,13 +554,9 @@ def _load_sunrgbd_sample(
 
         camera_intrinsic, camera_rtilt = load_sunrgbd_calibration(sample["intrinsics_path"])
         camera_to_lidar_transform = SUNRGBDDatasetLoader._sunrgbd_camera_to_depth_transform(camera_rtilt)
-        gt_boxes_cam = SUNRGBDDatasetLoader._load_ground_truth_boxes(
+        gt_boxes = SUNRGBDDatasetLoader._load_ground_truth_boxes(
             sample.get("annotation_path"),
             image_rgb.shape,
-        )
-        gt_boxes = SUNRGBDDatasetLoader._transform_gt_boxes_to_pipeline_lidar(
-            gt_boxes_cam,
-            camera_to_lidar_transform,
         )
         sample_meta_data = {
             "image_path": str(image_file),

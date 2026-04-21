@@ -11,7 +11,12 @@ from typing import Optional, Dict, List, Tuple, Any
 from components.dataset_loaders.utils import detect_dataset_type, load_dataset_sample
 from components.dataset_loaders.dataset_loader import LinkedDataHandler
 from components.dataset_loaders.nuscenes_dataset_loader import NuScenesDatasetLoader
-from components.dataset_loaders.sunrgbd_dataset_loader import SUNRGBDDatasetLoader
+from components.dataset_loaders.sunrgbd_dataset_loader import (
+    SUNRGBDDatasetLoader,
+    SUNRGBD_KEEP_FRACTION_DEFAULT,
+    SUNRGBD_KEEP_FRACTION_SESSION_KEY,
+    sunrgbd_keep_fraction_for_load,
+)
 from components.dataset_loaders.rosbag_extractor import (
     get_image_topics as get_ros_image_topics,
     get_pointcloud_topics as get_ros_pointcloud_topics,
@@ -647,19 +652,22 @@ def main():
 
                 # Control how densely SUNRGBD RGB-D is backprojected into a point cloud.
                 # Value is the fraction of valid depth pixels to keep (0–1).
-                if "sunrgbd_keep_fraction" not in st.session_state:
-                    st.session_state["sunrgbd_keep_fraction"] = 0.8
+                if SUNRGBD_KEEP_FRACTION_SESSION_KEY not in st.session_state:
+                    st.session_state[SUNRGBD_KEEP_FRACTION_SESSION_KEY] = (
+                        SUNRGBD_KEEP_FRACTION_DEFAULT
+                    )
                 sun_keep_pct = st.slider(
                     "SUNRGBD point cloud keep %",
                     5,
                     100,
-                    int(100.0 * float(st.session_state["sunrgbd_keep_fraction"])),
+                    int(100.0 * float(st.session_state[SUNRGBD_KEEP_FRACTION_SESSION_KEY])),
                     1,
                     help="Fraction of valid depth pixels kept when reconstructing SUNRGBD point clouds "
-                    "(lower = fewer points, lower RAM usage).",
+                    "(lower = fewer points, lower RAM usage). Stored in session and used whenever SUNRGBD "
+                    "is loaded (e.g. **2_Detection** batch or single-sample load from this page).",
                     key="sunrgbd_keep_pct",
                 )
-                st.session_state["sunrgbd_keep_fraction"] = float(sun_keep_pct) / 100.0
+                st.session_state[SUNRGBD_KEEP_FRACTION_SESSION_KEY] = float(sun_keep_pct) / 100.0
 
                 sample_index = st.number_input(
                     "Sample Index",
@@ -674,7 +682,7 @@ def main():
                             dataset_path=dataset_path,
                             sample_index=int(sample_index),
                             dataset_type=dataset_type,
-                            sunrgbd_keep_fraction=st.session_state["sunrgbd_keep_fraction"],
+                            sunrgbd_keep_fraction=sunrgbd_keep_fraction_for_load(),
                         )
                         if sample_meta_data and image is not None and point_cloud is not None:
                             sun_gt = sample_meta_data.get("ground_truth_boxes", [])

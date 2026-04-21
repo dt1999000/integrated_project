@@ -762,6 +762,56 @@ def compute_sparse_iou_2d(
     return len(intersection) / len(union)
 
 
+def select_best_cluster_id(
+    mask_points: np.ndarray,
+    mask: Optional[np.ndarray],
+    projection,
+    image_shape: Tuple[int, int],
+    cluster_labels: np.ndarray,
+) -> Optional[int]:
+    """
+    Return the cluster label id with highest normalized 2D IoU to the mask.
+
+    ``cluster_labels`` must align row-wise with ``mask_points``. If ``mask`` is
+    None, returns None (same behavior as the legacy points-only helper).
+    """
+    unique_labels = np.unique(cluster_labels)
+    unique_labels = unique_labels[unique_labels >= 0]
+    if len(unique_labels) == 0:
+        return None
+    if mask is None:
+        return None
+
+    iou_all_mask_points = compute_sparse_iou_2d(
+        mask=mask,
+        cluster_points_3d=mask_points,
+        projection=projection,
+        image_shape=image_shape,
+    )
+    ref_iou = iou_all_mask_points if iou_all_mask_points > 0 else 1.0
+
+    best_cluster_id = -1
+    best_iou = -1.0
+    for cluster_id in unique_labels:
+        cluster_points = mask_points[cluster_labels == cluster_id]
+        if len(cluster_points) < 5:
+            continue
+        raw_iou = compute_sparse_iou_2d(
+            mask=mask,
+            cluster_points_3d=cluster_points,
+            projection=projection,
+            image_shape=image_shape,
+        )
+        normalized_iou = min(1.0, raw_iou / ref_iou)
+        print(f'iou for cluster id {cluster_id} is {normalized_iou}')
+        if normalized_iou > best_iou:
+            best_iou = normalized_iou
+            best_cluster_id = int(cluster_id)
+    if best_cluster_id == -1:
+        return None
+    return best_cluster_id
+
+
 def select_best_cluster_points(
     mask_points: np.ndarray,
     mask: np.ndarray,
@@ -827,42 +877,15 @@ def select_best_cluster_points(
                 eps=dbscan_eps, min_samples=dbscan_min_samples
             )
 
-    unique_labels = np.unique(cluster_labels)
-    unique_labels = unique_labels[unique_labels >= 0]
-    if len(unique_labels) == 0:
+    best_id = select_best_cluster_id(
+        mask_points=mask_points,
+        mask=mask,
+        projection=projection,
+        image_shape=image_shape,
+        cluster_labels=cluster_labels,
+    )
+    if best_id is None:
         return None
-
-    # IoU is normalized so that the IoU of all mask_points (reprojected) vs the mask equals 1.0.
-    if mask is not None:
-        iou_all_mask_points = compute_sparse_iou_2d(
-            mask=mask,
-            cluster_points_3d=mask_points,
-            projection=projection,
-            image_shape=image_shape,
-        )
-        ref_iou = iou_all_mask_points if iou_all_mask_points > 0 else 1.0
-
-        best_cluster_id = -1
-        best_iou = -1.0
-        for cluster_id in unique_labels:
-            cluster_points = mask_points[cluster_labels == cluster_id]
-            if len(cluster_points) < 5:
-                continue
-            raw_iou = compute_sparse_iou_2d(
-                mask=mask,
-                cluster_points_3d=cluster_points,
-                projection=projection,
-                image_shape=image_shape,
-            )
-            normalized_iou = min(1.0, raw_iou / ref_iou)
-            print(f'iou for cluster id {cluster_id} is {normalized_iou}')
-            if normalized_iou > best_iou:
-                best_iou = normalized_iou
-                best_cluster_id = cluster_id
-        if best_cluster_id == -1:
-            return None
-        return mask_points[cluster_labels == best_cluster_id]
-
-    return None
+    return mask_points[cluster_labels == best_id]
 
     

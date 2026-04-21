@@ -18,6 +18,29 @@ from scipy.io import loadmat
 
 from components.core.pointcloud_projection import load_sunrgbd_calibration
 
+SUNRGBD_KEEP_FRACTION_SESSION_KEY = "sunrgbd_keep_fraction"
+SUNRGBD_KEEP_FRACTION_DEFAULT = 0.8
+
+
+def sunrgbd_keep_fraction_for_load() -> float:
+    """
+    Return the fraction of SUNRGBD depth points to keep (0–1], from Streamlit session.
+
+    Safe when the key is missing (e.g. user never opened Dataset Extraction): uses
+    ``SUNRGBD_KEEP_FRACTION_DEFAULT``. Invalid stored values fall back to the default.
+    """
+    import streamlit as st
+
+    v = st.session_state.get(
+        SUNRGBD_KEEP_FRACTION_SESSION_KEY, SUNRGBD_KEEP_FRACTION_DEFAULT
+    )
+    if v is None:
+        return float(SUNRGBD_KEEP_FRACTION_DEFAULT)
+    x = float(v)
+    if x <= 0.0 or x > 1.0:
+        return float(SUNRGBD_KEEP_FRACTION_DEFAULT)
+    return x
+
 
 class SUNRGBDDatasetLoader:
     """
@@ -117,31 +140,90 @@ class SUNRGBDDatasetLoader:
 
             bbox_2d = None
             if len(numeric_values) >= 4:
-                left = int(np.clip(round(numeric_values[0]), 0, w - 1))
-                top = int(np.clip(round(numeric_values[1]), 0, h - 1))
-                right = int(np.clip(round(numeric_values[2]), 0, w - 1))
-                bottom = int(np.clip(round(numeric_values[3]), 0, h - 1))
+                # SUNRGBD raw labels store 2D boxes as (x, y, w, h), not (x1, y1, x2, y2).
+                x, y, bw, bh = numeric_values[0], numeric_values[1], numeric_values[2], numeric_values[3]
+                left = int(np.clip(round(x), 0, w - 1))
+                top = int(np.clip(round(y), 0, h - 1))
+                right = int(np.clip(round(x + bw), 0, w - 1))
+                bottom = int(np.clip(round(y + bh), 0, h - 1))
                 if right > left and bottom > top:
                     bbox_2d = {"left": left, "top": top, "right": right, "bottom": bottom}
 
-            if len(numeric_values) >= 11:
-                # Common SUNRGBD txt convention:
-                # ... h, w, l, cx, cy, cz, heading
-                h3d, w3d, l3d, cx, cy, cz = numeric_values[-7:-1]
-                min_x = float(cx - (l3d * 0.5))
-                max_x = float(cx + (l3d * 0.5))
-                min_y = float(cy - (h3d * 0.5))
-                max_y = float(cy + (h3d * 0.5))
-                min_z = float(cz - (w3d * 0.5))
-                max_z = float(cz + (w3d * 0.5))
+            # Raw SUNRGBD text labels:
+            # <class> x y w h cx cy cz sx sy sz ox oy
+            # 3D is in upright-depth frame: X right, Y forward, Z up.
+            if len(numeric_values) >= 10:
+                cx, cy, cz = numeric_values[4], numeric_values[5], numeric_values[6]
+                sx, sy, sz = numeric_values[7], numeric_values[8], numeric_values[9]
+
+                # In SUNRGBD labels, coeffs are half-sizes (not full box lengths).
+                half_x = float(abs(sx))
+                half_y = float(abs(sy))
+                half_z = float(abs(sz))
+
+                # Orientation is a 2D heading vector on the ground plane.
+                # For upright-depth, use yaw around +Z.
+                if len(numeric_values) >= 12:
+                    ox, oy = float(numeric_values[10]), float(numeric_values[11])
+                    yaw = float(np.arctan2(oy, ox))
+                else:
+                    ox, oy = 1.0, 0.0
+                    yaw = 0.0
+
+                local_corners = np.array(
+                    [
+                        [-half_x, -half_y, -half_z],
+                        [half_x, -half_y, -half_z],
+                        [half_x, half_y, -half_z],
+                        [-half_x, half_y, -half_z],
+                        [-half_x, -half_y, half_z],
+                        [half_x, -half_y, half_z],
+                        [half_x, half_y, half_z],
+                        [-half_x, half_y, half_z],
+                    ],
+                    dtype=np.float64,
+                )
+                cos_yaw = float(np.cos(yaw))
+                sin_yaw = float(np.sin(yaw))
+                rot_z = np.array(
+                    [
+                        [cos_yaw, -sin_yaw, 0.0],
+                        [sin_yaw, cos_yaw, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    dtype=np.float64,
+                )
+                center = np.array([cx, cy, cz], dtype=np.float64)
+                corners = (local_corners @ rot_z.T) + center
+
+                min_x = float(np.min(corners[:, 0]))
+                max_x = float(np.max(corners[:, 0]))
+                min_y = float(np.min(corners[:, 1]))
+                max_y = float(np.max(corners[:, 1]))
+                min_z = float(np.min(corners[:, 2]))
+                max_z = float(np.max(corners[:, 2]))
             else:
                 min_x, min_y, min_z, max_x, max_y, max_z = numeric_values[-6:]
+                ox, oy = 1.0, 0.0
+                yaw = 0.0
+                corners = None
 
             gt_boxes.append(
                 {
                     "category": label if label else "Unknown",
                     "class": label if label else "Unknown",
                     "bbox_2d": bbox_2d,
+                    "center": [float(cx), float(cy), float(cz)] if len(numeric_values) >= 10 else None,
+                    "size": [
+                        float(2.0 * half_x),
+                        float(2.0 * half_y),
+                        float(2.0 * half_z),
+                    ]
+                    if len(numeric_values) >= 10
+                    else None,
+                    "orientation": [float(ox), float(oy)],
+                    "yaw": float(yaw),
+                    "corners": corners.astype(np.float32) if corners is not None else None,
                     "min_x": float(min(min_x, max_x)),
                     "max_x": float(max(min_x, max_x)),
                     "min_y": float(min(min_y, max_y)),
