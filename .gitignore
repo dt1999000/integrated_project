@@ -19,6 +19,8 @@ __pycache__/
 *.eps
 nul
 
+.agents
+.vscode
 .claude
 .cursor
 checkpoints/
@@ -26,5 +28,13 @@ req.txt
 media/*
 cvat_export/*
 cvat_example_export/*
-.vscode/
 models/
+pages/archive_folder/
+archive/
+
+DETECTION_PIPELINE_CONSOLIDATION_PLAN.md
+POINTCLOUD_EXTENSION_PLAN.md
+
+output/
+*.ts
+runs

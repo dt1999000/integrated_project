@@ -1,6 +1,5 @@
 """
-2D to 3D Projection and Point Cloud Visualization
-This module provides classes for projecting 2D pixels to 3D rays and visualizing point clouds.
+2D to 3D Projection, Sparse Depth, and Point Cloud Visualization.
 """
 
 import numpy as np
@@ -14,145 +13,15 @@ import open3d as o3d
 # Import the new clustering manager
 from .clustering_manager import ClusteringManager
 
-
-# =============================================================================
-# Frustum Filtering Utility Functions
-# =============================================================================
-
-def compute_frustum_planes(camera_origin: np.ndarray,
-                           base_corners: np.ndarray) -> List[np.ndarray]:
-    """
-    Compute the 5 plane equations for a frustum pyramid.
-
-    A frustum is bounded by 4 side planes (connecting apex to base edges)
-    and 1 base plane (the far end at specified depth).
-
-    Args:
-        camera_origin: (3,) apex of frustum (camera center in LiDAR coords)
-        base_corners: (4, 3) base corners [TL, TR, BR, BL] in LiDAR coords
-
-    Returns:
-        List of 5 plane equations as [a, b, c, d] where ax + by + cz + d = 0
-    """
-    planes = []
-
-    # 4 side planes: each from apex + 2 adjacent base corners
-    # Order: TL-TR, TR-BR, BR-BL, BL-TL
-    for i in range(4):
-        p1 = camera_origin
-        p2 = base_corners[i]
-        p3 = base_corners[(i + 1) % 4]
-
-        # Compute plane normal using cross product
-        v1 = p2 - p1
-        v2 = p3 - p1
-        normal = np.cross(v1, v2)
-        norm_length = np.linalg.norm(normal)
-        if norm_length > 1e-10:
-            normal = normal / norm_length
-        else:
-            # Degenerate case: skip this plane
-            continue
-
-        # Plane equation: normal · (point - p1) = 0
-        # ax + by + cz + d = 0 where d = -normal · p1
-        d = -np.dot(normal, p1)
-        planes.append(np.array([normal[0], normal[1], normal[2], d]))
-
-    # Base plane: defined by 3 base corners
-    v1 = base_corners[1] - base_corners[0]
-    v2 = base_corners[2] - base_corners[0]
-    normal = np.cross(v1, v2)
-    norm_length = np.linalg.norm(normal)
-    if norm_length > 1e-10:
-        normal = normal / norm_length
-
-        # Ensure normal points toward camera (so points between camera and base are inside)
-        to_camera = camera_origin - base_corners[0]
-        if np.dot(normal, to_camera) < 0:
-            normal = -normal
-
-        d = -np.dot(normal, base_corners[0])
-        planes.append(np.array([normal[0], normal[1], normal[2], d]))
-
-    return planes
+import os
 
 
-def filter_points_in_frustum(points: np.ndarray,
-                             camera_origin: np.ndarray,
-                             base_corners: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Filter points to keep only those inside a frustum pyramid.
-
-    Uses half-space method: a point is inside if it's on the correct side
-    of all 5 bounding planes.
-
-    Args:
-        points: Nx3 array of 3D points
-        camera_origin: (3,) frustum apex (camera center)
-        base_corners: (4, 3) frustum base corners [TL, TR, BR, BL]
-
-    Returns:
-        filtered_points: Mx3 array of points inside frustum
-        mask: N boolean array indicating which points are inside
-    """
-    if len(points) == 0:
-        return np.array([]).reshape(0, 3), np.array([], dtype=bool)
-
-    planes = compute_frustum_planes(camera_origin, base_corners)
-
-    if len(planes) == 0:
-        # No valid planes, return empty
-        return np.array([]).reshape(0, 3), np.zeros(len(points), dtype=bool)
-
-    # For each plane, compute signed distance
-    # Point is inside if on correct side of ALL planes
-    n_points = len(points)
-    inside = np.ones(n_points, dtype=bool)
-
-    # Determine correct sign by testing centroid of frustum
-    centroid = (camera_origin + base_corners.mean(axis=0)) / 2
-
-    for plane in planes:
-        normal = plane[:3]
-        d = plane[3]
-
-        # Signed distance: normal · point + d
-        distances = points @ normal + d
-        centroid_dist = np.dot(centroid, normal) + d
-
-        # Points should be on same side as centroid
-        if centroid_dist >= 0:
-            inside &= (distances >= 0)
-        else:
-            inside &= (distances <= 0)
-
-    return points[inside], inside
+DEBUG_PROJECTION = os.getenv("PROJECTION_DEBUG", "0").strip() in {"1", "true", "yes", "on"}
 
 
-def filter_points_in_multiple_frustums(points: np.ndarray,
-                                       frustums: List[Tuple[np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Filter points to keep those inside ANY of the provided frustums.
-
-    Args:
-        points: Nx3 array of 3D points
-        frustums: List of (camera_origin, base_corners) tuples
-
-    Returns:
-        filtered_points: Mx3 array of points inside any frustum
-        mask: N boolean array indicating which points are inside
-    """
-    if len(points) == 0 or len(frustums) == 0:
-        return np.array([]).reshape(0, 3), np.zeros(len(points), dtype=bool)
-
-    combined_mask = np.zeros(len(points), dtype=bool)
-
-    for camera_origin, base_corners in frustums:
-        _, mask = filter_points_in_frustum(points, camera_origin, base_corners)
-        combined_mask |= mask
-
-    return points[combined_mask], combined_mask
+def _debug_projection_log(label: str, details: str) -> None:
+    if DEBUG_PROJECTION:
+        print(f"[Projection][{label}] {details}")
 
 
 class Projection:
@@ -201,6 +70,106 @@ class Projection:
         camera_axes_cam = np.eye(3)
         camera_axes_lidar = (self.camera_to_lidar_transform[:3, :3] @ camera_axes_cam.T).T
         self.camera_axes = camera_axes_lidar
+        _debug_projection_log(
+            "init",
+            f"n_points={len(self.point_cloud)}, "
+            f"camera_to_lidar={self.camera_to_lidar_transform}, "
+            f"lidar_to_camera[0,:]={self.lidar_to_camera_transform}",
+        )
+    
+    def filter_forward_points(self, points_3d_lidar: np.ndarray) -> np.ndarray:
+        """
+        Filter points to only keep those in front of the camera (z_cam > 0).
+ 
+        Args:
+            points_3d_lidar: Nx3 (or Nx>=3) array in LiDAR coordinates.
+ 
+        Returns:
+            Filtered array with only forward-facing points.
+        """
+        if points_3d_lidar.ndim != 2 or points_3d_lidar.shape[1] < 3:
+            raise ValueError(
+                f"Expected points with shape (N, 3) or (N, >=3), got {points_3d_lidar.shape}"
+            )
+        ones = np.ones((points_3d_lidar.shape[0], 1), dtype=points_3d_lidar.dtype)
+        pts_h = np.hstack([points_3d_lidar[:, :3], ones])
+        pts_cam = (self.lidar_to_camera_transform @ pts_h.T).T[:, :3]
+        z_cam = pts_cam[:, 2]
+        mask = z_cam > 0.0
+        filtered = points_3d_lidar[mask]
+        if DEBUG_PROJECTION:
+            for i in range(min(5, len(filtered))):
+                _debug_projection_log(
+                    "sample_filter_forward",
+                    f"x_in,y_in,z_in={filtered[i,0]:.2f}, {filtered[i,1]:.2f}, {filtered[i,2]:.2f}, x_cam,y_cam,z_cam={pts_cam[i,0]:.2f}, {pts_cam[i,1]:.2f}, {pts_cam[i,2]:.2f}"
+                ) 
+        n_removed = len(points_3d_lidar) - len(filtered)
+        if n_removed > 0:
+            _debug_projection_log(
+                "filter_forward_points",
+                f"removed={n_removed}, remaining={len(filtered)}, "
+                f"z_cam_range=({z_cam.min():.3f}, {z_cam.max():.3f})",
+            )
+        
+        return filtered
+    
+    def compute_sparse_depth_map(self, image_shape: Tuple[int, int]) -> np.ndarray:
+        """
+        Create sparse depth map by back-projecting this instance's LiDAR points
+        onto the image, using positive camera z as depth.
+ 
+        Args:
+            image_shape: (height, width) of the image
+ 
+        Returns:
+            sparse_depth: HxW numpy array with depth values at projected pixel
+                          locations, zeros elsewhere.
+        """
+        h, w = image_shape
+        pixels, valid_mask = self.point_to_pixel(self.point_cloud)
+        in_bounds = (
+            (pixels[:, 0] >= 0)
+            & (pixels[:, 0] < w)
+            & (pixels[:, 1] >= 0)
+            & (pixels[:, 1] < h)
+        )
+        valid_mask &= in_bounds
+ 
+        sparse_depth = np.zeros((h, w), dtype=np.float32)
+        if np.any(valid_mask):
+            valid_pixels = pixels[valid_mask].astype(int)
+            valid_points = self.point_cloud[valid_mask]
+ 
+            ones = np.ones((valid_points.shape[0], 1), dtype=valid_points.dtype)
+            pts_h = np.hstack([valid_points[:, :3], ones])
+            pts_cam = (self.lidar_to_camera_transform @ pts_h.T).T[:, :3]
+            depths = pts_cam[:, 2]
+ 
+            positive_depth_mask = depths > 0
+            valid_pixels = valid_pixels[positive_depth_mask]
+            depths = depths[positive_depth_mask]
+            if DEBUG_PROJECTION:
+                for i in range(min(5, len(valid_points))):
+                    _debug_projection_log(
+                        "sample",
+                        f"x_in,y_in,z_in={valid_points[i,0]:.2f}, {valid_points[i,1]:.2f}, {valid_points[i,2]:.2f}, x_cam,y_cam,z_cam={pts_cam[i,0]:.2f}, {pts_cam[i,1]:.2f}, {pts_cam[i,2]:.2f}"
+                    ) 
+ 
+            for (u, v), depth in zip(valid_pixels, depths):
+                if sparse_depth[v, u] == 0 or depth < sparse_depth[v, u]:
+                    sparse_depth[v, u] = depth
+ 
+        n_points = np.sum(sparse_depth > 0)
+        if n_points > 0:
+            non_zero = sparse_depth[sparse_depth > 0]
+            _debug_projection_log(
+                "compute_sparse_depth_map",
+                f"valid_depths={n_points}/{len(self.point_cloud)}, "
+                f"depth_range=({non_zero.min():.2f}, {non_zero.max():.2f}), "
+                f"coverage={100 * n_points / (h * w):.2f}%"
+            )
+ 
+        return sparse_depth
         
     def pixel_to_ray(self, pixel_coords: np.ndarray) -> np.ndarray:
         """
@@ -249,64 +218,7 @@ class Projection:
             rays['origins'][i] = camera_center_lidar
             rays['directions'][i] = direction_lidar
         
-        return rays
-    
-    def find_closest_point_on_ray(self, rays: Dict[str, np.ndarray], 
-                                  max_distance: float = 100.0,
-                                  distance_threshold: float = 0.05) -> np.ndarray:
-        """
-        Find the closest point in the point cloud to each ray and project it onto the ray.
-        
-        Args:
-            rays: Dictionary with 'origins' (Nx3) and 'directions' (Nx3) arrays
-            max_distance: Maximum distance along ray to search for points
-            distance_threshold: Maximum perpendicular distance from ray to consider a point
-            
-        Returns:
-            Nx3 array of projected points on rays (closest to point cloud points)
-        """
-        origins = rays['origins']
-        directions = rays['directions']
-        num_rays = origins.shape[0]
-        projected_points = np.zeros((num_rays, 3))
-        
-        for i in range(num_rays):
-            origin = origins[i]
-            direction = directions[i]
-            
-            # Find points within max_distance from ray origin
-            distances_from_origin = np.linalg.norm(self.point_cloud - origin, axis=1)
-            nearby_mask = distances_from_origin < max_distance
-            nearby_points = self.point_cloud[nearby_mask]
-            
-            if len(nearby_points) == 0:
-                # No nearby points, extend ray to max_distance
-                projected_points[i] = origin + direction * max_distance
-                continue
-            
-            # For each nearby point, find closest point on ray
-            # Point on ray: origin + t * direction
-            # Distance from point to ray: ||(point - origin) - ((point - origin) · direction) * direction||
-            
-            vectors_to_points = nearby_points - origin
-            t_values = np.dot(vectors_to_points, direction)
-            t_values = np.clip(t_values, 0, max_distance)  # Only consider forward direction
-            
-            points_on_ray = origin + t_values[:, np.newaxis] * direction
-            distances_to_ray = np.linalg.norm(nearby_points - points_on_ray, axis=1)
-            
-            # Find point with minimum distance to ray
-            min_idx = np.argmin(distances_to_ray)
-            
-            if distances_to_ray[min_idx] < distance_threshold:
-                # Use the point on ray closest to the nearest point cloud point
-                projected_points[i] = points_on_ray[min_idx]
-            else:
-                # No point close enough, extend ray to max_distance
-                projected_points[i] = origin + direction * max_distance
-        
-        return projected_points
-    
+        return rays    
 
     def project_pixels_to_3d(self, pixel_coords: np.ndarray, 
                             max_distance: float = 100.0,
@@ -444,7 +356,8 @@ class Projection:
         points_cam = (self.lidar_to_camera_transform @ points_homo.T).T[:, :3]
 
         # Filter points behind camera (z <= 0 in camera coords)
-        valid_mask = points_cam[:, 2] > 0
+        z_cam = points_cam[:, 2]
+        valid_mask = z_cam > 0
 
         # Initialize output
         pixels = np.zeros((n_points, 2))
@@ -455,6 +368,16 @@ class Projection:
             normalized = points_cam[valid_mask, :2] / z
             pixels_homo = np.hstack([normalized, np.ones((np.sum(valid_mask), 1))])
             pixels[valid_mask] = (self.camera_intrinsic @ pixels_homo.T).T[:, :2]
+
+        if DEBUG_PROJECTION and n_points > 0:
+            n_valid = int(valid_mask.sum())
+            z_min = float(z_cam[valid_mask].min()) if n_valid > 0 else 0.0
+            z_max = float(z_cam[valid_mask].max()) if n_valid > 0 else 0.0
+            _debug_projection_log(
+                "point_to_pixel",
+                f"n_points={n_points}, n_valid={n_valid}, "
+                f"z_cam_range=({z_min:.3f}, {z_max:.3f})"
+            )
 
         return pixels, valid_mask
 
@@ -591,6 +514,156 @@ class Projection:
         """
         return [self.cuboid_to_2d(cuboid) for cuboid in cuboids]
 
+    def backproject_sparse_depth_map_with_colors(
+        self,
+        sparse_depth_map: np.ndarray,
+        image: np.ndarray,
+        depth_threshold_min: float = 0.1,
+        depth_threshold_max: float = 100.0
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Backproject sparse depth map to 3D LiDAR point cloud with colors from the image.
+
+        Args:
+            sparse_depth_map: HxW numpy array with depth values at projected pixel locations, zeros elsewhere
+            image: HxWx3 numpy array (RGB format) corresponding to the depth map
+            depth_threshold_min: Minimum valid depth value (meters)
+            depth_threshold_max: Maximum valid depth value (meters)
+
+        Returns:
+            Tuple of (points_lidar, colors) where:
+                - points_lidar: Nx3 array of 3D points in LiDAR coordinates
+                - colors: Nx3 array of RGB colors (0-255) corresponding to each point
+        """
+        h, w = sparse_depth_map.shape
+
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            if image.dtype != np.uint8:
+                if image.max() <= 1.0:
+                    image = (image * 255).astype(np.uint8)
+                else:
+                    image = image.astype(np.uint8)
+        else:
+            raise ValueError(f"Image must be HxWx3 RGB format, got shape {image.shape}")
+
+        valid_mask = (sparse_depth_map > depth_threshold_min) & (sparse_depth_map <= depth_threshold_max)
+
+        if not np.any(valid_mask):
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+
+        v, u = np.where(valid_mask)
+        depths = sparse_depth_map[valid_mask]
+
+        colors = image[v, u]
+
+        K_inv = np.linalg.inv(self.camera_intrinsic)
+        pixels_homogeneous = np.stack([u, v, np.ones_like(u)], axis=0)
+        points_normalized = K_inv @ pixels_homogeneous
+        points_camera = points_normalized * depths
+        points_camera = points_camera.T
+
+        points_camera_homo = np.hstack([points_camera, np.ones((len(points_camera), 1))])
+        points_lidar = (self.camera_to_lidar_transform @ points_camera_homo.T).T[:, :3]
+
+        print(f"Backprojected {len(points_lidar)} colored points from sparse depth map")
+        print(f"  X range: [{points_lidar[:, 0].min():.2f}, {points_lidar[:, 0].max():.2f}]")
+        print(f"  Y range: [{points_lidar[:, 1].min():.2f}, {points_lidar[:, 1].max():.2f}]")
+        print(f"  Z range: [{points_lidar[:, 2].min():.2f}, {points_lidar[:, 2].max():.2f}]")
+
+        return points_lidar, colors
+
+    def project_masked_depth_to_3d(
+        self,
+        depth_map: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+        depth_threshold_min: float = 0.1,
+        depth_threshold_max: float = 100.0,
+        stride: int = 1
+    ) -> np.ndarray:
+        """
+        Project a depth map (optionally masked) to 3D LiDAR coordinates using stored camera parameters.
+
+        Args:
+            depth_map: Metric depth map (H, W) in meters
+            mask: Optional binary mask (H, W). Only pixels where mask>0 are projected.
+            depth_threshold_min: Minimum valid depth value (meters)
+            depth_threshold_max: Maximum valid depth value (meters)
+            stride: Sampling stride for point cloud (1 = all pixels, 2 = every other pixel, etc.)
+
+        Returns:
+            points_lidar: Nx3 array of 3D points in LiDAR coordinates
+        """
+        depth_map = np.asarray(depth_map)
+        original_shape = depth_map.shape
+
+        if depth_map.ndim == 1:
+            raise ValueError(f"Depth map is 1D with shape {depth_map.shape}, expected 2D (H, W)")
+        elif depth_map.ndim == 2:
+            pass
+        elif depth_map.ndim == 3:
+            if depth_map.shape[0] == 1:
+                depth_map = depth_map[0, :, :]
+            elif depth_map.shape[2] == 1:
+                depth_map = depth_map[:, :, 0]
+            else:
+                depth_map = depth_map[0, :, :]
+        elif depth_map.ndim == 4:
+            depth_map = depth_map.squeeze()
+            if depth_map.ndim != 2:
+                depth_map = depth_map.reshape(-1, depth_map.shape[-1])[0].reshape(depth_map.shape[-2:])
+        else:
+            raise ValueError(f"Unexpected depth map shape: {depth_map.shape}, expected 2D (H, W)")
+
+        if depth_map.ndim != 2:
+            raise ValueError(f"After processing, depth map still has {depth_map.ndim} dimensions with shape {depth_map.shape} (original shape: {original_shape})")
+
+        height, width = depth_map.shape
+
+        u_coords, v_coords = np.meshgrid(
+            np.arange(0, width, stride),
+            np.arange(0, height, stride)
+        )
+
+        u = u_coords.flatten()
+        v = v_coords.flatten()
+        depths = depth_map[v, u]
+
+        valid_mask = (depths >= depth_threshold_min) & (depths <= depth_threshold_max)
+
+        if mask is not None:
+            if mask.shape != depth_map.shape:
+                raise ValueError(f"Mask shape {mask.shape} does not match depth map shape {depth_map.shape}")
+            mask_values = mask[v, u]
+            valid_mask = valid_mask & (mask_values > 0)
+            print(f"Applied mask: {np.sum(valid_mask):,} pixels remain after mask filtering")
+
+        u_valid = u[valid_mask]
+        v_valid = v[valid_mask]
+        depths_valid = depths[valid_mask]
+
+        print("Reconstructing masked point cloud from depth:")
+        print(f"  Total pixels: {len(u)}")
+        print(f"  Valid depth pixels: {len(depths_valid)} ({100 * len(depths_valid) / len(u):.1f}%)")
+
+        K_inv = np.linalg.inv(self.camera_intrinsic)
+        pixels_homogeneous = np.stack([u_valid, v_valid, np.ones_like(u_valid)], axis=0)
+        points_normalized = K_inv @ pixels_homogeneous
+        points_camera = points_normalized * depths_valid
+        points_camera = points_camera.T
+
+        points_camera_homo = np.hstack([points_camera, np.ones((len(points_camera), 1))])
+        points_lidar = (self.camera_to_lidar_transform @ points_camera_homo.T).T[:, :3]
+
+        if len(points_lidar) > 0:
+            print(f"  Reconstructed {len(points_lidar)} masked points in LiDAR coordinates")
+            print(f"  X range: [{points_lidar[:, 0].min():.2f}, {points_lidar[:, 0].max():.2f}]")
+            print(f"  Y range: [{points_lidar[:, 1].min():.2f}, {points_lidar[:, 1].max():.2f}]")
+            print(f"  Z range: [{points_lidar[:, 2].min():.2f}, {points_lidar[:, 2].max():.2f}]")
+        else:
+            print("  No valid points reconstructed from masked depth")
+
+        return points_lidar
+
 
 # Backward compatibility alias
 Projection2DTo3D = Projection
@@ -626,28 +699,6 @@ class PointCloud:
         
         return new_point_cloud
 
-    def filter_forward_points(self, points: np.ndarray) -> np.ndarray:
-        """
-        Filter points to only include those in front of the vehicle (positive x in LiDAR coords).
-        This is necessary because KITTI only has forward-facing cameras.
-
-        Args:
-            points: Nx3 array of points
-
-        Returns:
-            Filtered Nx3 array with only forward-facing points
-        """
-        forward_mask = points[:, 0] > 0  # Keep only positive x values
-        filtered_points = points[forward_mask]
-
-        n_removed = len(points) - len(filtered_points)
-        if n_removed > 0:
-            print(f"Forward-facing filter:")
-            print(f"  Removed {n_removed} points behind/beside vehicle (x <= 0)")
-            print(f"  Remaining forward-facing points: {len(filtered_points)}")
-
-        return filtered_points
-
     def filter_by_frustums(self, frustums: List[Tuple[np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
         """
         Filter point cloud to keep only points inside frustum regions.
@@ -673,39 +724,95 @@ class PointCloud:
 
     def remove_ground_plane_ransac(self, distance_threshold: float = 0.3,
                                    ransac_n: int = 3, num_iterations: int = 1000,
-                                   remove_ego_car: bool = True, filter_forward_only: bool = True) -> np.ndarray:
+                                   remove_ego_car: bool = False, filter_forward_only: bool = False,
+                                   ground_z_range: Optional[Tuple[float, float]] = (-3.0, 3.0),
+                                   ground_z_percentile: float = 0.35,
+                                   ground_fit_max_xy_distance: Optional[float] = 15.0,
+                                   camera_to_lidar_transform: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Remove ground plane from point cloud using RANSAC.
+
+        RANSAC is run on a subset of points that are likely ground to avoid
+        fitting walls/ceiling in indoor scenes (where they can have more points).
+        The plane normal is required to be roughly horizontal and pointing up.
 
         Args:
             distance_threshold: Maximum distance from plane to be considered inlier
             ransac_n: Number of points to sample for plane fitting
             num_iterations: Number of RANSAC iterations
             remove_ego_car: Whether to remove points near the ego vehicle
-            filter_forward_only: Whether to keep only forward-facing points (x > 0)
+            filter_forward_only: Whether to keep only forward-facing points in
+                                 front of the camera. If camera_to_lidar_transform
+                                 is provided, this uses the camera z-axis in LiDAR
+                                 coordinates; otherwise it falls back to x > 0.
+            ground_z_range: (z_min, z_max) - hard clip on z for candidates. Typical: (-3, 3) m.
+            ground_z_percentile: Use only points with z in [0, this percentile] of the cloud
+                                (e.g. 0.35 = lowest 35%%). Favors floor over walls in indoor.
+            ground_fit_max_xy_distance: If set, only points within this horizontal distance
+                                       from origin are used to fit the plane (avoids far walls).
 
         Returns:
             Filtered point cloud with ground plane removed
         """
+        pts = self.original_point_cloud
+        z_min_range, z_max_range = ground_z_range
+        # 1) Restrict to z band
+        ground_candidate_mask = (pts[:, 2] >= z_min_range) & (pts[:, 2] <= z_max_range)
+        # 2) Further restrict to lowest percentile of z (floor, not walls/ceiling)
+        band = pts[(pts[:, 2] >= z_min_range) & (pts[:, 2] <= z_max_range)]
+        z_lo_pct, z_hi_pct = np.percentile(band[:, 2], [0, ground_z_percentile * 100])
+        low_z_mask = (pts[:, 2] >= z_lo_pct) & (pts[:, 2] <= z_hi_pct)
+        ground_candidate_mask = ground_candidate_mask & low_z_mask
+        # 3) Optional: only points near the sensor (avoids far walls in same z band)
+        if ground_fit_max_xy_distance is not None and ground_fit_max_xy_distance > 0:
+            xy_dist = np.linalg.norm(pts[:, :2], axis=1)
+            ground_candidate_mask = ground_candidate_mask & (xy_dist <= ground_fit_max_xy_distance)
+        if np.sum(ground_candidate_mask) < ransac_n * 10:
+            # Fallback: relax to lower half of z range, no xy cap
+            z_lo, z_hi = np.percentile(pts[:, 2], [0, 50])
+            ground_candidate_mask = (pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)
+        ground_candidates = pts[ground_candidate_mask]
+        # Ensure we have enough candidates for Open3D's RANSAC
+        if len(ground_candidates) < ransac_n:
+            # Not enough points to fit a plane; keep original cloud unchanged
+            self.point_cloud_plane_removed = pts.copy()
+            self.ground_plane_model = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float64)
+            self.ground_plane_inliers = np.zeros(len(pts), dtype=bool)
+            self.ground_plane_outliers = np.ones(len(pts), dtype=bool)
+            return self.point_cloud_plane_removed
 
-        # Create Open3D point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(self.original_point_cloud)
+        # Create Open3D point cloud from ground-candidate points only
+        pcd_fit = o3d.geometry.PointCloud()
+        pcd_fit.points = o3d.utility.Vector3dVector(ground_candidates)
 
-        # Segment plane using RANSAC
-        plane_model, inliers = pcd.segment_plane(
+        plane_model, inliers_fit = pcd_fit.segment_plane(
             distance_threshold=distance_threshold,
             ransac_n=ransac_n,
             num_iterations=num_iterations
         )
+        a, b, c, d = plane_model
+        n_norm = np.sqrt(a * a + b * b + c * c) + 1e-9
+        # Require roughly horizontal (|n_z| dominant)
+        if abs(c) / n_norm < 0.7:
+            z_median = float(np.median(ground_candidates[:, 2]))
+            plane_model = np.array([0.0, 0.0, 1.0, -z_median], dtype=np.float64)
+            a, b, c, d = plane_model
+            n_norm = 1.0
+        else:
+            # Prefer normal pointing up (floor = ground below); flip if ceiling
+            if c < 0:
+                plane_model = np.array([-a, -b, -c, -d], dtype=np.float64)
+                a, b, c, d = plane_model
 
-        # Extract non-ground points (outliers)
-        outlier_cloud = pcd.select_by_index(inliers, invert=True)
+        # Apply plane to full point cloud: compute distances and mark inliers
+        n_pts = len(pts)
+        dists = np.abs(pts[:, 0] * a + pts[:, 1] * b + pts[:, 2] * c + d) / n_norm
+        inliers_full = np.where(dists <= distance_threshold)[0]
+        outlier_mask = np.ones(n_pts, dtype=bool)
+        outlier_mask[inliers_full] = False
+        filtered_points = pts[outlier_mask]
 
-        # Convert back to numpy array
-        filtered_points = np.asarray(outlier_cloud.points)
-
-        n_ground_points = len(inliers)
+        n_ground_points = len(inliers_full)
         n_remaining_points = len(filtered_points)
 
         if remove_ego_car:
@@ -714,16 +821,30 @@ class PointCloud:
             ego_mask = distances > 2.5
             filtered_points = filtered_points[ego_mask]
 
-        # Filter to only forward-facing points (positive x)
+        # Filter to only forward-facing points (z_cam > 0 if transform available,
+        # otherwise fallback to x > 0 in LiDAR frame).
         if filter_forward_only:
-            filtered_points = self.filter_forward_points(filtered_points)
+            if camera_to_lidar_transform is not None:
+                filtered_points = Projection.filter_forward_points(
+                    Projection(
+                        camera_intrinsic=np.eye(3, dtype=filtered_points.dtype),
+                        camera_extrinsic=np.eye(4, dtype=filtered_points.dtype),
+                        camera_to_lidar_transform=camera_to_lidar_transform,
+                        point_cloud=filtered_points,
+                    ),
+                    filtered_points,
+                )
+            else:
+                forward_mask = filtered_points[:, 0] > 0
+                filtered_points = filtered_points[forward_mask]
 
         self.ground_removed = True
         self.point_cloud_plane_removed = filtered_points
         self.ground_plane_model = plane_model
-        self.ground_inliers = self.original_point_cloud[inliers]
+        self.ground_inliers = self.original_point_cloud[inliers_full]
 
-    def get_ground_z(self, x: float = 0.0, y: float = 0.0) -> Optional[float]:
+    def get_ground_z(self, x: float = 0.0, y: float = 0.0,
+                     z_range: Optional[Tuple[float, float]] = (-10.0, 10.0)) -> Optional[float]:
         """
         Compute the ground z value at a given (x, y) location using the ground plane model.
 
@@ -733,9 +854,11 @@ class PointCloud:
         Args:
             x: X coordinate (forward direction)
             y: Y coordinate (lateral direction)
+            z_range: (z_min, z_max) - if computed z is outside this range, return None.
+                      Prevents invalid values (e.g. -80m) from bad plane fits.
 
         Returns:
-            Ground z value at (x, y), or None if ground plane not computed
+            Ground z value at (x, y), or None if ground plane not computed or z out of range
         """
         if not self.ground_removed or self.ground_plane_model is None:
             return None
@@ -746,7 +869,12 @@ class PointCloud:
             return None
 
         z = -(a * x + b * y + d) / c
-        return float(z)
+        z = float(z)
+        if z_range is not None:
+            z_lo, z_hi = z_range
+            if z < z_lo or z > z_hi:
+                return None
+        return z
 
     def add_projected_points(self, projected_points: np.ndarray):
         """
@@ -914,145 +1042,211 @@ class PointCloud:
         else:
             print("No points to add from segmentation masks")
 
-class PointCloudVisualizer:
-    """
-    Class for visualizing point clouds, clusters, and rays.
-    """
-    
-    def __init__(self, point_cloud: PointCloud):
+    @staticmethod
+    def from_rgbd_sunrgbd(
+        rgb_image: np.ndarray,
+        depth_image: np.ndarray,
+        camera_intrinsic: np.ndarray,
+        depth_scale: float = 10000.0,
+        depth_trunc: float = 10.0,
+        stride: int = 1,
+        keep_fraction: float = 0.8,
+    ) -> "PointCloud":
         """
-        Initialize the point cloud visualizer.
-        
+        Create a PointCloud from an RGBD image pair following the SunRGBD dataset conventions.
+
+        SunRGBD stores depth as 16-bit PNG. The ``depth_bfx/`` directory uses a
+        scale of 10000 (depth_meters = raw / 10000). Raw sensor directories may
+        use 1000 (millimetres). Adjust ``depth_scale`` accordingly.
+
+        The returned point cloud lives in the **camera** coordinate system
+        (X-right, Y-down, Z-forward) because SunRGBD has no separate LiDAR
+        frame.  Colours are carried on the ``PointCloud`` via the
+        ``.colors`` attribute (Nx3, 0-255 uint8).
+
         Args:
-            point_cloud: Nx3 array of point cloud points (x, y, z)
-            coordinate_systems: Optional coordinate system information
-            remove_ground: Whether to automatically remove ground plane using RANSAC
+            rgb_image:        H×W×3 uint8 RGB image.
+            depth_image:      H×W uint16 / float depth map (raw sensor values).
+            camera_intrinsic: 3×3 intrinsic matrix ``[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]``.
+            depth_scale:      Divisor that converts raw depth to **metres**
+                              (10000 for ``depth_bfx``, 1000 for raw mm).
+            depth_trunc:      Maximum depth in metres; farther points are discarded.
+            stride:           Pixel sampling stride (1 = every pixel).
+
+        Returns:
+            A ``PointCloud`` instance whose ``.original_point_cloud`` is Nx3 in
+            camera coords and ``.colors`` is the corresponding Nx3 RGB array.
         """
-        
-        if point_cloud.ground_removed:
-            self.original_point_cloud = point_cloud.point_cloud_plane_removed
-        else:
-            self.original_point_cloud = point_cloud.original_point_cloud
-    
-    def visualize_point_cloud(self, points: Optional[np.ndarray] = None,
-                                       rays: Optional[Dict[str, np.ndarray]] = None,
-                                       clusters: Optional[List[np.ndarray]] = None,
-                                       title: str = "Point Cloud with Projected Points"):
-        """
-        Visualize point cloud with projected 3D points from rays using Open3D. It has the option to visualize the ground plane, projected points, rays, and clusters along with the point cloud.
-        
-        Args:
-            points: Nx3 array of projected 3D points
-            rays: Optional dictionary with 'origins' (Nx3) and 'directions' (Nx3)
-            clusters: Optional list of point indices arrays for each cluster
-            title: Window title
-            draw_coordinate_systems: Whether to draw coordinate system axes
-            axis_length: Length of coordinate system axes
-        """
-        geometries = []
-    
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(self.original_point_cloud)
-        pcd.paint_uniform_color([0, 0, 1])
-        geometries.append(pcd)
-        
-        # Add clusters if provided
-        if clusters is not None:
-            cluster_colors = np.zeros((len(clusters), 3))
-            cluster_colors[:, 0] = 0.9  # High red channel for all clusters
-            cluster_colors[:, 1] = np.linspace(0, 0.3, len(clusters))  # Vary green from 0 to 0.3
-            cluster_colors[:, 2] = np.linspace(0, 0.2, len(clusters))  # Vary blue from 0 to 0.2
-            print("Cluster colors:")
-            print(cluster_colors)
-            for i, cluster_indices in enumerate(clusters):
-                if len(cluster_indices) > 0:
-                    cluster_pcd = o3d.geometry.PointCloud()
-                    cluster_pcd.points = o3d.utility.Vector3dVector(
-                        self.original_point_cloud[cluster_indices]
-                    )
-                    cluster_pcd.paint_uniform_color(cluster_colors[i])
-                    geometries.append(cluster_pcd)
-        
-        # Add projected points
-        if points is not None and len(points) > 0:
-            projected_pcd = o3d.geometry.PointCloud()
-            projected_pcd.points = o3d.utility.Vector3dVector(points)
-            projected_pcd.paint_uniform_color([1, 0, 0])  # Red
-            geometries.append(projected_pcd)
-            
-        
-        # Add rays if provided
-        if rays is not None:
-            origins = rays['origins']
-            directions = rays['directions']
-            for i in range(len(origins)):
-                origin = origins[i]
-                if points is not None and i < len(points):
-                    projected = points[i]
-                else:
-                    # Extend ray if no projected point
-                    projected = origin + directions[i] * 20.0
-                
-                # Create line segment for ray
-                line_points = np.array([origin, projected])
-                line = o3d.geometry.LineSet()
-                line.points = o3d.utility.Vector3dVector(line_points)
-                line.lines = o3d.utility.Vector2iVector([[0, 1]])
-                line.colors = o3d.utility.Vector3dVector([[1, 0.5, 0.2]])  # Orange
-                geometries.append(line)
-        
-        
-        # Visualize
-        o3d.visualization.draw_geometries(geometries, window_name=title)
+        print(
+            "[SUNRGBD_RGBD_PC] from_rgbd_sunrgbd called "
+            f"rgb_shape={getattr(rgb_image, 'shape', None)} "
+            f"depth_shape={getattr(depth_image, 'shape', None)} "
+            f"depth_dtype={getattr(depth_image, 'dtype', None)} "
+            f"depth_scale={depth_scale} depth_trunc={depth_trunc} stride={stride} "
+            f"keep_fraction={keep_fraction}"
+        )
+
+        # Convert depth to metres using float32 to reduce memory footprint.
+        depth_m = depth_image.astype(np.float32) / float(depth_scale)
+
+        h, w = depth_m.shape
+        u_coords, v_coords = np.meshgrid(
+            np.arange(0, w, stride),
+            np.arange(0, h, stride),
+        )
+        u = u_coords.ravel()
+        v = v_coords.ravel()
+        z = depth_m[v, u]
+
+        valid = (z > 0.0) & (z <= depth_trunc)
+        u, v, z = u[valid], v[valid], z[valid]
+
+        # Optional random downsampling to limit point count for memory-intensive
+        # operations such as DBSCAN in batch mode.
+        n_valid = z.size
+        if n_valid > 0:
+            if keep_fraction <= 0.0:
+                keep_fraction = 0.0
+            if keep_fraction < 1.0:
+                target_n = int(float(n_valid) * float(keep_fraction))
+                if target_n <= 0:
+                    target_n = 1
+                if target_n < n_valid:
+                    rng = np.random.default_rng()
+                    keep_idx = rng.choice(n_valid, size=target_n, replace=False)
+                    u = u[keep_idx]
+                    v = v[keep_idx]
+                    z = z[keep_idx]
+
+        fx = camera_intrinsic[0, 0]
+        fy = camera_intrinsic[1, 1]
+        cx = camera_intrinsic[0, 2]
+        cy = camera_intrinsic[1, 2]
+
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+
+        points = np.stack([x, y, z], axis=-1).astype(np.float32)
+        colors = rgb_image[v, u]  # Nx3 uint8
+
+        pc = PointCloud(points)
+        pc.colors = colors
+
+        print(
+            "[SUNRGBD_RGBD_PC] from_rgbd_sunrgbd finished "
+            f"valid_points={len(points)}"
+        )
+
+        return pc
 
 
-def visualize_image_with_pixels(image: np.ndarray, pixel_coords: np.ndarray,
-                                save_path: Optional[str] = None, show: bool = True):
+def load_sunrgbd_calibration(intrinsics_path: str) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Visualize image with marked pixels that are being projected.
-    
+    Load SUNRGBD calibration entries from a calibration text file.
+
+    Supported formats:
+
+    1) 18-value SUNRGBD trainval calib file:
+       - first 9 values: ``Rtilt`` (row-major)
+       - second 9 values: ``K`` (column-major flattening in official files)
+
+    2) 9-value intrinsics-only file:
+       - values are interpreted as row-major ``K``.
+       - ``Rtilt`` defaults to identity.
+
     Args:
-        image: 2D image (can be path or numpy array)
-        pixel_coords: Nx2 array of pixel coordinates (u, v)
-        save_path: Optional path to save the visualization
-        show: Whether to display the plot
+        intrinsics_path: Path to SUNRGBD calibration file.
+
+    Returns:
+        Tuple ``(K, Rtilt)``, both 3x3 float64 arrays.
     """
-    # Load image if it's a path
-    if isinstance(image, str):
-        img = cv2.imread(image)
-        if img is None:
-            raise ValueError(f"Could not load image: {image}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    values = np.loadtxt(intrinsics_path, dtype=np.float64).reshape(-1)
+    n_values = int(values.size)
+
+    if n_values >= 18:
+        rtilt = values[:9].reshape(3, 3)
+        k_flat = values[9:18]
+        K = k_flat.reshape(3, 3, order="F")
+    elif n_values == 9:
+        K = values.reshape(3, 3)
+        rtilt = np.eye(3, dtype=np.float64)
     else:
-        img = image.copy()
-        if len(img.shape) == 3 and img.shape[2] == 3:
-            # Already RGB
-            pass
-        else:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    
-    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-    ax.imshow(img)
-    
-    # Mark pixels
-    if pixel_coords.ndim == 1:
-        pixel_coords = pixel_coords.reshape(1, -1)
-    
-    for i, (u, v) in enumerate(pixel_coords):
-        # Draw circle at pixel location
-        circle = plt.Circle((u, v), 4, color='red', fill=True, alpha=0.5)
-        ax.add_patch(circle)
-        
-    ax.set_title(f"Image with {len(pixel_coords)} Projected Pixels", 
-                fontsize=14, weight='bold')
-    ax.axis('off')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Image visualization saved to: {save_path}")
-    
-    if show:
-        plt.show()
-    else:
-        plt.close()
+        raise ValueError(
+            f"Unsupported SUNRGBD calibration format in '{intrinsics_path}': "
+            f"expected 9 or >=18 values, got {n_values}"
+        )
+
+    return K, rtilt
+
+
+def load_sunrgbd_intrinsics(intrinsics_path: str) -> np.ndarray:
+    """
+    Load a 3×3 camera intrinsic matrix from SUNRGBD calibration text.
+
+    Supported formats:
+
+    1) ``intrinsics.txt`` style (3x3, row-major), e.g.::
+
+           fx  0  cx
+            0 fy  cy
+            0  0   1
+
+    2) ``sunrgbd_trainval/calib/*.txt`` style with 18 values:
+       first 9 are Rtilt, second 9 are K flattened in column-major order.
+
+    Args:
+        intrinsics_path: Path to SUNRGBD calibration file.
+
+    Returns:
+        3×3 numpy float64 intrinsic matrix.
+    """
+    K, _ = load_sunrgbd_calibration(intrinsics_path)
+    return K
+
+
+def create_o3d_pointcloud_from_rgbd_sunrgbd(
+    rgb_image: np.ndarray,
+    depth_image: np.ndarray,
+    camera_intrinsic: np.ndarray,
+    depth_scale: float = 10000.0,
+    depth_trunc: float = 10.0,
+) -> o3d.geometry.PointCloud:
+    """
+    Create an Open3D PointCloud directly from SunRGBD RGBD data using the
+    Open3D RGBD pipeline for maximum efficiency.
+
+    Args:
+        rgb_image:        H×W×3 uint8 RGB image.
+        depth_image:      H×W uint16 / float raw depth values.
+        camera_intrinsic: 3×3 numpy intrinsic matrix.
+        depth_scale:      Divisor converting raw depth to metres.
+        depth_trunc:      Maximum depth in metres.
+
+    Returns:
+        ``open3d.geometry.PointCloud`` with colours.
+    """
+    h, w = depth_image.shape[:2]
+
+    o3d_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+        width=w,
+        height=h,
+        fx=float(camera_intrinsic[0, 0]),
+        fy=float(camera_intrinsic[1, 1]),
+        cx=float(camera_intrinsic[0, 2]),
+        cy=float(camera_intrinsic[1, 2]),
+    )
+
+    rgb_o3d = o3d.geometry.Image(np.ascontiguousarray(rgb_image))
+    depth_o3d = o3d.geometry.Image(np.ascontiguousarray(depth_image.astype(np.float32)))
+
+    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        rgb_o3d,
+        depth_o3d,
+        depth_scale=depth_scale,
+        depth_trunc=depth_trunc,
+        convert_rgb_to_intensity=False,
+    )
+
+    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, o3d_intrinsic)
+
+    return pcd

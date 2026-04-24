@@ -7,7 +7,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 import cv2
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..core.pointcloud_projection import Projection
 
@@ -270,6 +270,103 @@ def draw_2d_boxes_on_image(image: np.ndarray, boxes: List[Dict]) -> np.ndarray:
                     font, font_scale, (255, 255, 255), thickness)
 
     return img_with_boxes
+
+
+def generate_distinct_colors(n: int) -> List[Tuple[float, float, float]]:
+    """
+    Generate n distinct RGB colors in [0, 1] for visualization.
+
+    Uses Plotly's qualitative color set and cycles if n exceeds palette size.
+    """
+    if n <= 0:
+        return []
+
+    base_colors = px.colors.qualitative.Plotly
+    colors: List[Tuple[float, float, float]] = []
+
+    for i in range(n):
+        color_str = base_colors[i % len(base_colors)]
+        color_str = color_str.strip()
+
+        # Handle hex colors like "#636efa" or "#fff"
+        if color_str.startswith("#"):
+            hex_str = color_str.lstrip("#")
+            length = len(hex_str)
+            if length == 6:
+                r = int(hex_str[0:2], 16)
+                g = int(hex_str[2:4], 16)
+                b = int(hex_str[4:6], 16)
+            elif length == 3:
+                r = int(hex_str[0] * 2, 16)
+                g = int(hex_str[1] * 2, 16)
+                b = int(hex_str[2] * 2, 16)
+            else:
+                # Fallback to a neutral color if format is unexpected
+                r = 128
+                g = 128
+                b = 128
+        else:
+            # Handle "rgb(r,g,b)" or "rgba(r,g,b,a)" strings
+            cleaned = color_str.lower().replace("rgba", "rgb")
+            cleaned = cleaned.replace("rgb(", "").replace(")", "")
+            parts = cleaned.split(",")
+            if len(parts) >= 3:
+                r = float(parts[0])
+                g = float(parts[1])
+                b = float(parts[2])
+            else:
+                r = 128.0
+                g = 128.0
+                b = 128.0
+
+        colors.append((r / 255.0, g / 255.0, b / 255.0))
+
+    return colors
+
+
+def overlay_masks_on_image(
+    image: np.ndarray,
+    masks: List[np.ndarray],
+    colors: List[Tuple[float, float, float]],
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """
+    Overlay segmentation masks on image with different colors.
+
+    Args:
+        image: Input image (H, W, 3) in RGB uint8 format
+        masks: List of binary masks (H, W)
+        colors: List of RGB colors (0-1 range) for each mask
+        alpha: Transparency of mask overlay (0-1)
+
+    Returns:
+        Image with masks overlaid (uint8 RGB)
+    """
+    if image.dtype != np.uint8:
+        img_float = np.clip(image.astype(np.float32), 0.0, 255.0)
+        base = img_float / 255.0
+    else:
+        base = image.astype(np.float32) / 255.0
+
+    result = base.copy()
+
+    for mask, color in zip(masks, colors):
+        if mask is None:
+            continue
+
+        mask_binary = (mask > 0).astype(np.float32)
+        if mask_binary.ndim == 2:
+            mask_binary = mask_binary[:, :, np.newaxis]
+
+        colored_mask = np.zeros_like(result)
+        colored_mask[:, :, 0] = color[0]
+        colored_mask[:, :, 1] = color[1]
+        colored_mask[:, :, 2] = color[2]
+
+        result = result * (1.0 - alpha * mask_binary) + colored_mask * (alpha * mask_binary)
+
+    result_uint8 = (np.clip(result, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return result_uint8
 
 
 def draw_projected_cuboid_bboxes(image: np.ndarray, cuboids: List[Dict],
@@ -689,6 +786,103 @@ def create_3d_scatter_plot(points, labels: Optional[np.ndarray] = None,
         ),
         margin=dict(l=0, r=0, b=0, t=40),
         height=600
+    )
+
+    return fig
+
+
+def create_3d_mask_assignment_figure(
+    points_3d: np.ndarray,
+    mask_assignments: np.ndarray,
+    mask_colors: List[Tuple[float, float, float]],
+    lidar_points: Optional[np.ndarray] = None,
+    show_unassigned: bool = True,
+    unassigned_color: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+    title: str = "3D Points Colored by Segmentation Mask",
+) -> go.Figure:
+    """
+    Create a 3D scatter figure where each point is colored by its assigned mask.
+
+    This is a reusable building block for visualizing segmentation outputs
+    on top of LiDAR or reconstructed 3D points.
+    """
+    fig = go.Figure()
+
+    n_points = len(points_3d)
+    if n_points == 0:
+        fig.update_layout(title=title)
+        return fig
+
+    n_masks = len(mask_colors)
+
+    for mask_idx in range(n_masks):
+        mask_points = points_3d[mask_assignments == mask_idx]
+        if len(mask_points) == 0:
+            continue
+
+        color = mask_colors[mask_idx]
+        color_str = f"rgb({int(color[0] * 255)}, {int(color[1] * 255)}, {int(color[2] * 255)})"
+
+        fig.add_trace(
+            go.Scatter3d(
+                x=mask_points[:, 0],
+                y=mask_points[:, 1],
+                z=mask_points[:, 2],
+                mode="markers",
+                marker=dict(size=2, color=color_str, opacity=0.8),
+                name=f"Mask {mask_idx + 1}",
+                showlegend=True,
+            )
+        )
+
+    if show_unassigned:
+        unassigned_points = points_3d[mask_assignments == -1]
+        if len(unassigned_points) > 0:
+            ua_color_str = (
+                f"rgb({int(unassigned_color[0] * 255)}, "
+                f"{int(unassigned_color[1] * 255)}, "
+                f"{int(unassigned_color[2] * 255)})"
+            )
+            fig.add_trace(
+                go.Scatter3d(
+                    x=unassigned_points[:, 0],
+                    y=unassigned_points[:, 1],
+                    z=unassigned_points[:, 2],
+                    mode="markers",
+                    marker=dict(size=2, color=ua_color_str, opacity=0.5),
+                    name="Unassigned",
+                    showlegend=True,
+                )
+            )
+
+    if lidar_points is not None and len(lidar_points) > 0:
+        sample_size = min(10000, len(lidar_points))
+        indices = np.random.choice(len(lidar_points), sample_size, replace=False)
+        sampled_lidar = lidar_points[indices]
+
+        fig.add_trace(
+            go.Scatter3d(
+                x=sampled_lidar[:, 0],
+                y=sampled_lidar[:, 1],
+                z=sampled_lidar[:, 2],
+                mode="markers",
+                marker=dict(size=1, color="rgb(200,200,200)", opacity=0.3),
+                name="LiDAR Points",
+                showlegend=True,
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="X (m)",
+            yaxis_title="Y (m)",
+            zaxis_title="Z (m)",
+            aspectmode="data",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+        height=700,
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
     )
 
     return fig

@@ -10,6 +10,7 @@ from nuscenes.utils.data_classes import Box
 from nuscenes.utils.geometry_utils import view_points, box_in_image, transform_matrix
 from pyquaternion import Quaternion
 import open3d as o3d
+import matplotlib.pyplot as plt
 
 
 class NuScenesAnnotationLoader:
@@ -292,7 +293,6 @@ class AnnotationVisualizer:
                 geometries.append(ann_pcd)
         
         # Add detected clusters in different colors
-                import matplotlib.pyplot as plt
                 colors = plt.cm.tab20(np.linspace(0, 1, len(detected_clusters)))[:, :3]
         for i, cluster_indices in enumerate(detected_clusters):
             if len(cluster_indices) > 0:

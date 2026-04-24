@@ -4,6 +4,8 @@ from PIL import Image
 import os
 import logging
 import diffusers
+import time
+from typing import Optional
 
 if not torch.cuda.is_available():
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -196,6 +198,104 @@ else:
     MarigoldDepthCompletionPipeline = None
 
 
+def remove_boundary_points_from_sparse_depth(sparse_depth_map: np.ndarray,
+                                             boundary_mask: np.ndarray) -> np.ndarray:
+    """
+    Remove boundary points from sparse depth map.
+    
+    Args:
+        sparse_depth_map: HxW numpy array with depth values at projected pixel locations, zeros elsewhere
+        boundary_mask: HxW binary mask with 1 at object boundaries, 0 elsewhere
+        
+    Returns:
+        Sparse depth map with boundary points set to zero
+    """
+    if sparse_depth_map.shape != boundary_mask.shape:
+        raise ValueError(f"Sparse depth map shape {sparse_depth_map.shape} does not match boundary mask shape {boundary_mask.shape}")
+    
+    # Set boundary points to zero
+    cleaned_depth = sparse_depth_map.copy()
+    cleaned_depth[boundary_mask > 0] = 0.0
+    
+    n_removed = np.sum((sparse_depth_map > 0) & (boundary_mask > 0))
+    print(f"Removed {n_removed} boundary points from sparse depth map")
+    
+    return cleaned_depth
+
+
+def compute_sparse_depth_map(point_cloud: np.ndarray,
+                             image_shape: tuple,
+                             camera_intrinsic: np.ndarray,
+                             camera_to_lidar_transform: np.ndarray,
+                             camera_extrinsic: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Create sparse depth map by back-projecting 3D LiDAR points onto 2D image.
+
+    Args:
+        point_cloud: Nx3 array of 3D points in LiDAR coordinates
+        image_shape: (height, width) of the image
+        camera_intrinsic: 3x3 camera intrinsic matrix K
+        camera_to_lidar_transform: 4x4 transformation matrix from camera to LiDAR
+
+    Returns:
+        sparse_depth: HxW numpy array with depth values at projected pixel locations, zeros elsewhere
+    """
+    if camera_intrinsic is None or camera_to_lidar_transform is None:
+        raise ValueError("Camera parameters not set. camera_intrinsic and camera_to_lidar_transform are required.")
+
+    if camera_extrinsic is None:
+        camera_extrinsic = np.eye(4, dtype=np.float32)
+
+    h, w = image_shape
+
+    from .pointcloud_projection import Projection
+
+    projection = Projection(
+        camera_intrinsic=camera_intrinsic,
+        camera_extrinsic=camera_extrinsic,
+        camera_to_lidar_transform=camera_to_lidar_transform,
+        point_cloud=point_cloud
+    )
+
+    pixels, valid_mask = projection.point_to_pixel(point_cloud)
+
+    in_bounds = (
+        (pixels[:, 0] >= 0) & (pixels[:, 0] < w) &
+        (pixels[:, 1] >= 0) & (pixels[:, 1] < h)
+    )
+    valid_mask &= in_bounds
+
+    sparse_depth = np.zeros((h, w), dtype=np.float32)
+
+    if np.any(valid_mask):
+        valid_pixels = pixels[valid_mask].astype(int)
+        valid_points = point_cloud[valid_mask]
+
+        lidar_to_camera = np.linalg.inv(camera_to_lidar_transform)
+        points_homo = np.hstack([valid_points, np.ones((len(valid_points), 1))])
+        points_cam = (lidar_to_camera @ points_homo.T).T[:, :3]
+
+        depths = points_cam[:, 2]
+
+        positive_depth_mask = depths > 0
+        valid_pixels = valid_pixels[positive_depth_mask]
+        depths = depths[positive_depth_mask]
+
+        for (u, v), depth in zip(valid_pixels, depths):
+            if sparse_depth[v, u] == 0 or depth < sparse_depth[v, u]:
+                sparse_depth[v, u] = depth
+
+    n_points = np.sum(sparse_depth > 0)
+    print(f"Created sparse depth map: {n_points} valid depth points out of {len(point_cloud)} total points")
+    if h > 0 and w > 0:
+        print(f"  Coverage: {100 * n_points / (h * w):.2f}% of pixels")
+    if n_points > 0:
+        non_zero = sparse_depth[sparse_depth > 0]
+        print(f"  Depth range: [{non_zero.min():.2f}, {non_zero.max():.2f}]m")
+
+    return sparse_depth
+
+
 class DepthEstimator:
     def __init__(self, use_marigold: bool = True, use_full_precision: bool = False, use_tiny_vae: bool = False,
                  camera_intrinsic: np.ndarray = None, camera_extrinsic: np.ndarray = None,
@@ -354,7 +454,8 @@ class DepthEstimator:
     def reconstruct_points_from_depth(self, depth_map: np.ndarray, 
                                      depth_threshold_min: float = 0.1,
                                      depth_threshold_max: float = 100.0,
-                                     stride: int = 1) -> np.ndarray:
+                                     stride: int = 1,
+                                     mask: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Reconstruct 3D point cloud from metric depth map and project to LiDAR coordinates.
         Uses camera parameters stored in the object.
@@ -364,6 +465,8 @@ class DepthEstimator:
             depth_threshold_min: Minimum valid depth value (meters)
             depth_threshold_max: Maximum valid depth value (meters)
             stride: Sampling stride for point cloud (1 = all pixels, 2 = every other pixel, etc.)
+            mask: Optional binary mask (H, W) with 1 for pixels to reconstruct, 0 to skip.
+                  If None, reconstructs all valid depth pixels.
             
         Returns:
             points_lidar: Nx3 array of 3D points in LiDAR coordinate system
@@ -374,7 +477,6 @@ class DepthEstimator:
         # Ensure depth_map is 2D (H, W)
         depth_map = np.asarray(depth_map)
         original_shape = depth_map.shape
-        print(f"DEBUG: reconstruct_points_from_depth received depth_map with shape: {original_shape}, ndim: {depth_map.ndim}")
         
         # Handle different possible shapes
         if depth_map.ndim == 1:
@@ -404,7 +506,6 @@ class DepthEstimator:
         if depth_map.ndim != 2:
             raise ValueError(f"After processing, depth map still has {depth_map.ndim} dimensions with shape {depth_map.shape} (original shape: {original_shape})")
         
-        print(f"DEBUG: After shape normalization, depth_map shape: {depth_map.shape}")
         height, width = depth_map.shape
         
         # Create pixel coordinate grid
@@ -422,6 +523,18 @@ class DepthEstimator:
         
         # Filter valid depths
         valid_mask = (depths >= depth_threshold_min) & (depths <= depth_threshold_max)
+        
+        # Apply mask if provided
+        if mask is not None:
+            # Ensure mask matches depth map shape
+            if mask.shape != depth_map.shape:
+                raise ValueError(f"Mask shape {mask.shape} does not match depth map shape {depth_map.shape}")
+            # Get mask values at sampled pixel locations
+            mask_values = mask[v, u]
+            # Only keep pixels where mask is non-zero
+            valid_mask = valid_mask & (mask_values > 0)
+            print(f"Applied mask: {np.sum(valid_mask):,} pixels remain after mask filtering")
+        
         u_valid = u[valid_mask]
         v_valid = v[valid_mask]
         depths_valid = depths[valid_mask]
@@ -566,6 +679,90 @@ class DepthEstimator:
         
         return result
     
+    def complete_depth_for_bboxes(self,
+                                  image: np.ndarray,
+                                  sparse_depth: np.ndarray,
+                                  bboxes: list,
+                                  num_inference_steps: int = 50,
+                                  ensemble_size: int = 1,
+                                  processing_resolution: int = 768,
+                                  seed: int = 2024) -> np.ndarray:
+        """
+        Run Marigold-DC depth completion separately on each bounding box region.
+        
+        Args:
+            image: Full RGB image as numpy array (H, W, 3)
+            sparse_depth: Full sparse depth map (H, W)
+            bboxes: List of bbox dicts with 'left', 'top', 'right', 'bottom' in pixel coords
+            num_inference_steps, ensemble_size, processing_resolution, seed: Marigold-DC parameters
+        
+        Returns:
+            completed_depth_full: Dense depth map (H, W) obtained by filling each bbox region.
+                                   Regions outside all bboxes are left as zero.
+        """
+        if sparse_depth is None:
+            raise ValueError("sparse_depth must be provided for per-bbox completion")
+        
+        h, w = sparse_depth.shape
+        completed_depth_full = np.zeros_like(sparse_depth, dtype=np.float32)
+        
+        if not bboxes:
+            print("complete_depth_for_bboxes: no bounding boxes provided, returning zeros depth map")
+            return completed_depth_full
+        
+        total_start = time.time()
+        n_runs = 0
+        
+        for idx, bbox in enumerate(bboxes):
+            bbox_2d = bbox
+            left = int(bbox_2d.get('left', 0))
+            top = int(bbox_2d.get('top', 0))
+            right = int(bbox_2d.get('right', w))
+            bottom = int(bbox_2d.get('bottom', h))
+            
+            left = max(0, min(left, w - 1))
+            right = max(left + 1, min(right, w))
+            top = max(0, min(top, h - 1))
+            bottom = max(top + 1, min(bottom, h))
+            
+            crop_img = image[top:bottom, left:right]
+            crop_sparse = sparse_depth[top:bottom, left:right]
+            
+            if crop_img.size == 0 or crop_sparse.size == 0:
+                continue
+            
+            print(f"\nRunning Marigold-DC on bbox {idx} with region "
+                  f"[(left={left}, top={top}), (right={right}, bottom={bottom})], "
+                  f"shape={crop_img.shape[:2]}")
+            
+            dense_crop = self.complete_depth(
+                image=crop_img,
+                sparse_depth=crop_sparse,
+                num_inference_steps=num_inference_steps,
+                ensemble_size=ensemble_size,
+                processing_resolution=processing_resolution,
+                seed=seed
+            )
+            
+            if dense_crop is None:
+                continue
+            
+            if dense_crop.shape != crop_sparse.shape:
+                # Ensure shape compatibility
+                dense_crop = np.asarray(dense_crop)
+                if dense_crop.shape != crop_sparse.shape:
+                    print(f"Warning: dense_crop shape {dense_crop.shape} does not match crop_sparse {crop_sparse.shape}, skipping bbox {idx}")
+                    continue
+            
+            completed_depth_full[top:bottom, left:right] = dense_crop.astype(np.float32)
+            n_runs += 1
+        
+        total_elapsed = time.time() - total_start
+        print(f"\nPer-bbox Marigold-DC completion finished: {n_runs} bbox runs, "
+              f"total time {total_elapsed:.2f} seconds")
+        
+        return completed_depth_full
+    
     def create_sparse_depth_map(self, point_cloud: np.ndarray,
                                 image_shape: tuple) -> np.ndarray:
         """
@@ -582,57 +779,12 @@ class DepthEstimator:
         if self.camera_intrinsic is None or self.camera_to_lidar_transform is None:
             raise ValueError("Camera parameters not set. Initialize with camera params or call set_camera_params() first.")
         
-        # Get or create projection object
-        projection = self._get_projection(point_cloud)
-        
-        # Update projection point cloud if needed
-        if not np.array_equal(projection.point_cloud, point_cloud):
-            projection.point_cloud = point_cloud
-        
-        # Project 3D points to 2D pixels
-        pixels, valid_mask = projection.point_to_pixel(point_cloud)
-        
-        # Filter points that are within image bounds
-        h, w = image_shape
-        in_bounds = (
-            (pixels[:, 0] >= 0) & (pixels[:, 0] < w) &
-            (pixels[:, 1] >= 0) & (pixels[:, 1] < h)
+        return compute_sparse_depth_map(
+            point_cloud=point_cloud,
+            image_shape=image_shape,
+            camera_intrinsic=self.camera_intrinsic,
+            camera_to_lidar_transform=self.camera_to_lidar_transform
         )
-        valid_mask &= in_bounds
-        
-        # Initialize sparse depth map
-        sparse_depth = np.zeros((h, w), dtype=np.float32)
-        
-        if np.any(valid_mask):
-            # Get valid pixels and corresponding points
-            valid_pixels = pixels[valid_mask].astype(int)
-            valid_points = point_cloud[valid_mask]
-            
-            # Transform points to camera coordinates to get depth (z-coordinate)
-            lidar_to_camera = np.linalg.inv(self.camera_to_lidar_transform)
-            points_homo = np.hstack([valid_points, np.ones((len(valid_points), 1))])
-            points_cam = (lidar_to_camera @ points_homo.T).T[:, :3]
-            
-            # Depth is the z-coordinate in camera space
-            depths = points_cam[:, 2]
-            
-            # Only keep positive depths (in front of camera)
-            positive_depth_mask = depths > 0
-            valid_pixels = valid_pixels[positive_depth_mask]
-            depths = depths[positive_depth_mask]
-            
-            # Fill sparse depth map (handle multiple points mapping to same pixel by taking closest)
-            for (u, v), depth in zip(valid_pixels, depths):
-                if sparse_depth[v, u] == 0 or depth < sparse_depth[v, u]:
-                    sparse_depth[v, u] = depth
-        
-        n_points = np.sum(sparse_depth > 0)
-        print(f"Created sparse depth map: {n_points} valid depth points out of {len(point_cloud)} total points")
-        print(f"  Coverage: {100*n_points/(h*w):.2f}% of pixels")
-        if n_points > 0:
-            print(f"  Depth range: [{sparse_depth[sparse_depth>0].min():.2f}, {sparse_depth[sparse_depth>0].max():.2f}]m")
-        
-        return sparse_depth
     
     def complete_depth(self, image: np.ndarray, sparse_depth: np.ndarray,
                       num_inference_steps: int = 50, ensemble_size: int = 1,
@@ -681,6 +833,7 @@ class DepthEstimator:
         print(f"\nRunning Marigold-DC depth completion...")
         print(f"  Steps: {num_inference_steps}, Ensemble: {ensemble_size}, Resolution: {processing_resolution}")
         
+        start_time = time.time()
         dense_depth = self.dc_pipe(
             image=image_pil,
             sparse_depth=sparse_depth,
@@ -689,9 +842,11 @@ class DepthEstimator:
             processing_resolution=processing_resolution,
             seed=seed
         )
+        elapsed = time.time() - start_time
         
         print(f"Depth completion completed!")
         print(f"  Output shape: {dense_depth.shape}")
         print(f"  Depth range: [{dense_depth.min():.2f}, {dense_depth.max():.2f}]m")
+        print(f"  Marigold-DC runtime: {elapsed:.2f} seconds")
         
         return dense_depth
