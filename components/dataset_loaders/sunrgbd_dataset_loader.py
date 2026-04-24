@@ -165,7 +165,10 @@ class SUNRGBDDatasetLoader:
                 # For upright-depth, use yaw around +Z.
                 if len(numeric_values) >= 12:
                     ox, oy = float(numeric_values[10]), float(numeric_values[11])
-                    yaw = float(np.arctan2(oy, ox))
+                    # SUNRGBD orientation vector is defined in upright-depth XY, but our
+                    # cuboid local axis convention is rotated by +90° relative to that
+                    # heading. Apply the offset so boxes align with visible objects.
+                    yaw = float(np.arctan2(oy, ox) - (0.5 * np.pi))
                 else:
                     ox, oy = 1.0, 0.0
                     yaw = 0.0
@@ -442,9 +445,11 @@ class SUNRGBDDatasetLoader:
         return {
             "sample_index": sample_index,
             "scene_id": sample["scene_id"],
+            "scene_root": sample.get("scene_root"),
             "image_path": sample["image_path"],
             "depth_path": sample["depth_path"],
             "intrinsics_path": sample["intrinsics_path"],
+            "annotation_path": sample.get("annotation_path"),
             "point_cloud": point_cloud_depth,
             "point_cloud_colors": point_cloud_colors,
             "camera_intrinsic": camera_intrinsic,

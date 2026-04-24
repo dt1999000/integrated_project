@@ -33,7 +33,10 @@ from components.core.clustering_manager import (
     scene_is_indoor_from_point_cloud,
 )
 from components.core.tracking import ObjectTracker
-from components.dataset_loaders.sunrgbd_dataset_loader import sunrgbd_keep_fraction_for_load
+from components.dataset_loaders.sunrgbd_dataset_loader import (
+    SUNRGBDDatasetLoader,
+    sunrgbd_keep_fraction_for_load,
+)
 from components.dataset_loaders.utils import load_dataset_sample
 from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
@@ -148,9 +151,11 @@ def default_detection_params() -> Dict:
             "d_theta": 0.05,
         },
         "cuboid_fitting_indoor": {
-            "margin": 0.05,
+            "margin": 0.02,
             "min_extent": 0.05,
-            "d_theta": 0.05,
+            "d_theta": 0.02,
+            "inlier_quantile": 0.99,
+            "coverage_weight": 4.0,
         },
         "scene_from_pointcloud": {
             "max_horizontal_span_m": 52.0,
@@ -182,6 +187,7 @@ def default_detection_params() -> Dict:
         "yolo_model_path": None,
         "yolo_conf_threshold": 0.25,
         "use_gpu": True,
+        "sunrgbd_use_label_bboxes_step3": False,
     }
 
 
@@ -373,11 +379,31 @@ def _ensure_projection(
     )
 
 
+def _get_current_sam_integration(
+    sam_model_type: str,
+    use_gpu: bool,
+) -> Optional[SAMIntegration]:
+    sam_integration = st.session_state.get("sam_integration")
+    initialized_model_type = st.session_state.get("sam_initialized_model_type")
+    initialized_use_gpu = st.session_state.get("sam_initialized_use_gpu")
+    if (
+        sam_integration is None
+        or initialized_model_type != sam_model_type
+        or initialized_use_gpu != use_gpu
+    ):
+        sam_integration = SAMIntegration(model_type=sam_model_type, use_gpu=use_gpu)
+        st.session_state.sam_integration = sam_integration
+        st.session_state.sam_initialized_model_type = sam_model_type
+        st.session_state.sam_initialized_use_gpu = use_gpu
+    return sam_integration
+
+
 def _build_step3_from_bboxes(
     bbox_data: Dict,
     image: np.ndarray,
     sparse_points: np.ndarray,
     sample_meta_data: Dict,
+    sam_integration: Optional[SAMIntegration] = None,
     projection: Optional[Projection] = None,
 ) -> Dict:
     """
@@ -387,8 +413,8 @@ def _build_step3_from_bboxes(
     For the tracking variant the current frame's annotations are selected by *frame_index*
     stored in ``st.session_state``.
 
-    Rectangular binary masks are synthesised from the bounding boxes so that the
-    downstream clustering / pose-estimation pipeline works unchanged.
+    Bounding boxes are used as SAM prompts when ``sam_integration`` is provided.
+    If SAM is not available, rectangular masks are synthesised as fallback.
     """
     start_time = time.time()
     h, w = image.shape[:2]
@@ -427,9 +453,16 @@ def _build_step3_from_bboxes(
         if x2 <= x1 or y2 <= y1:
             continue
 
-        mask = np.zeros((h, w), dtype=np.uint8)
-        mask[y1:y2, x1:x2] = 1
-        sam_masks.append(mask)
+        if sam_integration is not None:
+            sam_mask = sam_integration.get_mask_from_bbox(
+                image=image,
+                bbox=[x1, y1, x2, y2],
+            )
+            sam_masks.append((sam_mask > 0).astype(np.uint8))
+        else:
+            mask = np.zeros((h, w), dtype=np.uint8)
+            mask[y1:y2, x1:x2] = 1
+            sam_masks.append(mask)
         mask_bboxes.append([x1, y1, x2, y2])
         class_names_out.append(str(ann.get("class_name", "Unknown")))
         conf = ann.get("confidence")
@@ -453,12 +486,108 @@ def _build_step3_from_bboxes(
         "mask_bboxes": mask_bboxes,
         "class_names": class_names_out,
         "confidences": confidences_out,
-        "segmentation_debug": {"source": "loaded_bbox_annotation", "format": fmt},
+        "segmentation_debug": {
+            "source": "loaded_bbox_annotation",
+            "format": fmt,
+            "sam_refined": sam_integration is not None,
+        },
         "n_masks": len(sam_masks),
         "time": time.time() - start_time,
     }
     if has_tracking:
         result["loaded_instance_ids"] = instance_ids
+    return result
+
+
+def _build_step3_from_sunrgbd_gt_bboxes(
+    sample_meta_data: Dict,
+    image: np.ndarray,
+    sparse_points: np.ndarray,
+    class_names: Optional[List[str]] = None,
+    sam_integration: Optional[SAMIntegration] = None,
+    projection: Optional[Projection] = None,
+) -> Dict:
+    """Build Step 3 masks from SUNRGBD label-file 2D GT boxes, refined by SAM."""
+    normalized_targets = {
+        str(name).strip().casefold()
+        for name in (class_names or [])
+        if str(name).strip()
+    }
+
+    gt_boxes = sample_meta_data.get("ground_truth_boxes", []) or []
+    if not gt_boxes:
+        annotation_path = sample_meta_data.get("annotation_path")
+        if not annotation_path:
+            scene_root = sample_meta_data.get("scene_root")
+            scene_id = sample_meta_data.get("scene_id")
+            if scene_root and scene_id:
+                base_root = Path(scene_root)
+                label_v2 = base_root / "label" / f"{scene_id}.txt"
+                label_v1 = base_root / "label_v1" / f"{scene_id}.txt"
+                if label_v2.exists():
+                    annotation_path = str(label_v2)
+                elif label_v1.exists():
+                    annotation_path = str(label_v1)
+        if annotation_path:
+            gt_boxes = SUNRGBDDatasetLoader._load_ground_truth_boxes(annotation_path, image.shape)
+
+    annotations: List[Dict[str, Any]] = []
+    sam_masks: List[np.ndarray] = []
+    for gt in gt_boxes:
+        bbox_2d = gt.get("bbox_2d")
+        if not isinstance(bbox_2d, dict):
+            continue
+        left = int(bbox_2d.get("left", 0))
+        top = int(bbox_2d.get("top", 0))
+        right = int(bbox_2d.get("right", 0))
+        bottom = int(bbox_2d.get("bottom", 0))
+        if right <= left or bottom <= top:
+            continue
+        class_name = str(gt.get("class", gt.get("category", "Unknown")))
+        if normalized_targets and class_name.strip().casefold() not in normalized_targets:
+            continue
+        if sam_integration is None:
+            continue
+        sam_mask = sam_integration.get_mask_from_bbox(
+            image=image,
+            bbox=[left, top, right, bottom],
+        )
+        annotations.append(
+            {
+                "bbox": [left, top, right, bottom],
+                "class_name": class_name,
+                "confidence": 1.0,
+            }
+        )
+        sam_masks.append((sam_mask > 0).astype(np.uint8))
+
+    h, w = image.shape[:2]
+    mask_bboxes = [ann["bbox"] for ann in annotations]
+    class_names_out = [ann["class_name"] for ann in annotations]
+    confidences_out = [float(ann.get("confidence", 1.0)) for ann in annotations]
+    mask_assignments = None
+    if sam_masks:
+        proj = _ensure_projection(
+            projection=projection,
+            sample_meta_data=sample_meta_data,
+            sparse_points=sparse_points,
+        )
+        mask_assignments = assign_points_to_masks(sparse_points, sam_masks, proj, (h, w))
+
+    result = {
+        "sam_masks": sam_masks,
+        "mask_assignments": mask_assignments,
+        "mask_bboxes": mask_bboxes,
+        "class_names": class_names_out,
+        "confidences": confidences_out,
+        "n_masks": len(sam_masks),
+    }
+    seg_debug = dict(result.get("segmentation_debug", {}))
+    seg_debug["source"] = "sunrgbd_label_bbox_2d"
+    seg_debug["format"] = "sunrgbd_label_bbox_2d"
+    seg_debug["used_targets"] = sorted(normalized_targets)
+    seg_debug["sam_refined"] = sam_integration is not None
+    result["segmentation_debug"] = seg_debug
     return result
 
 
@@ -474,6 +603,7 @@ def step_3_sam_segmentation(
     grounding_dino_model_id: Optional[str] = None,
     use_gpu: bool = True,
     projection: Optional[Projection] = None,
+    use_sunrgbd_label_bboxes: bool = False,
 ) -> Dict:
     """
     Step 3: Generate SAM masks using open-vocabulary detection and assign original LiDAR points to masks.
@@ -494,7 +624,8 @@ def step_3_sam_segmentation(
         Dict with 'sam_masks', 'mask_assignments', 'mask_bboxes', 'class_names', 'confidences'
     """
     start_time = time.time()
-    
+    dataset_type = str(sample_meta_data.get("dataset_type", "")).lower()
+
     # Initialize SAM integration if needed
     if 'sam_integration' not in st.session_state or st.session_state.sam_integration is None:
         try:
@@ -531,6 +662,17 @@ def step_3_sam_segmentation(
     
     sam_integration = st.session_state.sam_integration
     h, w = image.shape[:2]
+    if use_sunrgbd_label_bboxes and dataset_type == "sunrgbd":
+        result = _build_step3_from_sunrgbd_gt_bboxes(
+            sample_meta_data=sample_meta_data,
+            image=image,
+            sparse_points=sparse_points,
+            class_names=class_names,
+            sam_integration=sam_integration,
+            projection=projection,
+        )
+        result["time"] = time.time() - start_time
+        return result
     
     # Use open-vocabulary detection pipeline
     if not class_names:
@@ -867,8 +1009,10 @@ def step_5_detection_pose_estimation(
             fit_result = fit_cuboid_to_points_indoor(
                 points=cluster_points,
                 d_theta=d_theta_in,
-                margin=float(indoor_params.get("margin", 0.05)),
+                margin=float(indoor_params.get("margin", 0.02)),
                 min_extent=float(indoor_params.get("min_extent", 0.05)),
+                inlier_quantile=float(indoor_params.get("inlier_quantile", 0.99)),
+                coverage_weight=float(indoor_params.get("coverage_weight", 4.0)),
             )
         else:
             dimensions_by_class = st.session_state.params.get('dimensions_by_class', {})
@@ -1007,11 +1151,16 @@ def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) 
     
     # Step 3: SAM segmentation (or preloaded bbox annotations)
     if preloaded_bbox_data is not None:
+        sam_integration = _get_current_sam_integration(
+            sam_model_type=params.get('sam_model_type', 'sam2_t'),
+            use_gpu=params.get('use_gpu', True),
+        )
         step_3_result = _build_step3_from_bboxes(
             bbox_data=preloaded_bbox_data,
             image=st.session_state.sample['image'],
             sparse_points=step_2_result['colored_sparse_points'],
             sample_meta_data=st.session_state.sample['sample_meta_data'],
+            sam_integration=sam_integration,
             projection=step_2_result['projection'],
         )
     else:
@@ -1029,6 +1178,7 @@ def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) 
             grounding_dino_model_id=params.get('grounding_dino_model_id'),
             use_gpu=params.get('use_gpu', True),
             projection=step_2_result['projection'],
+            use_sunrgbd_label_bboxes=params.get("sunrgbd_use_label_bboxes_step3", False),
         )
     results['step_3'] = {'completed': True, 'result': step_3_result}
     st.session_state.pipeline_state['step_3'] = results['step_3']
@@ -1324,6 +1474,16 @@ def main():
     )
     sidebar_sample_meta = (st.session_state.get("sample") or {}).get("sample_meta_data", {})
     sidebar_dataset_type = (sidebar_sample_meta.get("dataset_type") or "").lower()
+    if not sidebar_dataset_type:
+        batch_samples_for_sidebar = st.session_state.get("batch_samples", []) or []
+        if batch_samples_for_sidebar:
+            batch_types = {
+                str(s.get("dataset_type", "")).lower()
+                for s in batch_samples_for_sidebar
+                if str(s.get("dataset_type", "")).strip()
+            }
+            if len(batch_types) == 1:
+                sidebar_dataset_type = next(iter(batch_types))
     if "ground_plane_toggle_dataset_type" not in st.session_state:
         st.session_state["ground_plane_toggle_dataset_type"] = sidebar_dataset_type
         st.session_state["use_ground_plane_removal"] = _default_use_ground_plane_removal(sidebar_sample_meta)
@@ -1562,13 +1722,21 @@ def main():
 
     with st.sidebar.expander("Indoor cuboid (Step 5)", expanded=False):
         st.session_state.params['cuboid_fitting_indoor']['margin'] = st.slider(
-            "Padding (m)", 0.01, 0.3, 0.05, 0.01, key="cub_in_margin"
+            "Padding (m)", 0.01, 0.3, 0.02, 0.01, key="cub_in_margin"
         )
         st.session_state.params['cuboid_fitting_indoor']['min_extent'] = st.slider(
             "Min L/W/H (m)", 0.02, 0.3, 0.05, 0.01, key="cub_in_minex"
         )
         st.session_state.params['cuboid_fitting_indoor']['d_theta'] = st.slider(
-            "Yaw step (rad)", 0.02, 0.2, 0.05, 0.01, key="cub_in_dth"
+            "Yaw step (rad)", 0.02, 0.2, 0.02, 0.01, key="cub_in_dth"
+        )
+        st.session_state.params['cuboid_fitting_indoor']['inlier_quantile'] = st.slider(
+            "Inlier quantile", 0.85, 1.0, 0.99, 0.01, key="cub_in_iq",
+            help="Higher keeps more points in the fit; lower trims sparse outliers for tighter boxes."
+        )
+        st.session_state.params['cuboid_fitting_indoor']['coverage_weight'] = st.slider(
+            "Coverage weight", 0.0, 10.0, 4.0, 0.5, key="cub_in_covw",
+            help="Penalty for excluding points. Lower favors tighter boxes, higher favors coverage."
         )
     
     st.sidebar.markdown("### SAM Model")
@@ -1708,6 +1876,14 @@ def main():
     else:
         # For SUNRGBD, do not initialize or query any LLM components.
         st.sidebar.info("LLM-based dimension lookup is disabled for SUNRGBD dataset.")
+        st.session_state.params["sunrgbd_use_label_bboxes_step3"] = st.sidebar.checkbox(
+            "Step 3: use SUNRGBD label 2D GT bboxes",
+            value=st.session_state.params.get("sunrgbd_use_label_bboxes_step3", False),
+            help=(
+                "Use label-file 2D GT boxes (x, y, w, h -> xyxy) to build Step 3 masks "
+                "instead of open-vocabulary 2D detection. Useful for ablation studies."
+            ),
+        )
         if not st.session_state.params['class_names']:
             st.sidebar.warning("⚠️ Please enter at least one class name")
     
@@ -1765,6 +1941,7 @@ def main():
         st.session_state.params['yolo_model_path'] = None
         st.session_state.params['open_vocab_detector'] = 'yolo'
         st.sidebar.info("💡 SAM3 uses direct text prompts for open-vocabulary segmentation")
+    # Keep the preference in session state; Step 3 applies it only when dataset is SUNRGBD.
     
     # Compute Device
     st.sidebar.markdown("### Compute Device")
@@ -2326,6 +2503,9 @@ def main():
                             grounding_dino_model_id=st.session_state.params.get('grounding_dino_model_id'),
                             use_gpu=st.session_state.params.get('use_gpu', True),
                             projection=step_2_result['projection'],
+                            use_sunrgbd_label_bboxes=st.session_state.params.get(
+                                "sunrgbd_use_label_bboxes_step3", False
+                            ),
                         )
                         st.session_state.pipeline_state['step_3'] = {
                             'completed': True,
@@ -2372,11 +2552,16 @@ def main():
                 if st.button("📥 Load annotations into Step 3", key="load_bbox_step3_single"):
                     st.session_state["_bbox_load_frame_index"] = int(frame_idx_for_load)
                     step_2_result = st.session_state.pipeline_state['step_2']['result']
+                    sam_integration = _get_current_sam_integration(
+                        sam_model_type=st.session_state.params.get('sam_model_type', 'sam2_t'),
+                        use_gpu=st.session_state.params.get('use_gpu', True),
+                    )
                     result = _build_step3_from_bboxes(
                         bbox_data=bbox_data,
                         image=image,
                         sparse_points=step_2_result['colored_sparse_points'],
                         sample_meta_data=sample_meta_data,
+                        sam_integration=sam_integration,
                         projection=step_2_result['projection'],
                     )
                     st.session_state.pipeline_state['step_3'] = {

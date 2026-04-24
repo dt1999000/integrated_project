@@ -607,6 +607,8 @@ def fit_cuboid_to_points_indoor(
     d_theta: float = 0.05,
     margin: float = 0.05,
     min_extent: float = 0.05,
+    inlier_quantile: float = 0.96,
+    coverage_weight: float = 4.0,
 ) -> Dict:
     """
     Indoor-oriented cuboid: deformable axis-aligned box in yaw, minimizing volume so that
@@ -620,6 +622,10 @@ def fit_cuboid_to_points_indoor(
         d_theta: Yaw sampling step (radians), 0..pi (rectangle symmetry).
         margin: Extra half-padding (meters) on each axis in the local frame.
         min_extent: Minimum L, W, H (meters) to avoid degenerate boxes.
+        inlier_quantile: Central quantile used to reject sparse outliers before
+                         building the fitted box (higher keeps more points).
+        coverage_weight: Penalty weight for excluding too many points. Higher
+                         values keep more points at the cost of looser boxes.
 
     Returns:
         Same keys as outdoor fit: center, yaw, length, width, height, score (volume), method.
@@ -633,11 +639,15 @@ def fit_cuboid_to_points_indoor(
     margin = float(margin)
     min_extent = float(min_extent)
     d_theta = float(d_theta)
+    inlier_quantile = float(inlier_quantile)
+    coverage_weight = float(coverage_weight)
+    inlier_quantile = float(np.clip(inlier_quantile, 0.80, 1.0))
+    coverage_weight = max(0.0, coverage_weight)
 
     mu = np.mean(points, axis=0)
     rel = points - mu[None, :]
 
-    best_volume = float("inf")
+    best_score = float("inf")
     best_yaw = 0.0
     best_center = mu.copy()
     best_l = best_w = best_h = min_extent
@@ -655,9 +665,13 @@ def fit_cuboid_to_points_indoor(
         qx = rel @ u
         qy = rel @ v
         qz = rel @ w_axis
-        xmin, xmax = float(np.min(qx)), float(np.max(qx))
-        ymin, ymax = float(np.min(qy)), float(np.max(qy))
-        zmin, zmax = float(np.min(qz)), float(np.max(qz))
+
+        tail_q = 0.5 * (1.0 - inlier_quantile)
+        low_q = tail_q
+        high_q = 1.0 - tail_q
+        xmin, xmax = float(np.quantile(qx, low_q)), float(np.quantile(qx, high_q))
+        ymin, ymax = float(np.quantile(qy, low_q)), float(np.quantile(qy, high_q))
+        zmin, zmax = float(np.quantile(qz, low_q)), float(np.quantile(qz, high_q))
         length = max(min_extent, xmax - xmin + 2.0 * margin)
         width = max(min_extent, ymax - ymin + 2.0 * margin)
         height = max(min_extent, zmax - zmin + 2.0 * margin)
@@ -665,9 +679,23 @@ def fit_cuboid_to_points_indoor(
         cy = 0.5 * (ymin + ymax)
         cz = 0.5 * (zmin + zmax)
         c_world = mu + u * cx + v * cy + w_axis * cz
+
+        half_l = 0.5 * length
+        half_w = 0.5 * width
+        half_h = 0.5 * height
+        inlier_mask = (
+            (np.abs(qx - cx) <= half_l) &
+            (np.abs(qy - cy) <= half_w) &
+            (np.abs(qz - cz) <= half_h)
+        )
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        coverage = inlier_count / float(points.shape[0])
         volume = length * width * height
-        if volume < best_volume:
-            best_volume = volume
+        density = inlier_count / max(volume, 1e-6)
+        score = (1.0 / max(density, 1e-6)) + coverage_weight * (1.0 - coverage)
+
+        if score < best_score:
+            best_score = score
             best_yaw = float(yaw)
             best_center = c_world
             best_l, best_w, best_h = length, width, height
@@ -678,8 +706,8 @@ def fit_cuboid_to_points_indoor(
         "length": float(best_l),
         "width": float(best_w),
         "height": float(best_h),
-        "score": float(best_volume),
-        "method": "cuboid_fit_indoor_mvo",
+        "score": float(best_score),
+        "method": "cuboid_fit_indoor_dense",
     }
 
 

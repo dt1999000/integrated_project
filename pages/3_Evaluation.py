@@ -225,6 +225,39 @@ def _compute_per_class_per_frame_tables(
     return out
 
 
+def _sum_per_class_across_frames(
+    class_tables: Dict[str, Dict[str, List[Dict]]],
+    iou_key: str = "iou_50",
+) -> List[Dict]:
+    """Aggregate per-class per-frame rows into one batch-level row per class."""
+    rows: List[Dict] = []
+    for cls, payload in class_tables.items():
+        frame_rows = payload.get(iou_key, []) or []
+        gt_sum = int(sum(int(r.get("GT", 0)) for r in frame_rows))
+        det_sum = int(sum(int(r.get("Det", 0)) for r in frame_rows))
+        tp_sum = int(sum(int(r.get("TP", 0)) for r in frame_rows))
+        fp_sum = int(sum(int(r.get("FP", 0)) for r in frame_rows))
+        fn_sum = int(sum(int(r.get("FN", 0)) for r in frame_rows))
+        prec = float(tp_sum / (tp_sum + fp_sum)) if (tp_sum + fp_sum) > 0 else 0.0
+        rec = float(tp_sum / (tp_sum + fn_sum)) if (tp_sum + fn_sum) > 0 else 0.0
+        f1 = float((2.0 * prec * rec) / (prec + rec)) if (prec + rec) > 0.0 else 0.0
+        rows.append(
+            {
+                "Class": cls,
+                "Scenes": len(frame_rows),
+                "GT (sum)": gt_sum,
+                "Det (sum)": det_sum,
+                "TP (sum)": tp_sum,
+                "FP (sum)": fp_sum,
+                "FN (sum)": fn_sum,
+                "Precision": f"{prec * 100:.1f}%",
+                "Recall": f"{rec * 100:.1f}%",
+                "F1": f"{f1 * 100:.1f}%",
+            }
+        )
+    return rows
+
+
 def _json_sanitize(obj: Any) -> Any:
     """Recursively convert values to JSON-serializable Python types (e.g. numpy)."""
     if obj is None:
@@ -796,10 +829,10 @@ def _render_batch_eval():
                     "Rotate bins (°) subtracted after wrap to [0,360)",
                     min_value=0.0,
                     max_value=360.0,
-                    value=90.0,
+                    value=0.0,
                     step=1.0,
                     key="sim_azimuth_offset",
-                    help="With span 180°, offset 90° maps the former 90°–270° arc onto 0°–180°.",
+                    help="With span 180° and offset 0°, bins evaluate the direct 0°–180° azimuth range.",
                 )
             with off2:
                 angle_span_deg = st.number_input(
@@ -897,13 +930,21 @@ def _render_batch_eval():
             "inspect frame-by-frame TP/FP/FN against GT for that class only."
         )
         class_tables = _compute_per_class_per_frame_tables(eval_batch_results, eval_classes)
+        st.markdown("**Batch-level sum across scenes (per class, IoU >= 0.25, primary)**")
+        class_batch_rows_25 = _sum_per_class_across_frames(class_tables, iou_key="iou_25")
+        if class_batch_rows_25:
+            st.dataframe(pd.DataFrame(class_batch_rows_25), width="stretch")
+        st.markdown("**Batch-level sum across scenes (per class, IoU >= 0.5, reference)**")
+        class_batch_rows_50 = _sum_per_class_across_frames(class_tables, iou_key="iou_50")
+        if class_batch_rows_50:
+            st.dataframe(pd.DataFrame(class_batch_rows_50), width="stretch")
         class_tabs = st.tabs([f"Class: {cls}" for cls in eval_classes])
         for tab, cls in zip(class_tabs, eval_classes):
             with tab:
-                st.markdown(f"**{cls} — IoU ≥ 0.5**")
-                st.dataframe(pd.DataFrame(class_tables[cls]["iou_50"]), width="stretch")
                 st.markdown(f"**{cls} — IoU ≥ 0.25**")
                 st.dataframe(pd.DataFrame(class_tables[cls]["iou_25"]), width="stretch")
+                st.markdown(f"**{cls} — IoU ≥ 0.5**")
+                st.dataframe(pd.DataFrame(class_tables[cls]["iou_50"]), width="stretch")
 
     # ------------------------------------------------------------------
     # Sample list with keep/skip status

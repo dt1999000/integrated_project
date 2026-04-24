@@ -561,6 +561,8 @@ def _load_sunrgbd_sample(
         sample_meta_data = {
             "image_path": str(image_file),
             "point_cloud_path": str(pcd_file),
+            "scene_root": sample.get("scene_root"),
+            "annotation_path": sample.get("annotation_path"),
             "camera_intrinsic": camera_intrinsic,
             "camera_rtilt": camera_rtilt,
             "camera_extrinsic": np.eye(4, dtype=np.float64),
@@ -598,6 +600,8 @@ def _load_sunrgbd_sample(
     sample_meta_data = {
         "image_path": sample_data["image_path"],
         "point_cloud_path": sample_data["depth_path"],
+        "scene_root": sample_data.get("scene_root"),
+        "annotation_path": sample_data.get("annotation_path"),
         "camera_intrinsic": sample_data["camera_intrinsic"],
         "camera_rtilt": sample_data.get("camera_rtilt"),
         "camera_extrinsic": sample_data.get("camera_extrinsic", np.eye(4)),
