@@ -99,6 +99,14 @@ Then choose the dataset-specific flow:
 - ROS bag: configure topics, filter frames, and optionally extract a batch.
 - sim: filter and sample linked data, then load the selected item.
 
+Short download links:
+
+- KITTI: https://www.cvlibs.net/datasets/kitti/
+- nuScenes: https://www.nuscenes.org/nuscenes
+- SUNRGBD: https://rgbd.cs.princeton.edu/ (3D data + annotation prep guide: https://mmdetection3d.readthedocs.io/en/v0.18.1/datasets/sunrgbd_det.html)
+- ROS bag examples and format: https://github.com/ros2/rosbag2
+- sim: custom/internal dataset format (no public canonical download)
+
 The page stores the active dataset path, dataset type, calibration, and ground-truth annotations in session state for the later pages.
 
 ### Detection
