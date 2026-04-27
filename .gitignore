@@ -31,6 +31,8 @@ cvat_example_export/*
 models/
 pages/archive_folder/
 archive/
+models/
+output/
 
 DETECTION_PIPELINE_CONSOLIDATION_PLAN.md
 POINTCLOUD_EXTENSION_PLAN.md

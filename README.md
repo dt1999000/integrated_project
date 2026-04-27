@@ -15,11 +15,12 @@ You need to create the models directory and add the pretrained weights for the d
 
 ```models/
 ├── sam*.pth # SAM segmentation model weights
-├── yoloworld/yoloe*.pt # YOLOWorld/e detection model weights
-├── llm/*.pth # LLM-based model weights
+├── yoloworld or yoloe*.pt # YOLOWorld/e detection model weights
+├── llm
+    |-- *.pth # LLM-based model weights
 ├── some external models weights from hugging face, e.g. grounding dino/wedetect, etc.
 ```
-
+get at least a sam segmentation model from e.g. https://docs.ultralytics.com/models/sam-2/#installation and a yoloworld model from https://docs.ultralytics.com/models/yolo-world/#available-models-supported-tasks-and-operating-modes
 For batch runs, make sure the full set of weights is already present before you start processing. The same models are reused for every sample in the queue.
 
 ## Recommended Workflow
