@@ -9,7 +9,6 @@ from .constants import KITTI_CUBOID_TEMPLATES
 # Note: ClusteringManager is NOT imported here to avoid circular dependencies
 # Pages should import it directly: from components.core.clustering_manager import ClusteringManager
 from .pointcloud_projection import Projection, PointCloud
-from .evaluation import compute_3d_iou
 from .pose_estimation import estimate_pose_pca, estimate_pose_l_shape, cuboid_from_pose
 from .sam_integration import SAMIntegration, assign_points_to_masks
 
