@@ -50,7 +50,7 @@ For batch workflows, the usual sequence is:
 ### Clone The Repository
 
 ```bash
-git clone <your-github-repo-url>
+git clone https://github.com/dt1999000/integrated_project.git
 cd integrated_project
 ```
 
