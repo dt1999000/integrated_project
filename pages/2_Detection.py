@@ -4,6 +4,7 @@ Unified detection pipeline with step-by-step execution and full pipeline mode.
 """
 import json
 import os
+import textwrap
 import time
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
@@ -114,6 +115,208 @@ def save_sample_to_hard_drive_after_processing(
             print(f'failed to save point cloud with error: {Exception}')
 
 
+def _render_point_cloud_plot(
+    fig: go.Figure,
+    export_basename: str,
+    use_container_width: bool = False,
+) -> None:
+    """Render point-cloud Plotly chart with high-resolution export controls."""
+    def _build_structured_pointcloud_html(plot_fig: go.Figure, plot_name: str) -> str:
+        fig_dict = plot_fig.to_dict()
+        data_json = json.dumps(fig_dict.get("data", []), indent=2)
+        layout_json = json.dumps(fig_dict.get("layout", {}), indent=2)
+        config_json = json.dumps({"responsive": True, "displaylogo": False}, indent=2)
+        return textwrap.dedent(
+            f"""\
+            <!doctype html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1" />
+              <title>{plot_name}</title>
+              <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+            </head>
+            <body style="margin:0;">
+              <div id="pointcloud_plot" style="width:100vw; height:100vh;"></div>
+              <script>
+                // =========================================================================
+                // POINT CLOUD DATA (all traces / 3D points)
+                // =========================================================================
+                const pointCloudData = {data_json};
+
+                // =========================================================================
+                // LEGEND + CAPTION/TITLE + AXES (layout styling lives here)
+                // =========================================================================
+                const pointCloudLayout = {layout_json};
+
+                // =========================================================================
+                // EXPORT + INTERACTION OPTIONS
+                // =========================================================================
+                const pointCloudConfig = {config_json};
+
+                Plotly.newPlot("pointcloud_plot", pointCloudData, pointCloudLayout, pointCloudConfig);
+              </script>
+            </body>
+            </html>
+            """
+        )
+
+    # Streamlit in-app display (smaller, balanced for embedded charts)
+    display_legend_font_size = 12
+    display_caption_font_size = 14
+    display_axis_title_font_size = 12
+    display_axis_tick_font_size = 11
+    # Downloaded HTML / high-res export (edit these if you tune the exported file instead)
+    export_legend_font_size = 28
+    export_caption_font_size = 36
+    export_axis_title_font_size = 26
+    export_axis_tick_font_size = 24
+
+    axis_tick_settings = {
+        "x": {"nticks": 2, "dtick": None},
+        "y": {"nticks": 2, "dtick": None},
+        "z": {"nticks": 2, "dtick": None},
+    }
+    # Set any axis to [min, max] to force range, or keep None for auto-range.
+    axis_range_overrides = {
+        "x": None,
+        "y": None,
+        "z": None,
+    }
+
+    def _scene_axis(
+        axis_key: str,
+        title_text: str,
+        range_override: Optional[List[float]],
+        axis_title_font_size: int,
+        axis_tick_font_size: int,
+    ) -> Dict[str, Any]:
+        axis_cfg: Dict[str, Any] = {
+            "title": {"text": title_text, "font": {"size": axis_title_font_size}},
+            "tickfont": {"size": axis_tick_font_size},
+        }
+        tick_cfg = axis_tick_settings.get(axis_key, {})
+        axis_cfg["nticks"] = tick_cfg.get("nticks", 8)
+        if tick_cfg.get("dtick") is not None:
+            axis_cfg["dtick"] = tick_cfg["dtick"]
+        if range_override is not None:
+            axis_cfg["range"] = range_override
+        return axis_cfg
+
+    fig.update_layout(
+        legend=dict(
+            font=dict(size=display_legend_font_size),
+            title=dict(font=dict(size=display_legend_font_size)),
+            itemsizing="constant",
+        ),
+        title=dict(font=dict(size=display_caption_font_size)),
+        scene=dict(
+            xaxis=_scene_axis(
+                "x",
+                "X (m)",
+                axis_range_overrides["x"],
+                display_axis_title_font_size,
+                display_axis_tick_font_size,
+            ),
+            yaxis=_scene_axis(
+                "y",
+                "Y (m)",
+                axis_range_overrides["y"],
+                display_axis_title_font_size,
+                display_axis_tick_font_size,
+            ),
+            zaxis=_scene_axis(
+                "z",
+                "Z (m)",
+                axis_range_overrides["z"],
+                display_axis_title_font_size,
+                display_axis_tick_font_size,
+            ),
+        ),
+    )
+    export_config = {
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": export_basename,
+            "width": 2200,
+            "height": 1400,
+            "scale": 2,
+        },
+        "displaylogo": False,
+    }
+
+    if use_container_width:
+        st.plotly_chart(fig, use_container_width=True, config=export_config)
+    else:
+        st.plotly_chart(fig, config=export_config)
+
+    export_fig = go.Figure(fig)
+    export_fig.update_layout(
+        width=1920,
+        height=1080,
+        autosize=True,
+        margin=dict(l=10, r=10, t=55, b=10),
+        legend=dict(
+            font=dict(size=export_legend_font_size),
+            title=dict(font=dict(size=export_legend_font_size)),
+            itemsizing="constant",
+        ),
+        title=dict(
+            font=dict(size=export_caption_font_size),
+            pad=dict(t=6, b=2),
+        ),
+        scene=dict(
+            domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
+            xaxis=_scene_axis(
+                "x",
+                "X (m)",
+                axis_range_overrides["x"],
+                export_axis_title_font_size,
+                export_axis_tick_font_size,
+            ),
+            yaxis=_scene_axis(
+                "y",
+                "Y (m)",
+                axis_range_overrides["y"],
+                export_axis_title_font_size,
+                export_axis_tick_font_size,
+            ),
+            zaxis=_scene_axis(
+                "z",
+                "Z (m)",
+                axis_range_overrides["z"],
+                export_axis_title_font_size,
+                export_axis_tick_font_size,
+            ),
+        ),
+    )
+
+    st.download_button(
+        "⬇️ Download interactive HTML (high quality)",
+        data=_build_structured_pointcloud_html(export_fig, export_basename),
+        file_name=f"{export_basename}.html",
+        mime="text/html",
+        key=f"plotly_html_export_{export_basename}",
+        width="stretch",
+    )
+
+
+def _update_mask_capacity_hint(step_3_result: Optional[Dict], sample_meta_data: Dict) -> None:
+    """
+    Persist an evaluation hint when detection produces fewer masks than GT boxes.
+    """
+    if not step_3_result:
+        return
+    gt_boxes = sample_meta_data.get("ground_truth_boxes", []) or []
+    n_gt = len(gt_boxes)
+    sam_masks = step_3_result.get("sam_masks", []) or []
+    n_masks = len(sam_masks)
+    if n_gt > 0 and n_masks < n_gt:
+        prev_max = int(st.session_state.get("eval_mask_capacity_max", 0) or 0)
+        st.session_state["eval_mask_capacity_max"] = max(prev_max, n_masks)
+        st.session_state["eval_mask_capacity_hint_active"] = True
+
+
 def default_detection_params() -> Dict:
     """Default pipeline/session parameters (single source of truth for merges)."""
     return {
@@ -188,6 +391,7 @@ def default_detection_params() -> Dict:
         "yolo_conf_threshold": 0.25,
         "use_gpu": True,
         "sunrgbd_use_label_bboxes_step3": False,
+        "use_gt_2d_bboxes_step3": False,
     }
 
 
@@ -499,7 +703,7 @@ def _build_step3_from_bboxes(
     return result
 
 
-def _build_step3_from_sunrgbd_gt_bboxes(
+def _build_step3_from_gt_2d_bboxes(
     sample_meta_data: Dict,
     image: np.ndarray,
     sparse_points: np.ndarray,
@@ -507,15 +711,16 @@ def _build_step3_from_sunrgbd_gt_bboxes(
     sam_integration: Optional[SAMIntegration] = None,
     projection: Optional[Projection] = None,
 ) -> Dict:
-    """Build Step 3 masks from SUNRGBD label-file 2D GT boxes, refined by SAM."""
+    """Build Step 3 masks from dataset GT 2D boxes (e.g. KITTI/SUNRGBD), refined by SAM."""
     normalized_targets = {
         str(name).strip().casefold()
         for name in (class_names or [])
         if str(name).strip()
     }
 
+    dataset_type = str(sample_meta_data.get("dataset_type", "")).lower()
     gt_boxes = sample_meta_data.get("ground_truth_boxes", []) or []
-    if not gt_boxes:
+    if not gt_boxes and dataset_type == "sunrgbd":
         annotation_path = sample_meta_data.get("annotation_path")
         if not annotation_path:
             scene_root = sample_meta_data.get("scene_root")
@@ -524,10 +729,10 @@ def _build_step3_from_sunrgbd_gt_bboxes(
                 base_root = Path(scene_root)
                 label_v2 = base_root / "label" / f"{scene_id}.txt"
                 label_v1 = base_root / "label_v1" / f"{scene_id}.txt"
-                if label_v2.exists():
-                    annotation_path = str(label_v2)
-                elif label_v1.exists():
+                if label_v1.exists():
                     annotation_path = str(label_v1)
+                elif label_v2.exists():
+                    annotation_path = str(label_v2)
         if annotation_path:
             gt_boxes = SUNRGBDDatasetLoader._load_ground_truth_boxes(annotation_path, image.shape)
 
@@ -583,8 +788,9 @@ def _build_step3_from_sunrgbd_gt_bboxes(
         "n_masks": len(sam_masks),
     }
     seg_debug = dict(result.get("segmentation_debug", {}))
-    seg_debug["source"] = "sunrgbd_label_bbox_2d"
-    seg_debug["format"] = "sunrgbd_label_bbox_2d"
+    seg_debug["source"] = "dataset_gt_bbox_2d"
+    seg_debug["format"] = "dataset_gt_bbox_2d"
+    seg_debug["dataset_type"] = dataset_type
     seg_debug["used_targets"] = sorted(normalized_targets)
     seg_debug["sam_refined"] = sam_integration is not None
     result["segmentation_debug"] = seg_debug
@@ -603,7 +809,7 @@ def step_3_sam_segmentation(
     grounding_dino_model_id: Optional[str] = None,
     use_gpu: bool = True,
     projection: Optional[Projection] = None,
-    use_sunrgbd_label_bboxes: bool = False,
+    use_dataset_gt_2d_bboxes: bool = False,
 ) -> Dict:
     """
     Step 3: Generate SAM masks using open-vocabulary detection and assign original LiDAR points to masks.
@@ -662,8 +868,8 @@ def step_3_sam_segmentation(
     
     sam_integration = st.session_state.sam_integration
     h, w = image.shape[:2]
-    if use_sunrgbd_label_bboxes and dataset_type == "sunrgbd":
-        result = _build_step3_from_sunrgbd_gt_bboxes(
+    if use_dataset_gt_2d_bboxes and dataset_type in {"sunrgbd", "kitti"}:
+        result = _build_step3_from_gt_2d_bboxes(
             sample_meta_data=sample_meta_data,
             image=image,
             sparse_points=sparse_points,
@@ -941,7 +1147,11 @@ def step_5_detection_pose_estimation(
     sample_meta_data: Dict,
     sparse_points: np.ndarray,
     best_cluster_sparse_indices: Dict[int, np.ndarray],
+    filtered_mask_sparse_indices: Optional[Dict[int, np.ndarray]],
     sam_masks: List[np.ndarray],
+    mask_bboxes: Optional[List[List[int]]],
+    mask_confidences: Optional[List[float]],
+    projection: Optional[Projection],
     ground_z: float,
     cuboid_params: Dict
 ) -> Dict:
@@ -952,7 +1162,11 @@ def step_5_detection_pose_estimation(
         sample_meta_data: Sample metadata
         sparse_points: Nx3 array (same reference frame as Step 2 ``colored_sparse_points``)
         best_cluster_sparse_indices: Per-mask global row indices into ``sparse_points``
+        filtered_mask_sparse_indices: Per-mask row indices after filtering in Step 4
         sam_masks: List of binary masks
+        mask_bboxes: Step 3 2D mask bboxes ``[x1, y1, x2, y2]``
+        mask_confidences: Step 3 detector confidences aligned with mask index
+        projection: Projection helper for 3D cuboid reprojection
         ground_z: Ground plane z value
         cuboid_params: Cuboid fitting parameters
 
@@ -975,6 +1189,21 @@ def step_5_detection_pose_estimation(
         else False
     )
     indoor_params = st.session_state.params.get("cuboid_fitting_indoor", {})
+
+    def _unit_interval(x: float) -> float:
+        return float(np.clip(x, 0.0, 1.0))
+
+    def _template_consistency(cat: str, lwh: Tuple[float, float, float]) -> float:
+        if cat not in KITTI_CUBOID_TEMPLATES or cat == "Unknown":
+            return 1.0
+        t = KITTI_CUBOID_TEMPLATES[cat]
+        tpl = np.array([float(t["length"]), float(t["width"]), float(t["height"])], dtype=np.float64)
+        pred = np.array([float(lwh[0]), float(lwh[1]), float(lwh[2])], dtype=np.float64)
+        err_direct = np.mean(np.abs((pred - tpl) / np.maximum(tpl, 1e-6)))
+        pred_swapped = np.array([pred[1], pred[0], pred[2]], dtype=np.float64)
+        err_swap = np.mean(np.abs((pred_swapped - tpl) / np.maximum(tpl, 1e-6)))
+        rel_err = float(min(err_direct, err_swap))
+        return float(np.exp(-rel_err))
 
     # Fit cuboid to each mask's best cluster (materialize from sparse index map)
     for mask_idx, row_ix in best_cluster_sparse_indices.items():
@@ -1096,6 +1325,60 @@ def step_5_detection_pose_estimation(
             'n_points': len(cluster_points),
         }
 
+        mask_conf = 1.0
+        if mask_confidences is not None and mask_idx < len(mask_confidences):
+            mask_conf = _unit_interval(float(mask_confidences[mask_idx]))
+
+        reproj_agree = 0.5
+        if projection is not None and mask_bboxes is not None and mask_idx < len(mask_bboxes):
+            proj_payload = projection.cuboid_to_2d(cuboid)
+            if proj_payload is not None:
+                bbox_2d = proj_payload.get("bbox_2d")
+                if bbox_2d is not None:
+                    reproj_bbox = [
+                        float(bbox_2d["left"]),
+                        float(bbox_2d["top"]),
+                        float(bbox_2d["right"]),
+                        float(bbox_2d["bottom"]),
+                    ]
+                    reproj_agree = _unit_interval(
+                        float(calculate_iou(mask_bboxes[mask_idx], reproj_bbox))
+                    )
+                    cuboid["projected_bbox_2d"] = bbox_2d
+
+        n_points = int(len(cluster_points))
+        n_ref = float(st.session_state.params.get("confidence_points_ref", 80.0))
+        fit_lambda = float(st.session_state.params.get("confidence_fit_lambda", 1.0))
+        n_ref = max(1.0, n_ref)
+        fit_lambda = max(0.0, fit_lambda)
+
+        c_points = min(1.0, n_points / n_ref)
+        fit_score = float(fit_result.get("score", 1e9))
+        fit_energy = max(0.0, fit_score)
+        c_fit = float(np.exp(-fit_lambda * fit_energy))
+        c_template = _template_consistency(category, (length, width, height))
+        c_fit_total = _unit_interval(c_fit * c_template)
+
+        conf_components = {
+            "c_2d": mask_conf,
+            "c_points": _unit_interval(c_points),
+            "c_fit": c_fit_total,
+            "c_reproj": reproj_agree,
+            "fit_energy": fit_energy,
+            "fit_lambda": fit_lambda,
+            "n_points": n_points,
+            "n_ref": n_ref,
+            "template_consistency": c_template,
+        }
+        confidence = (
+            conf_components["c_2d"]
+            * conf_components["c_points"]
+            * conf_components["c_fit"]
+            * conf_components["c_reproj"]
+        )
+        cuboid["confidence"] = _unit_interval(confidence)
+        cuboid["confidence_components"] = conf_components
+
         detected_cuboids.append(cuboid)
 
     elapsed_time = time.time() - start_time
@@ -1178,7 +1461,10 @@ def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) 
             grounding_dino_model_id=params.get('grounding_dino_model_id'),
             use_gpu=params.get('use_gpu', True),
             projection=step_2_result['projection'],
-            use_sunrgbd_label_bboxes=params.get("sunrgbd_use_label_bboxes_step3", False),
+            use_dataset_gt_2d_bboxes=params.get(
+                "use_gt_2d_bboxes_step3",
+                params.get("sunrgbd_use_label_bboxes_step3", False),
+            ),
         )
     results['step_3'] = {'completed': True, 'result': step_3_result}
     st.session_state.pipeline_state['step_3'] = results['step_3']
@@ -1201,7 +1487,11 @@ def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) 
         sample_meta_data=st.session_state.sample['sample_meta_data'],
         sparse_points=step_2_result['colored_sparse_points'],
         best_cluster_sparse_indices=step_4_result['best_cluster_sparse_indices'],
+        filtered_mask_sparse_indices=step_4_result.get('filtered_mask_sparse_indices'),
         sam_masks=step_3_result['sam_masks'],
+        mask_bboxes=step_3_result.get('mask_bboxes'),
+        mask_confidences=step_3_result.get('confidences'),
+        projection=step_2_result.get('projection'),
         ground_z=results['step_1']['result']['ground_z'],
         cuboid_params=params['cuboid_fitting']
     )
@@ -1315,6 +1605,8 @@ def _run_pipeline_for_batch_sample(
         )
         return None
     step_5_result = results["step_5"]["result"]
+    step_3_result = results["step_3"]["result"]
+    _update_mask_capacity_hint(step_3_result, meta)
     dataset_type_lower = meta.get("dataset_type", "unknown").lower()
     export_results = {
         "detected_cuboids": step_5_result["detected_cuboids"],
@@ -1355,7 +1647,6 @@ def _run_pipeline_for_batch_sample(
             f"[batch] updating tracker for frame_index={frame_index}, "
             f"n_detections={step_5_result.get('n_detected', 0)}"
         )
-        step_3_result = results["step_3"]["result"]
         if step_3_result is None:
             print("[batch] step_3_result is None, skipping tracker update")
         else:
@@ -1474,16 +1765,16 @@ def main():
     )
     sidebar_sample_meta = (st.session_state.get("sample") or {}).get("sample_meta_data", {})
     sidebar_dataset_type = (sidebar_sample_meta.get("dataset_type") or "").lower()
+    batch_samples_for_sidebar = st.session_state.get("batch_samples", []) or []
+    batch_dataset_types = {
+        str(s.get("dataset_type", "")).lower()
+        for s in batch_samples_for_sidebar
+        if str(s.get("dataset_type", "")).strip()
+    }
     if not sidebar_dataset_type:
-        batch_samples_for_sidebar = st.session_state.get("batch_samples", []) or []
         if batch_samples_for_sidebar:
-            batch_types = {
-                str(s.get("dataset_type", "")).lower()
-                for s in batch_samples_for_sidebar
-                if str(s.get("dataset_type", "")).strip()
-            }
-            if len(batch_types) == 1:
-                sidebar_dataset_type = next(iter(batch_types))
+            if len(batch_dataset_types) == 1:
+                sidebar_dataset_type = next(iter(batch_dataset_types))
     if "ground_plane_toggle_dataset_type" not in st.session_state:
         st.session_state["ground_plane_toggle_dataset_type"] = sidebar_dataset_type
         st.session_state["use_ground_plane_removal"] = _default_use_ground_plane_removal(sidebar_sample_meta)
@@ -1777,8 +2068,17 @@ def main():
         parsed_class_names = [name.strip() for name in class_names_input.split(',') if name.strip()]
     st.session_state.params['class_names'] = parsed_class_names
 
-    # For SUNRGBD (indoor-only) dataset, skip LLM initialization entirely.
-    is_sunrgbd_dataset = sidebar_dataset_type == "sunrgbd"
+    # For SUNRGBD (indoor-only), skip LLM initialization entirely.
+    # Keep this robust for both single-sample and batch-only sessions.
+    is_sunrgbd_dataset = (
+        sidebar_dataset_type == "sunrgbd"
+        or "sunrgbd" in batch_dataset_types
+    )
+    has_gt_2d_bbox_dataset = (
+        sidebar_dataset_type in {"sunrgbd", "kitti"}
+        or "sunrgbd" in batch_dataset_types
+        or "kitti" in batch_dataset_types
+    )
 
     if not is_sunrgbd_dataset:
         # LLM Settings
@@ -1876,16 +2176,23 @@ def main():
     else:
         # For SUNRGBD, do not initialize or query any LLM components.
         st.sidebar.info("LLM-based dimension lookup is disabled for SUNRGBD dataset.")
-        st.session_state.params["sunrgbd_use_label_bboxes_step3"] = st.sidebar.checkbox(
-            "Step 3: use SUNRGBD label 2D GT bboxes",
-            value=st.session_state.params.get("sunrgbd_use_label_bboxes_step3", False),
-            help=(
-                "Use label-file 2D GT boxes (x, y, w, h -> xyxy) to build Step 3 masks "
-                "instead of open-vocabulary 2D detection. Useful for ablation studies."
-            ),
-        )
         if not st.session_state.params['class_names']:
             st.sidebar.warning("⚠️ Please enter at least one class name")
+
+    if has_gt_2d_bbox_dataset:
+        _gt_bbox_override = st.sidebar.checkbox(
+            "Step 3: use dataset GT 2D bboxes (KITTI/SUNRGBD)",
+            value=st.session_state.params.get(
+                "use_gt_2d_bboxes_step3",
+                st.session_state.params.get("sunrgbd_use_label_bboxes_step3", False),
+            ),
+            help=(
+                "Use dataset ground-truth 2D boxes to build Step 3 masks instead of open-vocabulary "
+                "2D detection. Supported for KITTI and SUNRGBD."
+            ),
+        )
+        st.session_state.params["use_gt_2d_bboxes_step3"] = _gt_bbox_override
+        st.session_state.params["sunrgbd_use_label_bboxes_step3"] = _gt_bbox_override
     
     is_sam2 = st.session_state.params['sam_model_type'].startswith('sam2')
     if is_sam2:
@@ -1941,7 +2248,7 @@ def main():
         st.session_state.params['yolo_model_path'] = None
         st.session_state.params['open_vocab_detector'] = 'yolo'
         st.sidebar.info("💡 SAM3 uses direct text prompts for open-vocabulary segmentation")
-    # Keep the preference in session state; Step 3 applies it only when dataset is SUNRGBD.
+    # Keep the preference in session state; Step 3 applies it for datasets with GT 2D boxes.
     
     # Compute Device
     st.sidebar.markdown("### Compute Device")
@@ -2033,6 +2340,8 @@ def main():
 
         if st.button("🚀 Process entire batch", type="primary", key="process_entire_batch"):
             do_batch_tracking = st.session_state.get("batch_process_enable_tracking", True)
+            st.session_state["eval_mask_capacity_max"] = 0
+            st.session_state["eval_mask_capacity_hint_active"] = False
             print(
                 f"[batch] starting batch processing for {total} samples "
                 f"(tracking={'on' if do_batch_tracking else 'off'})"
@@ -2141,6 +2450,8 @@ def main():
                 results = run_full_pipeline(st.session_state.params)
                 # Update session state so Export and Evaluation pages see the latest results
                 step_5_result = results['step_5']['result']
+                step_3_result = results['step_3']['result']
+                _update_mask_capacity_hint(step_3_result, st.session_state.sample['sample_meta_data'])
                 st.session_state.cuboids = step_5_result['detected_cuboids']
                 sample_meta_data = st.session_state.sample['sample_meta_data']
                 dataset_type = sample_meta_data.get('dataset_type', 'unknown').lower()
@@ -2335,25 +2646,52 @@ def main():
                     st.metric("Reduction", f"{reduction:.1f}%")
                 st.metric("Ground Z", f"{result['ground_z']:.3f}m" if result['ground_z'] else "N/A")
                 
-                # 3D Visualization: Before and After
+                # 3D Visualization: Ground-kept and removed points
                 st.markdown("#### 3D Point Cloud Visualization")
                 point_cloud_obj = result['point_cloud_obj']
-                
-                # Show ground-removed point cloud
-                fig = create_3d_scatter_plot(
-                    points=point_cloud_obj,
-                    labels=None,
-                    mask_points=None,
-                    cuboids=None,
-                    rays=None,
-                    points_in_frustums=None,
-                    reconstructed_points=None,
-                    show_lidar=True,
-                    show_reconstructed=False,
-                    color_by_depth=False,
-                    title="Point Cloud After Ground Removal"
+
+                kept_points = point_cloud_obj.point_cloud_plane_removed
+                removed_points = getattr(point_cloud_obj, "ground_inliers", None)
+
+                fig = go.Figure()
+
+                if kept_points is not None and len(kept_points) > 0:
+                    fig.add_trace(
+                        go.Scatter3d(
+                            x=kept_points[:, 0],
+                            y=kept_points[:, 1],
+                            z=kept_points[:, 2],
+                            mode="markers",
+                            marker=dict(size=1.5, color="deepskyblue", opacity=0.45),
+                            name="Points kept (non-ground)",
+                        )
+                    )
+
+                if removed_points is not None and len(removed_points) > 0:
+                    fig.add_trace(
+                        go.Scatter3d(
+                            x=removed_points[:, 0],
+                            y=removed_points[:, 1],
+                            z=removed_points[:, 2],
+                            mode="markers",
+                            marker=dict(size=2.0, color="orangered", opacity=0.65),
+                            name="Removed ground points",
+                        )
+                    )
+
+                fig.update_layout(
+                    title="Ground Plane Removal: Kept vs Removed Points",
+                    scene=dict(
+                        xaxis=dict(title="X (m)"),
+                        yaxis=dict(title="Y (m)"),
+                        zaxis=dict(title="Z (m)"),
+                        aspectmode="data",
+                    ),
+                    margin=dict(l=0, r=0, b=0, t=40),
+                    height=600,
+                    legend=dict(itemsizing="constant"),
                 )
-                st.plotly_chart(fig)
+                _render_point_cloud_plot(fig, "step1_point_cloud_after_ground_removal")
         
         if step_1_state.get('error'):
             st.error(f"❌ Error: {step_1_state['error']}")
@@ -2462,7 +2800,11 @@ def main():
                         ),
                         height=600
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    _render_point_cloud_plot(
+                        fig,
+                        "step2_colored_sparse_points",
+                        use_container_width=True,
+                    )
                 else:
                     st.warning("No colored sparse points to visualize")
         
@@ -2503,8 +2845,9 @@ def main():
                             grounding_dino_model_id=st.session_state.params.get('grounding_dino_model_id'),
                             use_gpu=st.session_state.params.get('use_gpu', True),
                             projection=step_2_result['projection'],
-                            use_sunrgbd_label_bboxes=st.session_state.params.get(
-                                "sunrgbd_use_label_bboxes_step3", False
+                            use_dataset_gt_2d_bboxes=st.session_state.params.get(
+                                "use_gt_2d_bboxes_step3",
+                                st.session_state.params.get("sunrgbd_use_label_bboxes_step3", False),
                             ),
                         )
                         st.session_state.pipeline_state['step_3'] = {
@@ -2695,7 +3038,7 @@ def main():
                         ),
                         height=600
                     )
-                    st.plotly_chart(fig)
+                    _render_point_cloud_plot(fig, "step3_point_assignment")
                 else:
                     st.warning("No mask assignments to visualize")
         
@@ -2885,7 +3228,7 @@ def main():
                         ),
                         height=600
                     )
-                    st.plotly_chart(fig)
+                    _render_point_cloud_plot(fig, "step4_clusters")
         
         if step_4_state.get('error'):
             st.error(f"❌ Error: {step_4_state['error']}")
@@ -2927,7 +3270,11 @@ def main():
                             sample_meta_data=sample_meta_data,
                             sparse_points=step_2_result['colored_sparse_points'],
                             best_cluster_sparse_indices=step_4_result['best_cluster_sparse_indices'],
+                            filtered_mask_sparse_indices=step_4_result.get('filtered_mask_sparse_indices'),
                             sam_masks=step_3_result['sam_masks'],
+                            mask_bboxes=step_3_result.get('mask_bboxes'),
+                            mask_confidences=step_3_result.get('confidences'),
+                            projection=step_2_result.get('projection'),
                             ground_z=step_1_result['ground_z'],
                             cuboid_params=st.session_state.params['cuboid_fitting']
                         )
@@ -3030,7 +3377,7 @@ def main():
                     )
                     if result['detected_cuboids']:
                         add_cuboids_to_figure(fig, result['detected_cuboids'], color='red', opacity=0.3, name_prefix="Detected: ")
-                    st.plotly_chart(fig)
+                    _render_point_cloud_plot(fig, "step5_detected_objects")
         
         if step_5_state.get('error'):
             st.error(f"❌ Error: {step_5_state['error']}")

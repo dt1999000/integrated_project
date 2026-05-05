@@ -9,11 +9,14 @@ import pandas as pd
 import cv2
 import io
 import json
+import textwrap
 import copy
 import importlib.util
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
+import plotly.graph_objects as go
 
 from components.core.evaluation import (
     compute_3d_iou,
@@ -106,7 +109,9 @@ def get_ground_truth_objects_for_class_per_scene(
     return per_scene_gt
 
 
-def _extract_detection_classes(batch_results: List[Dict], max_classes: int = 3) -> List[str]:
+def _extract_detection_classes(
+    batch_results: List[Dict], max_classes: Optional[int] = None
+) -> List[str]:
     """
     Extract target detection classes from batch metadata (pipeline params),
     falling back to detected cuboid categories.
@@ -122,7 +127,7 @@ def _extract_detection_classes(batch_results: List[Dict], max_classes: int = 3) 
             if cls_norm and cls_norm not in seen:
                 ordered.append(cls_norm)
                 seen.add(cls_norm)
-                if len(ordered) >= max_classes:
+                if max_classes is not None and len(ordered) >= max_classes:
                     return ordered
 
     for sample in batch_results:
@@ -131,7 +136,7 @@ def _extract_detection_classes(batch_results: List[Dict], max_classes: int = 3) 
             if cls_norm and cls_norm not in seen:
                 ordered.append(cls_norm)
                 seen.add(cls_norm)
-                if len(ordered) >= max_classes:
+                if max_classes is not None and len(ordered) >= max_classes:
                     return ordered
 
     return ordered
@@ -347,6 +352,83 @@ def _cuboid_position_payload(cuboid: Dict) -> Dict:
     }
 
 
+def _cuboid_center_xyz(cuboid: Dict) -> np.ndarray:
+    return np.asarray(
+        [
+            (float(cuboid.get("min_x", 0.0)) + float(cuboid.get("max_x", 0.0))) / 2.0,
+            (float(cuboid.get("min_y", 0.0)) + float(cuboid.get("max_y", 0.0))) / 2.0,
+            (float(cuboid.get("min_z", 0.0)) + float(cuboid.get("max_z", 0.0))) / 2.0,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _trim_far_ground_truth_by_mask_capacity(
+    batch_results: List[Dict],
+    max_masks_per_image: int,
+) -> Tuple[List[Dict], int, int]:
+    """
+    Keep at most `max_masks_per_image` GT boxes per frame by dropping GT cuboids
+    farthest from detections (based on nearest detection center distance).
+    """
+    if max_masks_per_image <= 0:
+        return batch_results, 0, 0
+
+    trimmed_results: List[Dict] = []
+    n_dropped = 0
+    n_frames_affected = 0
+
+    for sample in batch_results:
+        gt_raw = sample.get("ground_truth_cuboids")
+        if gt_raw is None:
+            trimmed_results.append(sample)
+            continue
+
+        gt_pairs: List[Tuple[int, Dict]] = []
+        for raw_idx, raw_gt in enumerate(gt_raw or []):
+            normalized = _normalize_gt_for_eval([raw_gt])
+            if normalized:
+                gt_pairs.append((raw_idx, normalized[0]))
+        gt_norm = [p[1] for p in gt_pairs]
+        det_list = sample.get("detected_cuboids", []) or []
+        if len(det_list) == 0:
+            dropped_here = len(gt_norm)
+            if dropped_here > 0:
+                n_dropped += dropped_here
+                n_frames_affected += 1
+            sample_copy = dict(sample)
+            sample_copy["ground_truth_cuboids"] = []
+            trimmed_results.append(sample_copy)
+            continue
+
+        if len(gt_norm) <= max_masks_per_image:
+            trimmed_results.append(sample)
+            continue
+
+        det_centers = np.asarray([_cuboid_center_xyz(det) for det in det_list], dtype=np.float64)
+        gt_distance_rows: List[Tuple[float, int]] = []
+        for gi, gt in enumerate(gt_norm):
+            gt_center = _cuboid_center_xyz(gt)
+            nearest = float(np.min(np.linalg.norm(det_centers - gt_center, axis=1)))
+            gt_distance_rows.append((nearest, gi))
+
+        keep_indices = {
+            gi for _, gi in sorted(gt_distance_rows, key=lambda row: row[0])[:max_masks_per_image]
+        }
+        keep_raw_indices = {gt_pairs[gi][0] for gi in keep_indices}
+        gt_trimmed = [gt for gi, gt in enumerate(gt_raw or []) if gi in keep_raw_indices]
+        dropped_here = len(gt_norm) - len(gt_trimmed)
+        if dropped_here > 0:
+            n_dropped += dropped_here
+            n_frames_affected += 1
+
+        sample_copy = dict(sample)
+        sample_copy["ground_truth_cuboids"] = gt_trimmed
+        trimmed_results.append(sample_copy)
+
+    return trimmed_results, n_dropped, n_frames_affected
+
+
 def _build_mismatch_export_payload(
     batch_results: List[Dict],
     iou_threshold: float,
@@ -441,6 +523,182 @@ def _build_mismatch_export_payload(
         },
         "samples": export_items,
     }
+
+
+def _render_point_cloud_plot(fig, export_basename: str) -> None:
+    """Render point-cloud Plotly chart with high-resolution export controls."""
+    def _build_structured_pointcloud_html(plot_fig, plot_name: str) -> str:
+        fig_dict = plot_fig.to_dict()
+        data_json = json.dumps(fig_dict.get("data", []), indent=2)
+        layout_json = json.dumps(fig_dict.get("layout", {}), indent=2)
+        config_json = json.dumps({"responsive": True, "displaylogo": False}, indent=2)
+        return textwrap.dedent(
+            f"""\
+            <!doctype html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1" />
+              <title>{plot_name}</title>
+              <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+            </head>
+            <body style="margin:0;">
+              <div id="pointcloud_plot" style="width:100vw; height:100vh;"></div>
+              <script>
+                // =========================================================================
+                // POINT CLOUD DATA (all traces / 3D points)
+                // =========================================================================
+                const pointCloudData = {data_json};
+
+                // =========================================================================
+                // LEGEND + CAPTION/TITLE + AXES (layout styling lives here)
+                // =========================================================================
+                const pointCloudLayout = {layout_json};
+
+                // =========================================================================
+                // EXPORT + INTERACTION OPTIONS
+                // =========================================================================
+                const pointCloudConfig = {config_json};
+
+                Plotly.newPlot("pointcloud_plot", pointCloudData, pointCloudLayout, pointCloudConfig);
+              </script>
+            </body>
+            </html>
+            """
+        )
+
+    # Streamlit in-app display
+    display_legend_font_size = 11
+    display_caption_font_size = 13
+    display_axis_title_font_size = 11
+    display_axis_tick_font_size = 10
+    # Downloaded HTML export
+    export_legend_font_size = 18
+    export_caption_font_size = 22
+    export_axis_title_font_size = 16
+    export_axis_tick_font_size = 14
+
+    axis_tick_settings = {
+        "x": {"nticks": 8, "dtick": None},
+        "y": {"nticks": 8, "dtick": None},
+        "z": {"nticks": 8, "dtick": None},
+    }
+    # Set any axis to [min, max] to force range, or keep None for auto-range.
+    axis_range_overrides = {
+        "x": None,
+        "y": None,
+        "z": None,
+    }
+
+    def _scene_axis(
+        axis_key: str,
+        title_text: str,
+        range_override: Optional[List[float]],
+        axis_title_font_size: int,
+        axis_tick_font_size: int,
+    ) -> Dict[str, Any]:
+        axis_cfg: Dict[str, Any] = {
+            "title": {"text": title_text, "font": {"size": axis_title_font_size}},
+            "tickfont": {"size": axis_tick_font_size},
+        }
+        tick_cfg = axis_tick_settings.get(axis_key, {})
+        axis_cfg["nticks"] = tick_cfg.get("nticks", 8)
+        if tick_cfg.get("dtick") is not None:
+            axis_cfg["dtick"] = tick_cfg["dtick"]
+        if range_override is not None:
+            axis_cfg["range"] = range_override
+        return axis_cfg
+
+    fig.update_layout(
+        legend=dict(
+            font=dict(size=display_legend_font_size),
+            title=dict(font=dict(size=display_legend_font_size)),
+            itemsizing="constant",
+        ),
+        title=dict(font=dict(size=display_caption_font_size)),
+        scene=dict(
+            xaxis=_scene_axis(
+                "x",
+                "X (m)",
+                axis_range_overrides["x"],
+                display_axis_title_font_size,
+                display_axis_tick_font_size,
+            ),
+            yaxis=_scene_axis(
+                "y",
+                "Y (m)",
+                axis_range_overrides["y"],
+                display_axis_title_font_size,
+                display_axis_tick_font_size,
+            ),
+            zaxis=_scene_axis(
+                "z",
+                "Z (m)",
+                axis_range_overrides["z"],
+                display_axis_title_font_size,
+                display_axis_tick_font_size,
+            ),
+        ),
+    )
+    export_config = {
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": export_basename,
+            "width": 2200,
+            "height": 1400,
+            "scale": 2,
+        },
+        "displaylogo": False,
+    }
+    st.plotly_chart(fig, width="stretch", config=export_config)
+    export_fig = go.Figure(fig)
+    export_fig.update_layout(
+        width=1920,
+        height=1080,
+        autosize=True,
+        margin=dict(l=10, r=10, t=55, b=10),
+        legend=dict(
+            font=dict(size=export_legend_font_size),
+            title=dict(font=dict(size=export_legend_font_size)),
+            itemsizing="constant",
+        ),
+        title=dict(
+            font=dict(size=export_caption_font_size),
+            pad=dict(t=6, b=2),
+        ),
+        scene=dict(
+            domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
+            xaxis=_scene_axis(
+                "x",
+                "X (m)",
+                axis_range_overrides["x"],
+                export_axis_title_font_size,
+                export_axis_tick_font_size,
+            ),
+            yaxis=_scene_axis(
+                "y",
+                "Y (m)",
+                axis_range_overrides["y"],
+                export_axis_title_font_size,
+                export_axis_tick_font_size,
+            ),
+            zaxis=_scene_axis(
+                "z",
+                "Z (m)",
+                axis_range_overrides["z"],
+                export_axis_title_font_size,
+                export_axis_tick_font_size,
+            ),
+        ),
+    )
+    st.download_button(
+        "⬇️ Download interactive HTML (high quality)",
+        data=_build_structured_pointcloud_html(export_fig, export_basename),
+        file_name=f"{export_basename}.html",
+        mime="text/html",
+        key=f"eval_plotly_html_export_{export_basename}",
+        width="stretch",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +815,7 @@ def _render_single_sample_eval():
     if point_cloud_obj:
         st.subheader("🎯 3D Comparison Visualization")
         fig_unified = create_comparison_plot(point_cloud_obj, ground_truth_boxes, detected_cuboids)
-        st.plotly_chart(fig_unified, width="stretch")
+        _render_point_cloud_plot(fig_unified, "evaluation_3d_comparison")
 
 
 def _render_sim_azimuth_iou_block(
@@ -619,6 +877,11 @@ def _render_batch_eval():
     batch_export = st.session_state.batch_export_results
     batch_results: List[Dict] = batch_export.get("samples", [])
     eval_batch_results, n_inferred_empty_gt = _prepare_batch_results_for_eval(batch_results)
+    max_masks_hint = int(st.session_state.get("eval_mask_capacity_max", 0) or 0)
+    eval_batch_results, n_trimmed_gt, n_trimmed_frames = _trim_far_ground_truth_by_mask_capacity(
+        eval_batch_results,
+        max_masks_per_image=max_masks_hint,
+    )
     total_queued: int = len(st.session_state.get("batch_samples", []))
 
     st.subheader("📦 Batch Sample Overview")
@@ -660,6 +923,11 @@ def _render_batch_eval():
             f"{n_inferred_empty_gt} frame(s) from annotated datasets had missing GT and were "
             "treated as empty scenes for evaluation."
         )
+    if n_trimmed_gt > 0:
+        st.info(
+            f"Applied mask-capacity GT trimming on {n_trimmed_frames} frame(s): "
+            f"dropped {n_trimmed_gt} far-away GT cuboid(s) using max masks per image = {max_masks_hint}."
+        )
 
     if n_no_gt > 0:
         st.info(
@@ -693,59 +961,84 @@ def _render_batch_eval():
     # ------------------------------------------------------------------
     st.subheader("🏆 Benchmark Metrics")
     st.caption(
-        "**Macro-F1** is the unweighted mean of per-class F1 (each class F1 uses pooled TP/FP/FN). "
-        "**Micro-F1** is the harmonic mean of micro precision and recall over all objects. "
-        "These are not COCO-style AP (no PR curve without confidence scores)."
+        "**Heuristic-score mAP@0.5** / **mAP@0.25** are the mean of per-class AP, each AP equal to the area under the "
+        "precision–recall curve (COCO-style interpolated envelope). Detections are ranked by "
+        "the exported heuristic `confidence` score (computed before GT matching). "
+        "**Macro-F1** is the unweighted mean of per-class F1 from greedy IoU matching at one threshold. "
+        "**Micro-F1** is the harmonic mean of pooled micro precision and recall at that threshold."
     )
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Macro-F1 @0.5", f"{ap_50['macro_f1'] * 100:.1f}%")
+        st.metric("mAP@0.5 (PR AUC)", f"{ap_50.get('map_pr', 0.0) * 100:.1f}%")
     with col2:
-        st.metric("Macro-F1 @0.25", f"{ap_25['macro_f1'] * 100:.1f}%")
+        st.metric("mAP@0.25 (PR AUC)", f"{ap_25.get('map_pr', 0.0) * 100:.1f}%")
     with col3:
-        st.metric("Micro precision @0.25", f"{ap_25['precision'] * 100:.1f}%")
+        st.metric("Macro-F1 @0.5", f"{ap_50['macro_f1'] * 100:.1f}%")
     with col4:
-        st.metric("Micro recall @0.25", f"{ap_25['recall'] * 100:.1f}%")
+        st.metric("Macro-F1 @0.25", f"{ap_25['macro_f1'] * 100:.1f}%")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Micro-F1 @0.5", f"{ap_50['f1'] * 100:.1f}%")
+        st.metric("Micro AP (PR, pooled) @0.5", f"{ap_50.get('micro_ap_pr', 0.0) * 100:.1f}%")
     with col2:
+        st.metric("Micro AP (PR, pooled) @0.25", f"{ap_25.get('micro_ap_pr', 0.0) * 100:.1f}%")
+    with col3:
+        st.metric("Micro-F1 @0.5", f"{ap_50['f1'] * 100:.1f}%")
+    with col4:
         st.metric("Micro-F1 @0.25", f"{ap_25['f1'] * 100:.1f}%")
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Micro precision @0.25", f"{ap_25['precision'] * 100:.1f}%")
+    with col2:
+        st.metric("Micro recall @0.25", f"{ap_25['recall'] * 100:.1f}%")
     with col3:
         st.metric("Total GT objects", stats["total_ground_truth"])
     with col4:
         st.metric("Total detections", stats["total_detections"])
 
+    st.subheader("📈 Precision-Recall Curves")
+    _ds_slug = _batch_primary_dataset_slug(eval_batch_results)
+    sun_note = ""
+    if _ds_slug == "sunrgbd":
+        sun_note = (
+            "**SUN RGB-D**: micro-pooled PR is for sanity checks — paper **mAP@0.25 / mAP@0.5** "
+            "is the mean of **per-class** AP in the benchmark table."
+        )
+    st.caption(
+        "Separate figures per IoU threshold (micro-pooled, heuristic-score ranking). "
+        "Plots end at **the attained recall** — the curve is not extrapolated horizontally to recall 1 "
+        "(avoids misleading plateaus under `step` plotting). PNG/SVG per figure."
+        + (f" {sun_note}" if sun_note else "")
+    )
+    _render_pr_curve_for_thesis(ap_25, ap_50)
+
     # ------------------------------------------------------------------
     # Per-class breakdown
     # ------------------------------------------------------------------
-    eval_classes = _extract_detection_classes(eval_batch_results, max_classes=3)
+    eval_classes = _extract_detection_classes(eval_batch_results, max_classes=None)
     if eval_classes:
         st.caption(f"Evaluating configured detection classes: {', '.join(eval_classes)}")
 
     if ap_50["per_class"]:
-        st.subheader("📊 Per-Class Metrics")
+        st.subheader("📊 Per-Class AP (reportable)")
         all_cats = sorted(set(list(ap_50["per_class"]) + list(ap_25["per_class"])))
         if eval_classes:
             all_cats = [c for c in all_cats if c in eval_classes]
         rows = []
         for cat in all_cats:
-            c50 = ap_50["per_class"].get(cat, {})
-            c25 = ap_25["per_class"].get(cat, {})
+            ap_pr_50 = ap_50.get("per_class_pr_ap", {}).get(cat)
+            ap_pr_25 = ap_25.get("per_class_pr_ap", {}).get(cat)
             rows.append({
                 "Category": cat,
-                "TP@0.5": c50.get("TP", 0),
-                "FP@0.5": c50.get("FP", 0),
-                "FN@0.5": c50.get("FN", 0),
-                "Prec@0.5": f"{c50.get('precision', 0) * 100:.1f}%",
-                "Rec@0.5": f"{c50.get('recall', 0) * 100:.1f}%",
-                "F1@0.5": f"{c50.get('f1', 0) * 100:.1f}%",
-                "F1@0.25": f"{c25.get('f1', 0) * 100:.1f}%",
+                "AP_PR@0.5": f"{ap_pr_50 * 100:.1f}%" if ap_pr_50 is not None else "—",
+                "AP_PR@0.25": f"{ap_pr_25 * 100:.1f}%" if ap_pr_25 is not None else "—",
+                "GT count": int(ap_25.get("n_gt_per_class_pr", {}).get(cat, 0)),
             })
         if rows:
             st.dataframe(pd.DataFrame(rows), width="stretch")
+            _render_per_class_pr_curves(ap_25, ap_50, all_cats)
         else:
             st.info("No per-class metrics available for the configured detection classes.")
 
@@ -829,10 +1122,10 @@ def _render_batch_eval():
                     "Rotate bins (°) subtracted after wrap to [0,360)",
                     min_value=0.0,
                     max_value=360.0,
-                    value=0.0,
+                    value=90.0,
                     step=1.0,
                     key="sim_azimuth_offset",
-                    help="With span 180° and offset 0°, bins evaluate the direct 0°–180° azimuth range.",
+                    help="Use offset 90° with span 180° to map the original 90°–270° sector into a 0°–180° axis.",
                 )
             with off2:
                 angle_span_deg = st.number_input(
@@ -1094,6 +1387,254 @@ def _make_download_buttons(fig: plt.Figure, base_name: str):
         )
 
 
+def _batch_primary_dataset_slug(batch_results: List[Dict]) -> Optional[str]:
+    """Most common ``dataset_type`` in batch exports (metadata or sample root key)."""
+    if not batch_results:
+        return None
+    counts: Dict[str, int] = {}
+    for r in batch_results:
+        meta = r.get("metadata") or {}
+        slug = meta.get("dataset_type") if meta.get("dataset_type") is not None else r.get("dataset_type")
+        slug_s = str(slug).strip().lower() if slug is not None else "unknown"
+        if slug_s == "":
+            slug_s = "unknown"
+        counts[slug_s] = counts.get(slug_s, 0) + 1
+    return max(counts.keys(), key=lambda k: counts[k])
+
+
+def _coco_style_precision_envelope_inplace(precision: np.ndarray) -> None:
+    """Backward max envelope on precision (aligned with detector AP bookkeeping). Mutates precision."""
+    p = precision
+    if p.size <= 1:
+        return
+    for i in range(len(p) - 2, -1, -1):
+        p[i] = float(max(float(p[i]), float(p[i + 1])))
+
+
+def _micro_pr_curve_stair_xy(recalls: np.ndarray, precisions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build a finite staircase polyline (x, y) for micro PR that does **not**
+    extrapolate precision past the largest observed cumulative recall — unlike
+    ``step(..., where='post')`` with ``xlim=(0,1)``, which extends the last bin to 1.0.
+
+    Opens at recall 0 with the precision after the envelope at the first operating point.
+    """
+    if recalls.size == 0:
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+    r_raw = recalls.astype(np.float64)
+    p_mono = precisions.astype(np.float64).copy()
+    _coco_style_precision_envelope_inplace(p_mono)
+    xr: List[float] = [0.0, float(r_raw[0])]
+    yr: List[float] = [float(p_mono[0]), float(p_mono[0])]
+    r_prev = float(r_raw[0])
+    p_prev = float(p_mono[0])
+    for i in range(1, len(r_raw)):
+        ri = float(r_raw[i])
+        pi = float(p_mono[i])
+        if abs(ri - r_prev) < 1e-15:
+            if abs(pi - p_prev) > 1e-15:
+                xr.extend([ri, ri]); yr.extend([p_prev, pi]); p_prev = pi
+            continue
+        xr.extend([ri, ri]); yr.extend([p_prev, pi])
+        r_prev, p_prev = ri, pi
+    return np.asarray(xr, dtype=np.float64), np.asarray(yr, dtype=np.float64)
+
+
+def _pr_fill_under_stair(ax, xr: np.ndarray, yr: np.ndarray, *, color: str, alpha: float = 0.10) -> None:
+    """Closed polygon under staircase down to baseline 0."""
+    if xr.size < 2:
+        return
+    r_last = float(xr[-1])
+    verts = [(0.0, 0.0)]
+    verts.extend([(float(rx), float(ry)) for rx, ry in zip(xr, yr)])
+    verts.append((r_last, 0.0))
+    ax.add_patch(
+        Polygon(verts, closed=True, facecolor=color, edgecolor="none", alpha=alpha)
+    )
+
+
+def _render_single_pr_curve_figure(
+    ap_bundle: Dict,
+    *,
+    iou_label: str,
+    line_color: str,
+    file_tag: str,
+) -> None:
+    """One PR figure ending at attained recall only; avoids horizontal tail artifacts."""
+    rec = np.asarray(ap_bundle.get("pr_recalls_micro", []) or [], dtype=np.float64)
+    prec = np.asarray(ap_bundle.get("pr_precisions_micro", []) or [], dtype=np.float64)
+    if rec.size == 0:
+        st.info(f"No PR points available for IoU {iou_label}.")
+        return
+    xr, yr = _micro_pr_curve_stair_xy(rec, prec)
+    ap_val = float(ap_bundle.get("micro_ap_pr", 0.0))
+    fig, ax = plt.subplots(figsize=(8.2, 5.2), dpi=180)
+    ax.set_facecolor("#FBFBFD")
+    _pr_fill_under_stair(ax, xr, yr, color=line_color, alpha=0.12)
+    ax.plot(xr, yr, linestyle="-", linewidth=2.4, color=line_color, label=f"Pooled AP={ap_val:.3f}")
+    r_max = float(np.max(rec))
+    x_pad = max(1e-4, 0.02 * max(r_max, 1e-4))
+    ax.set_xlim(0.0, min(1.0, r_max + x_pad))
+    ax.set_ylim(0.0, 1.02)
+    ax.set_xlabel("Recall", fontsize=12)
+    ax.set_ylabel("Precision", fontsize=12)
+    ax.set_title(
+        f"Precision–Recall ({iou_label}; micro-pooled, heuristic-score ranking)",
+        fontsize=13,
+    )
+    ax.grid(True, linestyle="--", alpha=0.30)
+    ax.legend(loc="lower left", frameon=True, fontsize=10)
+    st.pyplot(fig, width="stretch")
+    _make_download_buttons(fig, file_tag)
+    plt.close(fig)
+
+
+def _render_pr_curve_for_thesis(ap_25: Dict, ap_50: Dict) -> None:
+    """Render separate IoU PR figures — each ends at attained recall only (SUN RGB-D safe)."""
+    rec25 = np.asarray(ap_25.get("pr_recalls_micro", []) or [], dtype=np.float64)
+    rec50 = np.asarray(ap_50.get("pr_recalls_micro", []) or [], dtype=np.float64)
+
+    if rec25.size == 0 and rec50.size == 0:
+        st.info("No PR points available to plot.")
+        return
+
+    _render_single_pr_curve_figure(
+        ap_25,
+        iou_label="IoU ≥ 0.25",
+        line_color="#1f77b4",
+        file_tag="precision_recall_micro_iou025",
+    )
+    _render_single_pr_curve_figure(
+        ap_50,
+        iou_label="IoU ≥ 0.50",
+        line_color="#d62728",
+        file_tag="precision_recall_micro_iou050",
+    )
+
+    rows = []
+    n25 = max(len(rec25), len(np.asarray(ap_25.get("pr_precisions_micro", []) or [])))
+    prec25 = np.asarray(ap_25.get("pr_precisions_micro", []) or [], dtype=np.float64)
+    n50 = max(len(rec50), len(np.asarray(ap_50.get("pr_precisions_micro", []) or [])))
+    prec50 = np.asarray(ap_50.get("pr_precisions_micro", []) or [], dtype=np.float64)
+    n = max(n25, n50)
+    for i in range(n):
+        rows.append({
+            "idx": i,
+            "recall_025_raw": float(rec25[i]) if i < len(rec25) else np.nan,
+            "precision_025_raw": float(prec25[i]) if i < len(prec25) else np.nan,
+            "recall_050_raw": float(rec50[i]) if i < len(rec50) else np.nan,
+            "precision_050_raw": float(prec50[i]) if i < len(prec50) else np.nan,
+        })
+    df = pd.DataFrame(rows)
+    st.download_button(
+        "⬇️ Download PR curve points (CSV)",
+        data=df.to_csv(index=False),
+        file_name="precision_recall_curve_points.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+
+def _render_per_class_pr_curves(ap_25: Dict, ap_50: Dict, classes: List[str]) -> None:
+    """Render per-class PR curves (IoU 0.25 / 0.50) and export raw points."""
+    if not classes:
+        return
+    st.subheader("🧩 Per-Class PR Curves")
+    st.caption(
+        "Each class curve uses only detections/GT of that class. "
+        "AP is computed from the same per-class PR points shown here."
+    )
+    curves25 = ap_25.get("per_class_pr_curves", {}) or {}
+    curves50 = ap_50.get("per_class_pr_curves", {}) or {}
+    tabs = st.tabs(classes)
+    for tab, cat in zip(tabs, classes):
+        with tab:
+            c25 = curves25.get(cat, {})
+            c50 = curves50.get(cat, {})
+            rec25 = np.asarray(c25.get("recalls", []) or [], dtype=np.float64)
+            prec25 = np.asarray(c25.get("precisions", []) or [], dtype=np.float64)
+            rec50 = np.asarray(c50.get("recalls", []) or [], dtype=np.float64)
+            prec50 = np.asarray(c50.get("precisions", []) or [], dtype=np.float64)
+
+            col_l, col_r = st.columns(2)
+            with col_l:
+                fig25, ax25 = plt.subplots(figsize=(5.3, 4.0), dpi=170)
+                ax25.set_facecolor("#FBFBFD")
+                if rec25.size > 0:
+                    x25, y25 = _micro_pr_curve_stair_xy(rec25, prec25)
+                    _pr_fill_under_stair(ax25, x25, y25, color="#1f77b4", alpha=0.12)
+                    ax25.plot(
+                        x25,
+                        y25,
+                        linewidth=2.1,
+                        color="#1f77b4",
+                        label=f"AP={float(ap_25.get('per_class_pr_ap', {}).get(cat, 0.0)):.3f}",
+                    )
+                    xlim_max_25 = min(1.0, float(np.max(rec25)) + max(1e-4, 0.02 * max(float(np.max(rec25)), 1e-4)))
+                    ax25.set_xlim(0.0, xlim_max_25)
+                else:
+                    ax25.set_xlim(0.0, 1.0)
+                    ax25.text(0.5, 0.5, "No PR points", ha="center", va="center", transform=ax25.transAxes)
+                ax25.set_ylim(0.0, 1.02)
+                ax25.set_xlabel("Recall")
+                ax25.set_ylabel("Precision")
+                ax25.set_title(f"{cat} — IoU ≥ 0.25")
+                ax25.grid(True, linestyle="--", alpha=0.30)
+                if rec25.size > 0:
+                    ax25.legend(loc="lower left", fontsize=9, frameon=True)
+                st.pyplot(fig25, width="stretch")
+                plt.close(fig25)
+
+            with col_r:
+                fig50, ax50 = plt.subplots(figsize=(5.3, 4.0), dpi=170)
+                ax50.set_facecolor("#FBFBFD")
+                if rec50.size > 0:
+                    x50, y50 = _micro_pr_curve_stair_xy(rec50, prec50)
+                    _pr_fill_under_stair(ax50, x50, y50, color="#d62728", alpha=0.12)
+                    ax50.plot(
+                        x50,
+                        y50,
+                        linewidth=2.1,
+                        color="#d62728",
+                        label=f"AP={float(ap_50.get('per_class_pr_ap', {}).get(cat, 0.0)):.3f}",
+                    )
+                    xlim_max_50 = min(1.0, float(np.max(rec50)) + max(1e-4, 0.02 * max(float(np.max(rec50)), 1e-4)))
+                    ax50.set_xlim(0.0, xlim_max_50)
+                else:
+                    ax50.set_xlim(0.0, 1.0)
+                    ax50.text(0.5, 0.5, "No PR points", ha="center", va="center", transform=ax50.transAxes)
+                ax50.set_ylim(0.0, 1.02)
+                ax50.set_xlabel("Recall")
+                ax50.set_ylabel("Precision")
+                ax50.set_title(f"{cat} — IoU ≥ 0.50")
+                ax50.grid(True, linestyle="--", alpha=0.30)
+                if rec50.size > 0:
+                    ax50.legend(loc="lower left", fontsize=9, frameon=True)
+                st.pyplot(fig50, width="stretch")
+                plt.close(fig50)
+
+            n_raw = max(len(rec25), len(prec25), len(rec50), len(prec50))
+            rows = []
+            for i in range(n_raw):
+                rows.append(
+                    {
+                        "idx": i,
+                        "recall_025_raw": float(rec25[i]) if i < len(rec25) else np.nan,
+                        "precision_025_raw": float(prec25[i]) if i < len(prec25) else np.nan,
+                        "recall_050_raw": float(rec50[i]) if i < len(rec50) else np.nan,
+                        "precision_050_raw": float(prec50[i]) if i < len(prec50) else np.nan,
+                    }
+                )
+            st.download_button(
+                f"⬇️ Download raw PR points — {cat} (CSV)",
+                data=pd.DataFrame(rows).to_csv(index=False),
+                file_name=f"pr_curve_points_{cat.replace(' ', '_')}.csv",
+                mime="text/csv",
+                width="stretch",
+                key=f"dl_pr_curve_{cat}",
+            )
+
+
 def _render_ablation_study_runner():
     st.subheader("🧪 Ablation Study Runner")
     batch_samples = st.session_state.get("batch_samples", [])
@@ -1266,8 +1807,8 @@ def main():
     st.header("📊 Detection Evaluation")
     st.markdown(
         "Evaluate detection results against ground truth. "
-        "Computes 3D IoU and micro/macro-F1 metrics at IoU 0.5 and 0.25 "
-        "(true AP requires per-detection scores, which are not used here)."
+        "Computes 3D IoU, micro/macro-F1 at IoU 0.5 and 0.25, and **heuristic-score mAP@0.5 / mAP@0.25** "
+        "as mean per-class AP (area under the PR curve; ranking uses exported heuristic `confidence`)."
     )
 
     has_batch = (

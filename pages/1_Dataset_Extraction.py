@@ -15,7 +15,16 @@ from components.dataset_loaders.sunrgbd_dataset_loader import (
     SUNRGBDDatasetLoader,
     SUNRGBD_KEEP_FRACTION_DEFAULT,
     SUNRGBD_KEEP_FRACTION_SESSION_KEY,
+    SUNRGBD_VAL_SPLIT_1BASED_END,
+    SUNRGBD_VAL_SPLIT_1BASED_START,
     sunrgbd_keep_fraction_for_load,
+    sunrgbd_val_split_indices_zero_based,
+)
+from components.dataset_loaders.kitti_dataset_loader import (
+    KITTI_TRAIN_SPLIT_COUNT,
+    KITTI_VAL_SPLIT_COUNT,
+    kitti_train_split_positions,
+    kitti_val_split_positions,
 )
 from components.dataset_loaders.rosbag_extractor import (
     get_image_topics as get_ros_image_topics,
@@ -427,6 +436,84 @@ def main():
                                 else:
                                     st.error("❌ Failed to load sample")
 
+                        if st.button("📦 Load entire KITTI dataset for detection", key="load_all_kitti_entire_dataset"):
+                            batch_samples = []
+                            for img_path in image_files:
+                                sample_index = int(img_path.stem)
+                                batch_samples.append({
+                                    "dataset_type": "kitti",
+                                    "dataset_path": dataset_path,
+                                    "sample_index": sample_index,
+                                    "image_path": str(img_path),
+                                    "point_cloud_path": "",
+                                })
+                            st.session_state.batch_samples = batch_samples
+                            st.session_state.process_all_samples = True
+                            st.session_state.batch_samples_saved = True
+                            st.success(
+                                f"✅ Prepared all {len(batch_samples)} KITTI samples. "
+                                "Go to **2_Detection** and click **Process entire batch**."
+                            )
+                            st.rerun()
+
+                        if training_dir.exists():
+                            col_kitti_train, col_kitti_val = st.columns(2)
+                            with col_kitti_train:
+                                n_train = len(kitti_train_split_positions(num_samples))
+                                if st.button(
+                                    f"📦 Load KITTI train split (n={n_train})",
+                                    key="load_kitti_train_split_for_detection",
+                                    help="Paper-style split: first 3712 frames from KITTI training set.",
+                                ):
+                                    batch_samples = []
+                                    for pos in kitti_train_split_positions(num_samples):
+                                        img_path = image_files[int(pos)]
+                                        batch_samples.append({
+                                            "dataset_type": "kitti",
+                                            "dataset_path": dataset_path,
+                                            "sample_index": int(img_path.stem),
+                                            "image_path": str(img_path),
+                                            "point_cloud_path": "",
+                                        })
+                                    st.session_state.batch_samples = batch_samples
+                                    st.session_state.process_all_samples = True
+                                    st.session_state.batch_samples_saved = True
+                                    st.success(
+                                        f"✅ Prepared {len(batch_samples)} KITTI train samples "
+                                        f"(paper split target={KITTI_TRAIN_SPLIT_COUNT}). "
+                                        "Go to **2_Detection** and click **Process entire batch**."
+                                    )
+                                    st.rerun()
+
+                            with col_kitti_val:
+                                n_val = len(kitti_val_split_positions(num_samples))
+                                if st.button(
+                                    f"📦 Load KITTI val split (n={n_val})",
+                                    key="load_kitti_val_split_for_detection",
+                                    help="Paper-style split: remaining 3769 frames from KITTI training set.",
+                                ):
+                                    batch_samples = []
+                                    for pos in kitti_val_split_positions(num_samples):
+                                        img_path = image_files[int(pos)]
+                                        batch_samples.append({
+                                            "dataset_type": "kitti",
+                                            "dataset_path": dataset_path,
+                                            "sample_index": int(img_path.stem),
+                                            "image_path": str(img_path),
+                                            "point_cloud_path": "",
+                                        })
+                                    st.session_state.batch_samples = batch_samples
+                                    st.session_state.process_all_samples = True
+                                    st.session_state.batch_samples_saved = True
+                                    st.success(
+                                        f"✅ Prepared {len(batch_samples)} KITTI val samples "
+                                        f"(paper split target={KITTI_VAL_SPLIT_COUNT}). "
+                                        "Go to **2_Detection** and click **Process entire batch**."
+                                    )
+                                    st.rerun()
+                        else:
+                            st.caption("Paper train/val split buttons are available only for KITTI training sets.")
+
                         # KITTI: random batch filtering + send to detection
                         ensure_filter_state("kitti")
                         st.markdown("---")
@@ -503,7 +590,7 @@ def main():
                                     batch_samples.append({
                                         "dataset_type": "kitti",
                                         "dataset_path": dataset_path,
-                                        "sample_index": item["sample_index"],
+                                        "sample_index": int(Path(item["image_path"]).stem),
                                         "image_path": item.get("image_path", ""),
                                         # For KITTI we resolve LiDAR internally in loaders; keep path optional here.
                                         "point_cloud_path": "",
@@ -548,6 +635,37 @@ def main():
                             st.error("❌ Failed to load sample")
                 else:
                     st.warning("Please enter a sample token")
+
+            if st.button("📦 Load entire nuScenes CAM_FRONT split for detection", key="load_all_nuscenes_entire_dataset"):
+                version = None
+                for d in Path(dataset_path).iterdir():
+                    if d.is_dir() and d.name.startswith("v1.0-"):
+                        version = d.name
+                        break
+                if version is None:
+                    st.error("❌ Could not determine nuScenes version (expected a 'v1.0-*' directory).")
+                else:
+                    with st.spinner("Indexing all nuScenes CAM_FRONT samples..."):
+                        loader = NuScenesDatasetLoader(dataroot=str(dataset_path), version=version, verbose=False)
+                        loader.load_dataset()
+                        camera_samples = loader.get_camera_samples(camera_channel="CAM_FRONT")
+                        batch_samples = []
+                        for item in camera_samples:
+                            batch_samples.append({
+                                "dataset_type": "nuscenes",
+                                "dataset_path": dataset_path,
+                                "sample_index": item["sample_token"],
+                                "image_path": item.get("image_path", ""),
+                                "point_cloud_path": "",
+                            })
+                    st.session_state.batch_samples = batch_samples
+                    st.session_state.process_all_samples = True
+                    st.session_state.batch_samples_saved = True
+                    st.success(
+                        f"✅ Prepared all {len(batch_samples)} nuScenes CAM_FRONT samples. "
+                        "Go to **2_Detection** and click **Process entire batch**."
+                    )
+                    st.rerun()
 
             # nuScenes: simple subsampling (every n-th sample) + send to detection
 
@@ -701,22 +819,83 @@ def main():
                         else:
                             st.error("❌ Failed to load SUNRGBD sample")
 
+                col_sun_all, col_sun_val = st.columns(2)
+                with col_sun_all:
+                    if st.button("📦 Load entire SUNRGBD dataset for detection", key="load_all_sunrgbd_entire_dataset"):
+                        batch_samples: List[Dict[str, Any]] = []
+                        for idx, sample in enumerate(sun_samples):
+                            batch_samples.append(
+                                {
+                                    "dataset_type": "sunrgbd",
+                                    "dataset_path": dataset_path,
+                                    "sample_index": int(idx),
+                                    "image_path": sample.get("image_path", ""),
+                                    "point_cloud_path": "",
+                                }
+                            )
+                        st.session_state.batch_samples = batch_samples
+                        st.session_state.process_all_samples = True
+                        st.session_state.batch_samples_saved = True
+                        st.success(
+                            f"✅ Prepared all {len(batch_samples)} SUNRGBD samples. "
+                            "Go to **2_Detection** and click **Process entire batch**."
+                        )
+                        st.rerun()
+                with col_sun_val:
+                    n_val = len(sunrgbd_val_split_indices_zero_based(num_samples))
+                    if st.button(
+                        f"📦 Load val split ({SUNRGBD_VAL_SPLIT_1BASED_START}–{SUNRGBD_VAL_SPLIT_1BASED_END}, n={n_val})",
+                        key="load_sunrgbd_val_split_for_detection",
+                        help="Standard validation set (1-based scene indices 1..5050) for paper-comparable eval.",
+                    ):
+                        batch_samples = []
+                        for idx in sunrgbd_val_split_indices_zero_based(num_samples):
+                            sample = sun_samples[int(idx)]
+                            batch_samples.append(
+                                {
+                                    "dataset_type": "sunrgbd",
+                                    "dataset_path": dataset_path,
+                                    "sample_index": int(idx),
+                                    "image_path": sample.get("image_path", ""),
+                                    "point_cloud_path": "",
+                                }
+                            )
+                        st.session_state.batch_samples = batch_samples
+                        st.session_state.process_all_samples = True
+                        st.session_state.batch_samples_saved = True
+                        st.success(
+                            f"✅ Prepared {len(batch_samples)} SUNRGBD validation samples "
+                            f"({SUNRGBD_VAL_SPLIT_1BASED_START}..{SUNRGBD_VAL_SPLIT_1BASED_END} 1-based). "
+                            "Go to **2_Detection** / **3_Evaluation** as needed."
+                        )
+                        st.rerun()
+
                 st.markdown("---")
                 st.subheader("🖼️ Batch Preparation (SUNRGBD)")
                 st.markdown(
-                    "Subsample indexed scenes (**every n-th** or a **seeded random subset**), click **Prepare batch** "
-                    "to preview the selection, then **Load samples for detection** to register selected scene indices "
-                    "for **2_Detection**."
+                    "Subsample indexed scenes (**every n-th**, **random**, or **official val 1–5050**), "
+                    "click **Prepare batch** to preview, then **Load samples for detection** to register indices "
+                    "for **2_Detection** / **3_Evaluation**."
                 )
 
                 sunrgbd_sampling_mode = st.radio(
                     "SUNRGBD batch sampling",
-                    ("Every n-th scene", "Random subset (fixed size + seed)"),
+                    (
+                        "Every n-th scene",
+                        "Random subset (fixed size + seed)",
+                        f"Official val split (1–{SUNRGBD_VAL_SPLIT_1BASED_END}, paper-comparable)",
+                    ),
                     horizontal=True,
                     key="sunrgbd_sampling_mode",
                 )
 
-                if sunrgbd_sampling_mode == "Every n-th scene":
+                if sunrgbd_sampling_mode == f"Official val split (1–{SUNRGBD_VAL_SPLIT_1BASED_END}, paper-comparable)":
+                    st.caption(
+                        f"Uses scene order after **numeric** ID sort: 1-based indices "
+                        f"{SUNRGBD_VAL_SPLIT_1BASED_START}..{SUNRGBD_VAL_SPLIT_1BASED_END} "
+                        f"({len(sunrgbd_val_split_indices_zero_based(num_samples))} scenes on disk)."
+                    )
+                elif sunrgbd_sampling_mode == "Every n-th scene":
                     col_s1, col_s2 = st.columns(2)
                     with col_s1:
                         sun_stride = st.number_input(
@@ -758,7 +937,15 @@ def main():
 
                 if st.button("📚 Prepare SUNRGBD batch", type="primary", key="prepare_sunrgbd_batch"):
                     with st.spinner("Preparing SUNRGBD batch selection..."):
-                        if sunrgbd_sampling_mode == "Every n-th scene":
+                        if sunrgbd_sampling_mode == f"Official val split (1–{SUNRGBD_VAL_SPLIT_1BASED_END}, paper-comparable)":
+                            indices = np.array(
+                                sunrgbd_val_split_indices_zero_based(num_samples), dtype=int
+                            )
+                            mode_desc = (
+                                f"official val (1-based {SUNRGBD_VAL_SPLIT_1BASED_START}.."
+                                f"{SUNRGBD_VAL_SPLIT_1BASED_END}, n={len(indices)})"
+                            )
+                        elif sunrgbd_sampling_mode == "Every n-th scene":
                             step = int(sun_stride)
                             start_idx = int(sun_start)
                             indices = _every_nth_indices(num_samples, step, start_idx)
@@ -1236,6 +1423,29 @@ def main():
 
                         subset = handler.subsets[selected_subset]
                         links = subset['links']
+
+                        if st.button(
+                            "📦 Load entire selected Sim subset for detection",
+                            key=f"load_all_sim_entire_subset_{selected_subset}",
+                        ):
+                            batch_samples = []
+                            for link in links:
+                                image_path = _sim_rgb_path_for_link(dataset_path, selected_subset, link)
+                                batch_samples.append({
+                                    "dataset_type": "sim",
+                                    "dataset_path": dataset_path,
+                                    "sample_index": link["token"],
+                                    "image_path": str(image_path) if image_path is not None else "",
+                                    "point_cloud_path": "",
+                                })
+                            st.session_state.batch_samples = batch_samples
+                            st.session_state.process_all_samples = True
+                            st.session_state.batch_samples_saved = True
+                            st.success(
+                                f"✅ Prepared all {len(batch_samples)} samples from subset `{selected_subset}`. "
+                                "Go to **2_Detection** and click **Process entire batch**."
+                            )
+                            st.rerun()
                         
                         ensure_filter_state("sim")
 

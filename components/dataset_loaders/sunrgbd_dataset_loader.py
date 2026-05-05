@@ -21,6 +21,27 @@ from components.core.pointcloud_projection import load_sunrgbd_calibration
 SUNRGBD_KEEP_FRACTION_SESSION_KEY = "sunrgbd_keep_fraction"
 SUNRGBD_KEEP_FRACTION_DEFAULT = 0.8
 
+# Official SUNRGBD trainval validation range (1-based scene index; paper-comparable).
+# After numeric sorting of scene IDs, this is samples[0]..samples[5049] (0-based).
+SUNRGBD_VAL_SPLIT_1BASED_START = 1
+SUNRGBD_VAL_SPLIT_1BASED_END = 5050
+
+
+def sunrgbd_val_split_indices_zero_based(num_samples: int) -> List[int]:
+    """
+    0-based indices for the standard validation split (1-based scenes 1..5050).
+
+    Assumes ``load_dataset`` orders ``sample_ids`` with numeric sort so index
+    :math:`k` matches scene order used in common benchmarks.
+    """
+    if num_samples <= 0:
+        return []
+    start_z = SUNRGBD_VAL_SPLIT_1BASED_START - 1
+    end_excl = min(num_samples, SUNRGBD_VAL_SPLIT_1BASED_END)
+    if start_z >= end_excl:
+        return []
+    return list(range(start_z, end_excl))
+
 
 def sunrgbd_keep_fraction_for_load() -> float:
     """
@@ -51,8 +72,8 @@ class SUNRGBDDatasetLoader:
         calib/<id>.txt
         depth/<id>.mat
         image/<id>.jpg
-        label/<id>.txt      (preferred, version 2)
-        label_v1/<id>.txt   (fallback)
+        label_v1/<id>.txt   (preferred; matches upright-depth .mat point clouds)
+        label/<id>.txt      (fallback, version 2)
     """
 
     def __init__(self, dataroot: str):
@@ -91,14 +112,18 @@ class SUNRGBDDatasetLoader:
             if p.suffix.lower() == ".txt":
                 calib_map[p.stem] = p
 
-        sample_ids = sorted(set(image_map.keys()) & set(depth_map.keys()) & set(calib_map.keys()))
+        raw_ids = set(image_map.keys()) & set(depth_map.keys()) & set(calib_map.keys())
+        # Numeric order matches standard train/val index conventions (1..N), not lexicographic.
+        sample_ids = sorted(
+            raw_ids, key=lambda s: (0, int(s)) if str(s).isdigit() else (1, str(s))
+        )
         for sample_id in sample_ids:
             annotation_v2_path = label_dir / f"{sample_id}.txt"
             annotation_v1_path = label_v1_dir / f"{sample_id}.txt"
-            if annotation_v2_path.exists():
-                annotation_path = annotation_v2_path
-            elif annotation_v1_path.exists():
+            if annotation_v1_path.exists():
                 annotation_path = annotation_v1_path
+            elif annotation_v2_path.exists():
+                annotation_path = annotation_v2_path
             else:
                 annotation_path = None
             self.samples.append(

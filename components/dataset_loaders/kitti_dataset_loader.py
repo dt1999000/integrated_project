@@ -7,6 +7,27 @@ import os
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 
+KITTI_TRAIN_SPLIT_COUNT = 3712
+KITTI_VAL_SPLIT_COUNT = 3769
+KITTI_TOTAL_TRAINING_SAMPLES = KITTI_TRAIN_SPLIT_COUNT + KITTI_VAL_SPLIT_COUNT
+
+
+def kitti_train_split_positions(total_samples: int) -> List[int]:
+    """
+    Return the official KITTI train split positions [0, 3711] clipped by available samples.
+    """
+    n = max(0, min(int(total_samples), KITTI_TOTAL_TRAINING_SAMPLES))
+    return list(range(0, min(KITTI_TRAIN_SPLIT_COUNT, n)))
+
+
+def kitti_val_split_positions(total_samples: int) -> List[int]:
+    """
+    Return the official KITTI val split positions [3712, 7480] clipped by available samples.
+    """
+    n = max(0, min(int(total_samples), KITTI_TOTAL_TRAINING_SAMPLES))
+    start = min(KITTI_TRAIN_SPLIT_COUNT, n)
+    return list(range(start, n))
+
 
 class KITTIDatasetLoader:
     """Class to load and process KITTI dataset - matches NuScenes interface."""

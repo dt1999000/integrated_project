@@ -673,6 +673,184 @@ def compute_frame_metrics_at_iou(
     }
 
 
+def _detection_confidence_for_pr(det: Dict) -> float:
+    """
+    Sort key for PR-curve AP: higher means process this detection earlier
+    (higher "confidence" first).
+    """
+    c = det.get("confidence")
+    if c is None:
+        return 0.0
+    cf = float(c)
+    if not math.isfinite(cf):
+        return 0.0
+    return float(np.clip(cf, 0.0, 1.0))
+
+
+def average_precision_under_pr_curve(recalls: np.ndarray, precisions: np.ndarray) -> float:
+    """
+    Detection AP computed as step-wise area under the monotonic precision
+    envelope (not trapezoidal interpolation).
+    """
+    if recalls.size == 0:
+        return 0.0
+    rec = np.concatenate(([0.0], recalls.astype(np.float64), [1.0]))
+    prec = np.concatenate(([0.0], precisions.astype(np.float64), [0.0]))
+    for i in range(len(prec) - 2, -1, -1):
+        prec[i] = max(prec[i], prec[i + 1])
+    idx = np.where(rec[1:] != rec[:-1])[0] + 1
+    return float(np.sum((rec[idx] - rec[idx - 1]) * prec[idx]))
+
+
+def _ap_pr_single_bucket(
+    samples: List[Tuple[int, List[Dict], List[Dict]]],
+    iou_threshold: float,
+    *,
+    category_filter: Optional[str],
+) -> Tuple[float, List[float], List[float]]:
+    """
+    One AP from a PR curve. If ``category_filter`` is None, pool all classes:
+    any GT may match any detection (IoU only). Otherwise only that category's
+    GT and detections participate; matching is restricted to same category.
+    """
+    if category_filter is None:
+        n_gt_total = sum(len(gt) for _, gt, _ in samples)
+        det_entries: List[Tuple[int, Dict, float]] = []
+        for fi, _gt, det_list in samples:
+            for det in det_list:
+                det_entries.append((fi, det, _detection_confidence_for_pr(det)))
+    else:
+        c = category_filter
+        n_gt_total = 0
+        det_entries = []
+        for fi, gt_list, det_list in samples:
+            for gi, gt in enumerate(gt_list):
+                if gt.get("category", "Unknown") == c:
+                    n_gt_total += 1
+            for det in det_list:
+                if det.get("category", "Unknown") == c:
+                    det_entries.append((fi, det, _detection_confidence_for_pr(det)))
+
+    det_entries.sort(key=lambda x: (-x[2], x[0]))
+
+    matched_gt: Set[Tuple[int, int]] = set()
+    precisions: List[float] = []
+    recalls: List[float] = []
+    cum_tp = 0
+    cum_fp = 0
+
+    for fi, det, _sc in det_entries:
+        gt_list = samples[fi][1]
+        best_gi = -1
+        best_iou = 0.0
+        for gi, gt in enumerate(gt_list):
+            if (fi, gi) in matched_gt:
+                continue
+            if category_filter is not None:
+                if gt.get("category", "Unknown") != category_filter:
+                    continue
+                if det.get("category", "Unknown") != category_filter:
+                    continue
+            iou = compute_3d_iou(gt, det)
+            if iou > best_iou:
+                best_iou = iou
+                best_gi = gi
+
+        if best_iou >= iou_threshold and best_gi >= 0:
+            matched_gt.add((fi, best_gi))
+            cum_tp += 1
+        else:
+            cum_fp += 1
+
+        denom = cum_tp + cum_fp
+        precisions.append(cum_tp / denom if denom > 0 else 0.0)
+        recalls.append(cum_tp / n_gt_total if n_gt_total > 0 else 0.0)
+
+    ap = average_precision_under_pr_curve(
+        np.asarray(recalls, dtype=np.float64),
+        np.asarray(precisions, dtype=np.float64),
+    )
+    return ap, precisions, recalls
+
+
+def compute_pr_map_at_iou(
+    batch_results: List[Dict],
+    iou_threshold: float,
+    match_by_category: bool,
+) -> Dict:
+    """
+    Mean AP (mAP) at a fixed 3D IoU threshold as the mean of per-class AP,
+    where each AP is the area under the precision–recall curve.
+
+    For each class, detections of that class are sorted by
+    ``_detection_confidence_for_pr`` (global across frames); each GT box is
+    matched at most once per class.
+
+    Args:
+        batch_results: Same as ``compute_batch_ap`` (evaluable samples with GT).
+        iou_threshold: IoU threshold for a TP (e.g. 0.5 or 0.25).
+        match_by_category: If True, mAP is the unweighted mean of per-class AP
+            over classes with at least one GT. If False, one pooled AP treats
+            all categories together (``map_pr`` equals ``micro_ap_pr``).
+
+    Returns:
+        Dict with ``map_pr``, ``micro_ap_pr`` (pooled PR-AUC), ``per_class_pr_ap``,
+        ``per_class_pr_curves`` (raw per-class PR points), ``n_gt_per_class``,
+        optional micro PR point lists, and ``iou_threshold``.
+    """
+    samples: List[Tuple[int, List[Dict], List[Dict]]] = []
+    for i, sample in enumerate(batch_results):
+        gt = _normalize_gt_cuboids(sample.get("ground_truth_cuboids", []))
+        det = list(sample.get("detected_cuboids", []))
+        samples.append((i, gt, det))
+
+    n_gt_per_class: Dict[str, int] = {}
+    for _fi, gt_list, _ in samples:
+        for gt in gt_list:
+            lab = gt.get("category", "Unknown")
+            n_gt_per_class[lab] = n_gt_per_class.get(lab, 0) + 1
+
+    micro_ap, micro_prec, micro_rec = _ap_pr_single_bucket(
+        samples, iou_threshold, category_filter=None
+    )
+
+    per_class_ap: Dict[str, float] = {}
+    per_class_pr_curves: Dict[str, Dict[str, List[float]]] = {}
+    if match_by_category:
+        for c in sorted(n_gt_per_class.keys()):
+            nk = n_gt_per_class[c]
+            if nk == 0:
+                continue
+            ap_c, prec_c, rec_c = _ap_pr_single_bucket(
+                samples, iou_threshold, category_filter=c
+            )
+            per_class_ap[c] = ap_c
+            per_class_pr_curves[c] = {
+                "precisions": [float(v) for v in prec_c],
+                "recalls": [float(v) for v in rec_c],
+                "n_gt": int(nk),
+            }
+        classes_with_gt = [c for c, nk in n_gt_per_class.items() if nk > 0]
+        map_pr = (
+            float(np.mean([per_class_ap[c] for c in classes_with_gt]))
+            if classes_with_gt
+            else 0.0
+        )
+    else:
+        map_pr = micro_ap
+
+    return {
+        "map_pr": map_pr,
+        "micro_ap_pr": micro_ap,
+        "per_class_pr_ap": per_class_ap,
+        "per_class_pr_curves": per_class_pr_curves,
+        "n_gt_per_class": dict(n_gt_per_class),
+        "pr_recalls_micro": micro_rec,
+        "pr_precisions_micro": micro_prec,
+        "iou_threshold": iou_threshold,
+    }
+
+
 def compute_batch_ap(
     batch_results: List[Dict],
     iou_threshold: float = 0.5,
@@ -681,11 +859,11 @@ def compute_batch_ap(
     """
     Batch-level detection metrics at a fixed 3D IoU threshold.
 
-    True Average Precision (area under the precision–recall curve) is not
-    computed because per-detection confidence scores are not available.
-    Instead this returns **micro** precision/recall/F1 over all TPs/FPs/FNs
-    pooled across frames, and **macro_f1**: the unweighted mean of each
-    class's F1 (each class F1 uses micro TP/FP/FN pooled for that class).
+    Returns **micro** precision/recall/F1 over all TPs/FPs/FNs pooled across
+    frames, **macro_f1**, and **PR-curve mAP** (``map_pr``): mean of per-class
+    AP as area under the precision–recall curve when ``match_by_category`` is
+    True; otherwise a single pooled AP (see ``compute_pr_map_at_iou``).
+    Detection ordering uses the exported ``confidence`` score.
 
     Args:
         batch_results: List of sample dicts from
@@ -698,7 +876,7 @@ def compute_batch_ap(
     Returns:
         Dict with macro_f1, precision, recall, f1 (micro), total_tp/fp/fn,
         per_frame_metrics (list), per_class (dict with precision, recall, f1),
-        and iou_threshold.
+        iou_threshold, and PR fields from ``compute_pr_map_at_iou``.
     """
     total_tp = 0
     total_fp = 0
@@ -749,6 +927,8 @@ def compute_batch_ap(
 
     macro_f1 = float(np.mean(f1_per_class)) if f1_per_class else f1
 
+    pr_stats = compute_pr_map_at_iou(batch_results, iou_threshold, match_by_category)
+
     return {
         "macro_f1": macro_f1,
         "precision": precision,
@@ -760,6 +940,13 @@ def compute_batch_ap(
         "per_frame_metrics": per_frame_metrics,
         "per_class": per_class,
         "iou_threshold": iou_threshold,
+        "map_pr": pr_stats["map_pr"],
+        "micro_ap_pr": pr_stats["micro_ap_pr"],
+        "per_class_pr_ap": pr_stats["per_class_pr_ap"],
+        "per_class_pr_curves": pr_stats["per_class_pr_curves"],
+        "n_gt_per_class_pr": pr_stats["n_gt_per_class"],
+        "pr_recalls_micro": pr_stats["pr_recalls_micro"],
+        "pr_precisions_micro": pr_stats["pr_precisions_micro"],
     }
 
 
@@ -833,6 +1020,12 @@ def _azimuth_bin_label(
         lo = i * span / float(n_bins)
         hi = (i + 1) * span / float(n_bins)
         return f"|θ| {lo:.0f}°–{hi:.0f}°"
+
+    if angular_mode == "rot_clip":
+        span = max(1e-9, float(angle_span_deg))
+        lo = i * span / float(n_bins)
+        hi = (i + 1) * span / float(n_bins)
+        return f"{lo:.0f}°–{hi:.0f}°"
 
     span = 360.0 if angular_mode == "full360" else max(1e-9, float(angle_span_deg))
     lo = i * span / float(n_bins)
@@ -968,8 +1161,9 @@ def compute_batch_statistics(
     Compute comprehensive batch evaluation statistics at IoU 0.5 and 0.25.
 
     ``ap_50`` / ``ap_25`` hold micro precision/recall/F1, macro-F1 per class,
-    and per-frame breakdowns (see ``compute_batch_ap``). True AP is not
-    computed without detection scores.
+    per-frame breakdowns (see ``compute_batch_ap``), and **mAP** as mean
+    per-class AP under the PR curve (``map_pr``), using exported detection
+    ``confidence`` for ranking.
 
     Args:
         batch_results: List of sample dicts from
