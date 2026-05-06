@@ -4,7 +4,6 @@ Unified detection pipeline with step-by-step execution and full pipeline mode.
 """
 import json
 import os
-import textwrap
 import time
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
@@ -45,6 +44,7 @@ from components.utils.visualization_helper import (
     create_3d_scatter_plot,
     generate_distinct_colors,
     overlay_masks_on_image,
+    render_point_cloud_plot as shared_render_point_cloud_plot,
 )
 from components.core.llm_service import (
     set_llm_temperature,
@@ -120,184 +120,11 @@ def _render_point_cloud_plot(
     export_basename: str,
     use_container_width: bool = False,
 ) -> None:
-    """Render point-cloud Plotly chart with high-resolution export controls."""
-    def _build_structured_pointcloud_html(plot_fig: go.Figure, plot_name: str) -> str:
-        fig_dict = plot_fig.to_dict()
-        data_json = json.dumps(fig_dict.get("data", []), indent=2)
-        layout_json = json.dumps(fig_dict.get("layout", {}), indent=2)
-        config_json = json.dumps({"responsive": True, "displaylogo": False}, indent=2)
-        return textwrap.dedent(
-            f"""\
-            <!doctype html>
-            <html lang="en">
-            <head>
-              <meta charset="utf-8" />
-              <meta name="viewport" content="width=device-width, initial-scale=1" />
-              <title>{plot_name}</title>
-              <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-            </head>
-            <body style="margin:0;">
-              <div id="pointcloud_plot" style="width:100vw; height:100vh;"></div>
-              <script>
-                // =========================================================================
-                // POINT CLOUD DATA (all traces / 3D points)
-                // =========================================================================
-                const pointCloudData = {data_json};
-
-                // =========================================================================
-                // LEGEND + CAPTION/TITLE + AXES (layout styling lives here)
-                // =========================================================================
-                const pointCloudLayout = {layout_json};
-
-                // =========================================================================
-                // EXPORT + INTERACTION OPTIONS
-                // =========================================================================
-                const pointCloudConfig = {config_json};
-
-                Plotly.newPlot("pointcloud_plot", pointCloudData, pointCloudLayout, pointCloudConfig);
-              </script>
-            </body>
-            </html>
-            """
-        )
-
-    # Streamlit in-app display (smaller, balanced for embedded charts)
-    display_legend_font_size = 12
-    display_caption_font_size = 14
-    display_axis_title_font_size = 12
-    display_axis_tick_font_size = 11
-    # Downloaded HTML / high-res export (edit these if you tune the exported file instead)
-    export_legend_font_size = 28
-    export_caption_font_size = 36
-    export_axis_title_font_size = 26
-    export_axis_tick_font_size = 24
-
-    axis_tick_settings = {
-        "x": {"nticks": 2, "dtick": None},
-        "y": {"nticks": 2, "dtick": None},
-        "z": {"nticks": 2, "dtick": None},
-    }
-    # Set any axis to [min, max] to force range, or keep None for auto-range.
-    axis_range_overrides = {
-        "x": None,
-        "y": None,
-        "z": None,
-    }
-
-    def _scene_axis(
-        axis_key: str,
-        title_text: str,
-        range_override: Optional[List[float]],
-        axis_title_font_size: int,
-        axis_tick_font_size: int,
-    ) -> Dict[str, Any]:
-        axis_cfg: Dict[str, Any] = {
-            "title": {"text": title_text, "font": {"size": axis_title_font_size}},
-            "tickfont": {"size": axis_tick_font_size},
-        }
-        tick_cfg = axis_tick_settings.get(axis_key, {})
-        axis_cfg["nticks"] = tick_cfg.get("nticks", 8)
-        if tick_cfg.get("dtick") is not None:
-            axis_cfg["dtick"] = tick_cfg["dtick"]
-        if range_override is not None:
-            axis_cfg["range"] = range_override
-        return axis_cfg
-
-    fig.update_layout(
-        legend=dict(
-            font=dict(size=display_legend_font_size),
-            title=dict(font=dict(size=display_legend_font_size)),
-            itemsizing="constant",
-        ),
-        title=dict(font=dict(size=display_caption_font_size)),
-        scene=dict(
-            xaxis=_scene_axis(
-                "x",
-                "X (m)",
-                axis_range_overrides["x"],
-                display_axis_title_font_size,
-                display_axis_tick_font_size,
-            ),
-            yaxis=_scene_axis(
-                "y",
-                "Y (m)",
-                axis_range_overrides["y"],
-                display_axis_title_font_size,
-                display_axis_tick_font_size,
-            ),
-            zaxis=_scene_axis(
-                "z",
-                "Z (m)",
-                axis_range_overrides["z"],
-                display_axis_title_font_size,
-                display_axis_tick_font_size,
-            ),
-        ),
-    )
-    export_config = {
-        "toImageButtonOptions": {
-            "format": "png",
-            "filename": export_basename,
-            "width": 2200,
-            "height": 1400,
-            "scale": 2,
-        },
-        "displaylogo": False,
-    }
-
-    if use_container_width:
-        st.plotly_chart(fig, use_container_width=True, config=export_config)
-    else:
-        st.plotly_chart(fig, config=export_config)
-
-    export_fig = go.Figure(fig)
-    export_fig.update_layout(
-        width=1920,
-        height=1080,
-        autosize=True,
-        margin=dict(l=10, r=10, t=55, b=10),
-        legend=dict(
-            font=dict(size=export_legend_font_size),
-            title=dict(font=dict(size=export_legend_font_size)),
-            itemsizing="constant",
-        ),
-        title=dict(
-            font=dict(size=export_caption_font_size),
-            pad=dict(t=6, b=2),
-        ),
-        scene=dict(
-            domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
-            xaxis=_scene_axis(
-                "x",
-                "X (m)",
-                axis_range_overrides["x"],
-                export_axis_title_font_size,
-                export_axis_tick_font_size,
-            ),
-            yaxis=_scene_axis(
-                "y",
-                "Y (m)",
-                axis_range_overrides["y"],
-                export_axis_title_font_size,
-                export_axis_tick_font_size,
-            ),
-            zaxis=_scene_axis(
-                "z",
-                "Z (m)",
-                axis_range_overrides["z"],
-                export_axis_title_font_size,
-                export_axis_tick_font_size,
-            ),
-        ),
-    )
-
-    st.download_button(
-        "⬇️ Download interactive HTML (high quality)",
-        data=_build_structured_pointcloud_html(export_fig, export_basename),
-        file_name=f"{export_basename}.html",
-        mime="text/html",
-        key=f"plotly_html_export_{export_basename}",
-        width="stretch",
+    """Thin wrapper over shared point-cloud renderer."""
+    shared_render_point_cloud_plot(
+        fig=fig,
+        export_basename=export_basename,
+        use_container_width=use_container_width,
     )
 
 

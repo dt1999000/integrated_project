@@ -1128,11 +1128,9 @@ class GroundingDINOIntegration:
 
         Returns the same structure as :meth:`YOLOIntegration.detect_with_classes`.
         """
-        print(f"starting groundingdino detect", flush=True)
         if self._pipe is None:
             print("pipeline is None", flush=True)
             raise RuntimeError("Grounding DINO pipeline not loaded")
-        print("pipeline is not None", flush=True)
 
         arr = np.ascontiguousarray(image)
         if arr.dtype != np.uint8:
@@ -1146,10 +1144,9 @@ class GroundingDINOIntegration:
         )
 
         detections: List[Dict] = []
-        print(f"raw: {raw}", flush=True)
         if not raw:
             return detections
-        print("raw is not empty", flush=True)
+            
         for item in raw:
             score = float(item["score"])
             label = item["label"]
