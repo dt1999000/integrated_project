@@ -6,7 +6,7 @@ detected cuboids to ground truth annotations.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional, Set, Callable
 import math
 import numpy as np
 
@@ -14,6 +14,30 @@ from shapely.geometry import Polygon
 
 from ..dataset_loaders.kitti_dataset_loader import KITTIDatasetLoader
 import cv2
+
+KITTI_DIFFICULTY_RULES: Dict[str, Dict[str, float]] = {
+    "easy": {"min_height_px": 40.0, "max_occlusion": 0, "max_truncation": 0.15},
+    "moderate": {"min_height_px": 25.0, "max_occlusion": 1, "max_truncation": 0.30},
+    "hard": {"min_height_px": 25.0, "max_occlusion": 2, "max_truncation": 0.50},
+}
+
+
+def _normalize_eval_category_key(category: object) -> str:
+    """
+    Canonical class label for category-aware matching and per-class bookkeeping.
+
+    YOLO-World etc. often emit ``person`` while KITTI GT uses ``Pedestrian``.
+    """
+    raw = category
+    if raw is None:
+        label = ""
+    else:
+        label = str(raw).strip().lower()
+    if label in {"", "unknown"}:
+        return "unknown"
+    if label in {"person", "pedestrian"}:
+        return "pedestrian"
+    return label
 
 
 # =============================================================================
@@ -391,7 +415,7 @@ class CuboidMatcher:
         # Match each detected cuboid to nearest GT
         for det_idx, det in enumerate(detected_cuboids):
             det_center = self.get_cuboid_center(det)
-            det_category = det.get('category', 'Unknown')
+            det_category = det.get("category", det.get("class", "Unknown"))
 
             best_match_idx = None
             best_dist = self.max_distance
@@ -401,10 +425,12 @@ class CuboidMatcher:
                 if gt_idx in matched_gt_indices:
                     continue
 
-                gt_category = gt.get('category', 'Unknown')
+                gt_category = gt.get("category", gt.get("class", "Unknown"))
 
                 # Category check if enabled
-                if self.match_by_category and det_category != gt_category:
+                if self.match_by_category and _normalize_eval_category_key(
+                    det_category
+                ) != _normalize_eval_category_key(gt_category):
                     continue
 
                 gt_center = self.get_cuboid_center(gt)
@@ -450,21 +476,21 @@ class CuboidMatcher:
 
         # Count true positives per category
         for gt_idx, det_idx, dist in match_result.matches:
-            cat = gt_cuboids[gt_idx].get('category', 'Unknown')
+            cat = _normalize_eval_category_key(gt_cuboids[gt_idx].get("category", gt_cuboids[gt_idx].get("class", "Unknown")))
             if cat not in category_stats:
                 category_stats[cat] = {'TP': 0, 'FP': 0, 'FN': 0}
             category_stats[cat]['TP'] += 1
 
         # Count false negatives (unmatched GT)
         for gt_idx in match_result.unmatched_gt:
-            cat = gt_cuboids[gt_idx].get('category', 'Unknown')
+            cat = _normalize_eval_category_key(gt_cuboids[gt_idx].get("category", gt_cuboids[gt_idx].get("class", "Unknown")))
             if cat not in category_stats:
                 category_stats[cat] = {'TP': 0, 'FP': 0, 'FN': 0}
             category_stats[cat]['FN'] += 1
 
         # Count false positives (unmatched detections)
         for det_idx in match_result.unmatched_det:
-            cat = detected_cuboids[det_idx].get('category', 'Unknown')
+            cat = _normalize_eval_category_key(detected_cuboids[det_idx].get("category", detected_cuboids[det_idx].get("class", "Unknown")))
             if cat not in category_stats:
                 category_stats[cat] = {'TP': 0, 'FP': 0, 'FN': 0}
             category_stats[cat]['FP'] += 1
@@ -496,7 +522,9 @@ def _normalize_gt_cuboids(cuboids: List[Dict]) -> List[Dict]:
             k in gt and gt[k] is not None
             for k in ("min_x", "min_y", "min_z", "max_x", "max_y", "max_z")
         ):
-            normalized.append(gt)
+            norm_gt = dict(gt)
+            norm_gt["category"] = norm_gt.get("category", norm_gt.get("class", "Unknown"))
+            normalized.append(norm_gt)
             continue
 
         translation = gt.get("translation")
@@ -543,9 +571,11 @@ def greedy_iou_match(
 
     iou_matrix = np.zeros((n_gt, n_det), dtype=np.float64)
     for gi, gt in enumerate(gt_cuboids):
-        gt_cat = gt.get("category", "Unknown")
+        gt_cat = gt.get("category", gt.get("class", "Unknown"))
         for di, det in enumerate(detected_cuboids):
-            if match_by_category and gt_cat != det.get("category", "Unknown"):
+            if match_by_category and _normalize_eval_category_key(gt_cat) != _normalize_eval_category_key(
+                det.get("category", det.get("class", "Unknown"))
+            ):
                 continue
             iou_matrix[gi, di] = compute_3d_iou(gt, det)
 
@@ -611,7 +641,7 @@ def compute_frame_metrics_at_iou(
 
     if n_gt == 0:
         for det in detected_cuboids:
-            cat = det.get("category", "Unknown")
+            cat = _normalize_eval_category_key(det.get("category", det.get("class", "Unknown")))
             per_class_fp[cat] = per_class_fp.get(cat, 0) + 1
         per_class = {c: {"TP": 0, "FP": per_class_fp[c], "FN": 0} for c in per_class_fp}
         return {
@@ -622,7 +652,7 @@ def compute_frame_metrics_at_iou(
 
     if n_det == 0:
         for gt in gt_cuboids:
-            cat = gt.get("category", "Unknown")
+            cat = _normalize_eval_category_key(gt.get("category", gt.get("class", "Unknown")))
             per_class_fn[cat] = per_class_fn.get(cat, 0) + 1
         per_class = {c: {"TP": 0, "FP": 0, "FN": per_class_fn[c]} for c in per_class_fn}
         return {
@@ -636,15 +666,15 @@ def compute_frame_metrics_at_iou(
     )
 
     for gi, di in tp_pairs:
-        cat = gt_cuboids[gi].get("category", "Unknown")
+        cat = _normalize_eval_category_key(gt_cuboids[gi].get("category", gt_cuboids[gi].get("class", "Unknown")))
         per_class_tp[cat] = per_class_tp.get(cat, 0) + 1
 
     for di in unmatched_det:
-        cat = detected_cuboids[di].get("category", "Unknown")
+        cat = _normalize_eval_category_key(detected_cuboids[di].get("category", detected_cuboids[di].get("class", "Unknown")))
         per_class_fp[cat] = per_class_fp.get(cat, 0) + 1
 
     for gi in unmatched_gt:
-        cat = gt_cuboids[gi].get("category", "Unknown")
+        cat = _normalize_eval_category_key(gt_cuboids[gi].get("category", gt_cuboids[gi].get("class", "Unknown")))
         per_class_fn[cat] = per_class_fn.get(cat, 0) + 1
 
     tp = len(tp_pairs)
@@ -702,12 +732,246 @@ def average_precision_under_pr_curve(recalls: np.ndarray, precisions: np.ndarray
     return float(np.sum((rec[idx] - rec[idx - 1]) * prec[idx]))
 
 
+def ap_r11(recalls: np.ndarray, precisions: np.ndarray) -> float:
+    """
+    AP on the classic 11-point interpolation grid (0.0..1.0 recall).
+    """
+    recalls = np.asarray(recalls, dtype=np.float64)
+    precisions = np.asarray(precisions, dtype=np.float64)
+    recall_levels = np.linspace(0.0, 1.0, 11)
+    ap = 0.0
+    for r in recall_levels:
+        valid = precisions[recalls >= r]
+        p_interp = valid.max() if valid.size > 0 else 0.0
+        ap += float(p_interp) / 11.0
+    return float(ap)
+
+
+def _kitti_box_height_px(cuboid: Dict) -> float:
+    if cuboid.get("bbox_height_px") is not None:
+        return max(0.0, float(cuboid.get("bbox_height_px")))
+    bbox_2d = cuboid.get("bbox_2d")
+    if not isinstance(bbox_2d, dict):
+        return 0.0
+    top = bbox_2d.get("top")
+    bottom = bbox_2d.get("bottom")
+    if top is None or bottom is None:
+        return 0.0
+    return max(0.0, float(bottom) - float(top))
+
+
+def _kitti_occlusion_level(cuboid: Dict) -> int:
+    occ_raw = cuboid.get("occlusion", cuboid.get("occluded", 3))
+    if isinstance(occ_raw, bool):
+        return 1 if occ_raw else 0
+    if isinstance(occ_raw, (int, np.integer)):
+        return int(occ_raw)
+    if isinstance(occ_raw, (float, np.floating)):
+        return int(occ_raw)
+    if isinstance(occ_raw, str):
+        value = occ_raw.strip().lower()
+        occ_map = {
+            "0": 0, "fully_visible": 0, "fully visible": 0,
+            "1": 1, "partly_occluded": 1, "partly occluded": 1, "partly": 1,
+            "2": 2, "largely_occluded": 2, "difficult_to_see": 2, "difficult to see": 2,
+            "3": 3, "unknown": 3,
+        }
+        if value in occ_map:
+            return occ_map[value]
+    return 3
+
+
+def _kitti_truncation(cuboid: Dict) -> float:
+    trunc = cuboid.get("truncation", cuboid.get("truncated", 1.0))
+    if trunc is None:
+        return 1.0
+    try:
+        return float(trunc)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def matches_kitti_difficulty(cuboid: Dict, difficulty: str) -> bool:
+    """
+    Check if a GT cuboid satisfies KITTI Easy/Moderate/Hard rules.
+    """
+    rules = KITTI_DIFFICULTY_RULES.get(str(difficulty).lower())
+    if rules is None:
+        return True
+    h = _kitti_box_height_px(cuboid)
+    occ = _kitti_occlusion_level(cuboid)
+    trunc = _kitti_truncation(cuboid)
+    return (
+        h >= rules["min_height_px"]
+        and occ <= int(rules["max_occlusion"])
+        and trunc <= rules["max_truncation"]
+    )
+
+
+def filter_kitti_samples_by_difficulty(
+    batch_results: List[Dict],
+    difficulty: str,
+) -> List[Dict]:
+    """
+    Return a copy of ``batch_results`` where each sample keeps only GT cuboids
+    that satisfy the selected KITTI difficulty.
+    """
+    filtered: List[Dict] = []
+    for sample in batch_results:
+        sample_copy = dict(sample)
+        gt_raw = sample_copy.get("ground_truth_cuboids")
+        if gt_raw is not None:
+            sample_copy["ground_truth_cuboids"] = [
+                gt for gt in (gt_raw or []) if matches_kitti_difficulty(gt, difficulty)
+            ]
+        filtered.append(sample_copy)
+    return filtered
+
+
+def _closest_gt_index_for_detection(
+    gt_cuboids: List[Dict],
+    detection: Dict,
+    *,
+    match_by_category: bool,
+) -> int:
+    """
+    Return index of closest GT by 3D center distance, or -1 when no candidate exists.
+    """
+    det_center = CuboidMatcher.get_cuboid_center(detection)
+    det_category = _normalize_eval_category_key(
+        detection.get("category", detection.get("class", "Unknown"))
+    )
+    best_idx = -1
+    best_dist = float("inf")
+    for gi, gt in enumerate(gt_cuboids):
+        gt_category = _normalize_eval_category_key(gt.get("category", gt.get("class", "Unknown")))
+        if match_by_category and gt_category != det_category:
+            continue
+        gt_center = CuboidMatcher.get_cuboid_center(gt)
+        dist = float(np.linalg.norm(det_center - gt_center))
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = gi
+    return best_idx
+
+
+def compute_kitti_difficulty_ap(
+    batch_results: List[Dict],
+    iou_threshold: float = 0.5,
+    match_by_category: bool = True,
+) -> Dict:
+    """
+    KITTI AP split by difficulty using nearest-GT pairing first.
+
+    Flow:
+    1) For each detection, find its closest GT (optionally class-constrained).
+    2) Assign detection to that GT's difficulty bucket (Easy/Moderate/Hard).
+    3) Per (difficulty, class), sort detections by confidence and compute PR:
+       - TP: IoU>=threshold with paired GT, and that GT not claimed yet.
+       - FP: otherwise.
+    4) Report AP under PR curve and AP_R11.
+    """
+    difficulties = ("easy", "moderate", "hard")
+    samples: Dict[int, Dict[str, List[Dict]]] = {}
+    n_gt: Dict[str, Dict[str, int]] = {d: {} for d in difficulties}
+    det_entries: Dict[str, Dict[str, List[Tuple[int, Dict, int, float]]]] = {
+        d: {} for d in difficulties
+    }
+
+    for fi, sample in enumerate(batch_results):
+        gt_list = _normalize_gt_cuboids(sample.get("ground_truth_cuboids", []) or [])
+        det_list = list(sample.get("detected_cuboids", []) or [])
+        samples[fi] = {"gt": gt_list, "det": det_list}
+
+        gt_difficulties: List[List[str]] = []
+        for gt in gt_list:
+            gt_cat = _normalize_eval_category_key(gt.get("category", gt.get("class", "Unknown")))
+            gt_diff_list: List[str] = []
+            for d in difficulties:
+                if matches_kitti_difficulty(gt, d):
+                    n_gt[d][gt_cat] = n_gt[d].get(gt_cat, 0) + 1
+                    gt_diff_list.append(d)
+            gt_difficulties.append(gt_diff_list)
+
+        for det in det_list:
+            gi = _closest_gt_index_for_detection(
+                gt_list, det, match_by_category=match_by_category
+            )
+            if gi < 0:
+                continue
+            d_list = gt_difficulties[gi]
+            if not d_list:
+                continue
+            gt_cat = _normalize_eval_category_key(
+                gt_list[gi].get("category", gt_list[gi].get("class", "Unknown"))
+            )
+            score = _detection_confidence_for_pr(det)
+            for d in d_list:
+                det_entries[d].setdefault(gt_cat, []).append(
+                    (fi, det, gi, score)
+                )
+
+    per_difficulty_per_class: Dict[str, Dict[str, Dict]] = {d: {} for d in difficulties}
+    for d in difficulties:
+        for cat, entries in det_entries[d].items():
+            entries.sort(key=lambda x: (-x[3], x[0]))
+            npos = int(n_gt[d].get(cat, 0))
+            matched_gt: Set[Tuple[int, int]] = set()
+            precisions: List[float] = []
+            recalls: List[float] = []
+            cum_tp = 0
+            cum_fp = 0
+
+            for fi, det, gi, _score in entries:
+                gt = samples[fi]["gt"][gi]
+                gt_key = (fi, gi)
+                valid_pair = True
+                gt_cat_norm = _normalize_eval_category_key(gt.get("category", gt.get("class", "Unknown")))
+                det_cat_norm = _normalize_eval_category_key(det.get("category", det.get("class", "Unknown")))
+                if match_by_category and gt_cat_norm != det_cat_norm:
+                    valid_pair = False
+                iou = compute_3d_iou(gt, det) if valid_pair else 0.0
+                if gt_key not in matched_gt and iou >= iou_threshold:
+                    matched_gt.add(gt_key)
+                    cum_tp += 1
+                else:
+                    cum_fp += 1
+                denom = cum_tp + cum_fp
+                precisions.append(cum_tp / denom if denom > 0 else 0.0)
+                recalls.append(cum_tp / npos if npos > 0 else 0.0)
+
+            rec_np = np.asarray(recalls, dtype=np.float64)
+            prec_np = np.asarray(precisions, dtype=np.float64)
+            per_difficulty_per_class[d][cat] = {
+                "n_gt": npos,
+                "ap_pr": average_precision_under_pr_curve(rec_np, prec_np),
+                "ap_r11": ap_r11(rec_np, prec_np),
+                "precisions": [float(v) for v in precisions],
+                "recalls": [float(v) for v in recalls],
+            }
+
+        for cat, npos in n_gt[d].items():
+            if cat not in per_difficulty_per_class[d]:
+                per_difficulty_per_class[d][cat] = {
+                    "n_gt": int(npos),
+                    "ap_pr": 0.0,
+                    "ap_r11": 0.0,
+                    "precisions": [],
+                    "recalls": [],
+                }
+
+    return {
+        "iou_threshold": float(iou_threshold),
+        "per_difficulty_per_class": per_difficulty_per_class,
+    }
+
+
 def _ap_pr_single_bucket(
     samples: List[Tuple[int, List[Dict], List[Dict]]],
     iou_threshold: float,
     *,
     category_filter: Optional[str],
-) -> Tuple[float, List[float], List[float]]:
+) -> Tuple[float, float, List[float], List[float]]:
     """
     One AP from a PR curve. If ``category_filter`` is None, pool all classes:
     any GT may match any detection (IoU only). Otherwise only that category's
@@ -723,12 +987,13 @@ def _ap_pr_single_bucket(
         c = category_filter
         n_gt_total = 0
         det_entries = []
+        cn = _normalize_eval_category_key(c)
         for fi, gt_list, det_list in samples:
             for gi, gt in enumerate(gt_list):
-                if gt.get("category", "Unknown") == c:
+                if _normalize_eval_category_key(gt.get("category", gt.get("class", "Unknown"))) == cn:
                     n_gt_total += 1
             for det in det_list:
-                if det.get("category", "Unknown") == c:
+                if _normalize_eval_category_key(det.get("category", det.get("class", "Unknown"))) == cn:
                     det_entries.append((fi, det, _detection_confidence_for_pr(det)))
 
     det_entries.sort(key=lambda x: (-x[2], x[0]))
@@ -738,6 +1003,9 @@ def _ap_pr_single_bucket(
     recalls: List[float] = []
     cum_tp = 0
     cum_fp = 0
+    category_norm = (
+        None if category_filter is None else _normalize_eval_category_key(category_filter)
+    )
 
     for fi, det, _sc in det_entries:
         gt_list = samples[fi][1]
@@ -746,10 +1014,10 @@ def _ap_pr_single_bucket(
         for gi, gt in enumerate(gt_list):
             if (fi, gi) in matched_gt:
                 continue
-            if category_filter is not None:
-                if gt.get("category", "Unknown") != category_filter:
+            if category_norm is not None:
+                if _normalize_eval_category_key(gt.get("category", gt.get("class", "Unknown"))) != category_norm:
                     continue
-                if det.get("category", "Unknown") != category_filter:
+                if _normalize_eval_category_key(det.get("category", det.get("class", "Unknown"))) != category_norm:
                     continue
             iou = compute_3d_iou(gt, det)
             if iou > best_iou:
@@ -770,7 +1038,11 @@ def _ap_pr_single_bucket(
         np.asarray(recalls, dtype=np.float64),
         np.asarray(precisions, dtype=np.float64),
     )
-    return ap, precisions, recalls
+    ap11 = ap_r11(
+        np.asarray(recalls, dtype=np.float64),
+        np.asarray(precisions, dtype=np.float64),
+    )
+    return ap, ap11, precisions, recalls
 
 
 def compute_pr_map_at_iou(
@@ -807,24 +1079,26 @@ def compute_pr_map_at_iou(
     n_gt_per_class: Dict[str, int] = {}
     for _fi, gt_list, _ in samples:
         for gt in gt_list:
-            lab = gt.get("category", "Unknown")
+            lab = _normalize_eval_category_key(gt.get("category", gt.get("class", "Unknown")))
             n_gt_per_class[lab] = n_gt_per_class.get(lab, 0) + 1
 
-    micro_ap, micro_prec, micro_rec = _ap_pr_single_bucket(
+    micro_ap, micro_ap_r11, micro_prec, micro_rec = _ap_pr_single_bucket(
         samples, iou_threshold, category_filter=None
     )
 
     per_class_ap: Dict[str, float] = {}
+    per_class_ap_r11: Dict[str, float] = {}
     per_class_pr_curves: Dict[str, Dict[str, List[float]]] = {}
     if match_by_category:
         for c in sorted(n_gt_per_class.keys()):
             nk = n_gt_per_class[c]
             if nk == 0:
                 continue
-            ap_c, prec_c, rec_c = _ap_pr_single_bucket(
+            ap_c, ap11_c, prec_c, rec_c = _ap_pr_single_bucket(
                 samples, iou_threshold, category_filter=c
             )
             per_class_ap[c] = ap_c
+            per_class_ap_r11[c] = ap11_c
             per_class_pr_curves[c] = {
                 "precisions": [float(v) for v in prec_c],
                 "recalls": [float(v) for v in rec_c],
@@ -836,13 +1110,22 @@ def compute_pr_map_at_iou(
             if classes_with_gt
             else 0.0
         )
+        map_pr_r11 = (
+            float(np.mean([per_class_ap_r11[c] for c in classes_with_gt]))
+            if classes_with_gt
+            else 0.0
+        )
     else:
         map_pr = micro_ap
+        map_pr_r11 = micro_ap_r11
 
     return {
         "map_pr": map_pr,
+        "map_pr_r11": map_pr_r11,
         "micro_ap_pr": micro_ap,
+        "micro_ap_r11": micro_ap_r11,
         "per_class_pr_ap": per_class_ap,
+        "per_class_pr_ap_r11": per_class_ap_r11,
         "per_class_pr_curves": per_class_pr_curves,
         "n_gt_per_class": dict(n_gt_per_class),
         "pr_recalls_micro": micro_rec,
@@ -941,12 +1224,57 @@ def compute_batch_ap(
         "per_class": per_class,
         "iou_threshold": iou_threshold,
         "map_pr": pr_stats["map_pr"],
+        "map_pr_r11": pr_stats["map_pr_r11"],
         "micro_ap_pr": pr_stats["micro_ap_pr"],
+        "micro_ap_r11": pr_stats["micro_ap_r11"],
         "per_class_pr_ap": pr_stats["per_class_pr_ap"],
+        "per_class_pr_ap_r11": pr_stats["per_class_pr_ap_r11"],
         "per_class_pr_curves": pr_stats["per_class_pr_curves"],
         "n_gt_per_class_pr": pr_stats["n_gt_per_class"],
         "pr_recalls_micro": pr_stats["pr_recalls_micro"],
         "pr_precisions_micro": pr_stats["pr_precisions_micro"],
+    }
+
+
+def compute_omni3d_class_agnostic_map(
+    batch_results: List[Dict],
+    iou_thresholds: Optional[List[float]] = None,
+    progress_callback: Optional[Callable[[int, int, float], None]] = None,
+) -> Dict:
+    """
+    omni3d-style class-agnostic 3D mAP.
+
+    All GT and detections are evaluated as a single pooled "object" class
+    (i.e., category labels are ignored), AP is computed at each IoU threshold,
+    and the final score is the mean AP over thresholds.
+
+    Default threshold grid:
+        0.05, 0.10, 0.15, ..., 0.50
+    """
+    if iou_thresholds is None:
+        iou_thresholds = [round(0.05 * i, 2) for i in range(1, 11)]
+
+    thresholds: List[float] = []
+    ap_per_threshold: Dict[str, float] = {}
+    total_thresholds = len(iou_thresholds)
+    for idx, thr in enumerate(iou_thresholds, start=1):
+        thr_f = float(thr)
+        thresholds.append(thr_f)
+        ap_stats = compute_batch_ap(
+            batch_results,
+            iou_threshold=thr_f,
+            match_by_category=False,
+        )
+        ap_per_threshold[f"{thr_f:.2f}"] = float(ap_stats.get("map_pr", 0.0))
+        if progress_callback is not None:
+            progress_callback(idx, total_thresholds, thr_f)
+
+    mean_ap = float(np.mean(list(ap_per_threshold.values()))) if ap_per_threshold else 0.0
+    return {
+        "protocol": "omni3d_class_agnostic",
+        "iou_thresholds": thresholds,
+        "ap_per_threshold": ap_per_threshold,
+        "map": mean_ap,
     }
 
 
@@ -1156,6 +1484,7 @@ def compute_batch_statistics(
     batch_results: List[Dict],
     total_queued: int = 0,
     match_by_category: bool = False,
+    omni3d_progress_callback: Optional[Callable[[int, int, float], None]] = None,
 ) -> Dict:
     """
     Compute comprehensive batch evaluation statistics at IoU 0.5 and 0.25.
@@ -1186,6 +1515,10 @@ def compute_batch_statistics(
     total_detections = sum(len(r.get("detected_cuboids", [])) for r in batch_results)
     total_gt = sum(len(r.get("ground_truth_cuboids", [])) for r in results_with_gt)
 
+    omni3d_class_agnostic = compute_omni3d_class_agnostic_map(
+        results_with_gt,
+        progress_callback=omni3d_progress_callback,
+    )
     ap_50 = compute_batch_ap(results_with_gt, iou_threshold=0.5, match_by_category=match_by_category)
     ap_25 = compute_batch_ap(results_with_gt, iou_threshold=0.25, match_by_category=match_by_category)
 
@@ -1198,4 +1531,5 @@ def compute_batch_statistics(
         "total_ground_truth": total_gt,
         "ap_50": ap_50,
         "ap_25": ap_25,
+        "omni3d_class_agnostic": omni3d_class_agnostic,
     }
