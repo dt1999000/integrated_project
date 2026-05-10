@@ -206,6 +206,9 @@ class KITTIDatasetLoader:
                     continue
 
                 # Parse KITTI label: Type Truncated Occluded Alpha bbox2d(4) dim(3) loc(3) Rotation_y
+                truncation = float(parts[1])
+                occlusion = int(float(parts[2]))
+                alpha = float(parts[3])
                 # Extract 2D bounding box (pixel coordinates)
                 bbox_2d = {
                     'left': float(parts[4]),
@@ -247,6 +250,10 @@ class KITTIDatasetLoader:
                 # Create cuboid dict compatible with element.py
                 cuboid = {
                     'category': obj_type,
+                    'truncation': truncation,
+                    'occlusion': occlusion,
+                    'alpha': alpha,
+                    'bbox_height_px': float(bbox_2d['bottom'] - bbox_2d['top']),
                     'corners': corners_lidar,
                     'bbox_2d': bbox_2d,  # 2D bounding box in pixel coordinates
                     'min_x': float(corners_lidar[:, 0].min()),
