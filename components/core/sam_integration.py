@@ -18,6 +18,17 @@ except ImportError:
     print("Ultralytics not available. Install with: pip install ultralytics")
     ULTRALYTICS_AVAILABLE = False
 
+YOLOE_AVAILABLE = False
+YOLOE = None  # type: ignore[misc, assignment]
+if ULTRALYTICS_AVAILABLE:
+    try:
+        from ultralytics import YOLOE as _YOLOE
+
+        YOLOE = _YOLOE
+        YOLOE_AVAILABLE = True
+    except ImportError:
+        YOLOE_AVAILABLE = False
+
 try:
     from ultralytics.models.sam import SAM2DynamicInteractivePredictor
     SAM2_AVAILABLE = True
@@ -76,6 +87,21 @@ def get_available_models() -> Dict[str, List[str]]:
 def get_models_dir() -> str:
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     return os.path.abspath(os.path.join(project_root, "models"))
+
+
+def is_yoloe_weights_path(model_path: str) -> bool:
+    """True if the checkpoint filename indicates Ultralytics YOLOE (not YOLO-World)."""
+    base = os.path.basename(model_path).lower()
+    return "yoloe" in base
+
+
+def resolve_yolo_model_path(yolo_model_path: Optional[str]) -> str:
+    """Default YOLO-World weights in ``models/`` when ``yolo_model_path`` is None."""
+    if yolo_model_path is None:
+        return os.path.abspath(os.path.join(get_models_dir(), "yolov8s-world.pt"))
+    if not os.path.isabs(yolo_model_path):
+        return os.path.abspath(os.path.join(get_models_dir(), yolo_model_path))
+    return yolo_model_path
 
 
 def calculate_iou(bbox1: List[float], bbox2: List[float]) -> float:
@@ -154,6 +180,7 @@ class SAMIntegration:
         self.device = torch.device("cuda" if self.use_gpu else "cpu")
         self.current_image = None
         self._yolo_integration = None  # Lazy initialization for SAM2 pipeline
+        self._yolo_cached_resolved_path: Optional[str] = None
         self._grounding_dino_integration = None
         self._grounding_dino_model_id_cached: Optional[str] = None
         self._sam3_prev_tracked: List[Dict[str, Union[str, np.ndarray, float]]] = []
@@ -874,10 +901,13 @@ class SAMIntegration:
                 image, class_names, conf_threshold=conf_threshold
             )
         else:
-            if self._yolo_integration is None:
-                if yolo_model_path is None:
-                    yolo_model_path = "yolov8s-world.pt"
-                self._yolo_integration = YOLOIntegration(yolo_model_path, use_gpu=self.use_gpu)
+            resolved_yolo = resolve_yolo_model_path(yolo_model_path)
+            if (
+                self._yolo_integration is None
+                or self._yolo_cached_resolved_path != resolved_yolo
+            ):
+                self._yolo_integration = YOLOIntegration(resolved_yolo, use_gpu=self.use_gpu)
+                self._yolo_cached_resolved_path = resolved_yolo
             detector = self._yolo_integration
             ov_detections = detector.detect_with_classes(
                 image, class_names, conf_threshold=conf_threshold
@@ -997,14 +1027,15 @@ class YOLOIntegration:
     """
     YOLO Integration Module for 3D Object Detection Pipeline
     This module provides unified class for integrating YOLO models.
-    Supports YOLO-World models for open-vocabulary object detection.
+    Uses YOLO-World via ``YOLO`` for typical open-vocabulary weights, and
+    ``YOLOE`` when the checkpoint filename contains ``yoloe`` (e.g. ``yoloe-v8l.pt``).
     """
     def __init__(self, model_path: str = "yolov8x-worldv2.pt", use_gpu: bool = True):
         """
         Initialize YOLO integration manager.
 
         Args:
-            model_path: Path to YOLO-World model file (default: "yolov8s-world.pt")
+            model_path: Path to YOLO-World or YOLOE weights (resolved under ``models/`` if relative)
             use_gpu: Boolean flag to enable GPU usage (if available)
         """
         if not ULTRALYTICS_AVAILABLE:
@@ -1023,14 +1054,23 @@ class YOLOIntegration:
         self._load_model()
 
     def _load_model(self):
-        """Load the YOLO model."""
-        self.model = YOLO(self.model_path)
-        print(f"Loaded YOLO model from {self.model_path} on {self.device}")
+        """Load YOLO-World (``YOLO``) or YOLOE (``YOLOE``) from checkpoint path."""
+        if is_yoloe_weights_path(self.model_path):
+            if not YOLOE_AVAILABLE or YOLOE is None:
+                raise ImportError(
+                    "YOLOE weights require ultralytics with YOLOE support. "
+                    "Upgrade with: pip install -U ultralytics"
+                )
+            self.model = YOLOE(self.model_path)
+            print(f"Loaded YOLOE model from {self.model_path} on {self.device}")
+        else:
+            self.model = YOLO(self.model_path)
+            print(f"Loaded YOLO model from {self.model_path} on {self.device}")
 
     def detect_with_classes(self, image: np.ndarray, class_names: List[str],
                            conf_threshold: float = 0.25) -> List[Dict]:
         """
-        Detect objects in image using YOLO-World with specified class names.
+        Detect objects using open-vocabulary prompts (YOLO-World or YOLOE).
 
         Args:
             image: Input image as numpy array (H, W, 3) in RGB format
