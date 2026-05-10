@@ -12,6 +12,7 @@ from .visualization_helper import (
     generate_distinct_colors,
     overlay_masks_on_image,
     create_3d_mask_assignment_figure,
+    create_evaluation_mask_wireframe_figure,
 )
 from .export_utils import Export
 
@@ -25,6 +26,7 @@ __all__ = [
     "generate_distinct_colors",
     "overlay_masks_on_image",
     "create_3d_mask_assignment_figure",
+    "create_evaluation_mask_wireframe_figure",
     "Export",
 ]
 

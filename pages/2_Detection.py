@@ -119,12 +119,14 @@ def _render_point_cloud_plot(
     fig: go.Figure,
     export_basename: str,
     use_container_width: bool = False,
+    show_legend: bool = True,
 ) -> None:
     """Thin wrapper over shared point-cloud renderer."""
     shared_render_point_cloud_plot(
         fig=fig,
         export_basename=export_basename,
         use_container_width=use_container_width,
+        show_legend=show_legend,
     )
 
 
@@ -1457,6 +1459,10 @@ def _run_pipeline_for_batch_sample(
                 "category": gt_box.get("category", gt_box.get("class", "Unknown")),
                 "corners": gt_box.get("corners"),
                 "bbox_2d": gt_box.get("bbox_2d"),
+                "truncation": gt_box.get("truncation"),
+                "occlusion": gt_box.get("occlusion", gt_box.get("occluded")),
+                "alpha": gt_box.get("alpha"),
+                "bbox_height_px": gt_box.get("bbox_height_px"),
                 "min_x": gt_box.get("min_x"),
                 "max_x": gt_box.get("max_x"),
                 "min_y": gt_box.get("min_y"),
@@ -2301,6 +2307,10 @@ def main():
                             'category': gt_box.get('category', gt_box.get('class', 'Unknown')),
                             'corners': gt_box.get('corners'),
                             'bbox_2d': gt_box.get('bbox_2d'),
+                            'truncation': gt_box.get('truncation'),
+                            'occlusion': gt_box.get('occlusion', gt_box.get('occluded')),
+                            'alpha': gt_box.get('alpha'),
+                            'bbox_height_px': gt_box.get('bbox_height_px'),
                             'min_x': gt_box.get('min_x'),
                             'max_x': gt_box.get('max_x'),
                             'min_y': gt_box.get('min_y'),
@@ -3056,6 +3066,82 @@ def main():
                         height=600
                     )
                     _render_point_cloud_plot(fig, "step4_clusters")
+
+                    # 3D Visualization: best-cluster vs non-best points, colored by mask
+                    st.markdown("#### 3D Best Cluster vs Noise (Mask Colors)")
+                    fig_best_vs_noise = go.Figure()
+                    step_3_masks = step_3_result.get("sam_masks", []) or []
+                    mask_colors = generate_distinct_colors(len(step_3_masks))
+                    best_ix = result.get('best_cluster_sparse_indices', {})
+
+                    for mask_idx, cluster_labels in mask_cluster_labels.items():
+                        row_ix = filtered_ix.get(mask_idx)
+                        if row_ix is None or len(row_ix) == 0:
+                            continue
+
+                        mask_points = sparse_points[row_ix]
+                        if mask_points is None or len(mask_points) == 0:
+                            continue
+
+                        best_row_ix = best_ix.get(mask_idx)
+                        if best_row_ix is None or len(best_row_ix) == 0:
+                            best_mask = np.zeros(len(row_ix), dtype=bool)
+                        else:
+                            best_mask = np.isin(row_ix, best_row_ix)
+
+                        noise_mask = ~best_mask
+                        color = mask_colors[mask_idx % len(mask_colors)] if mask_colors else (1.0, 0.0, 0.0)
+                        color_rgb = f'rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})'
+
+                        best_points = mask_points[best_mask]
+                        if len(best_points) > 0:
+                            max_points = 3000
+                            if len(best_points) > max_points:
+                                indices = np.random.choice(len(best_points), max_points, replace=False)
+                                best_points = best_points[indices]
+                            fig_best_vs_noise.add_trace(go.Scatter3d(
+                                x=best_points[:, 0],
+                                y=best_points[:, 1],
+                                z=best_points[:, 2],
+                                mode='markers',
+                                marker=dict(
+                                    size=2,
+                                    color=color_rgb,
+                                    opacity=0.95
+                                ),
+                                name=f'Mask {mask_idx + 1} Best Cluster'
+                            ))
+
+                        noise_points = mask_points[noise_mask]
+                        if len(noise_points) > 0:
+                            max_points = 3000
+                            if len(noise_points) > max_points:
+                                indices = np.random.choice(len(noise_points), max_points, replace=False)
+                                noise_points = noise_points[indices]
+                            fig_best_vs_noise.add_trace(go.Scatter3d(
+                                x=noise_points[:, 0],
+                                y=noise_points[:, 1],
+                                z=noise_points[:, 2],
+                                mode='markers',
+                                marker=dict(
+                                    size=2,
+                                    color=color_rgb,
+                                    opacity=0.25
+                                ),
+                                name=f'Mask {mask_idx + 1} Noise (Non-best)'
+                            ))
+
+                    fig_best_vs_noise.update_layout(
+                        title="3D Best Cluster vs Noise (Same Mask Color, Different Opacity)",
+                        scene=dict(
+                            xaxis_title="X (m)",
+                            yaxis_title="Y (m)",
+                            zaxis_title="Z (m)",
+                            aspectmode='data'
+                        ),
+                        height=600
+                    )
+                    _render_point_cloud_plot(fig_best_vs_noise, "step4_best_vs_noise_by_mask")
         
         if step_4_state.get('error'):
             st.error(f"❌ Error: {step_4_state['error']}")
@@ -3137,6 +3223,10 @@ def main():
                                     'category': gt_box.get('category', gt_box.get('class', 'Unknown')),
                                     'corners': gt_box.get('corners'),
                                     'bbox_2d': gt_box.get('bbox_2d'),
+                                    'truncation': gt_box.get('truncation'),
+                                    'occlusion': gt_box.get('occlusion', gt_box.get('occluded')),
+                                    'alpha': gt_box.get('alpha'),
+                                    'bbox_height_px': gt_box.get('bbox_height_px'),
                                     'min_x': gt_box.get('min_x'),
                                     'max_x': gt_box.get('max_x'),
                                     'min_y': gt_box.get('min_y'),

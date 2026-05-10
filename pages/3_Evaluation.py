@@ -14,6 +14,7 @@ import importlib.util
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 from matplotlib.patches import Polygon
 import plotly.graph_objects as go
 
@@ -21,6 +22,8 @@ from components.core.evaluation import (
     compute_3d_iou,
     compute_batch_statistics,
     compute_batch_azimuth_bin_metrics,
+    compute_batch_ap,
+    compute_kitti_difficulty_ap,
     compute_frame_metrics_at_iou,
     greedy_iou_match,
     _normalize_gt_cuboids,
@@ -29,8 +32,55 @@ from components.utils.visualization_helper import (
     draw_2d_boxes_on_image,
     draw_projected_cuboid_bboxes,
     create_comparison_plot,
+    create_evaluation_mask_wireframe_figure,
+    generate_distinct_colors,
+    overlay_masks_on_image,
     render_point_cloud_plot as shared_render_point_cloud_plot,
 )
+
+
+def _canonical_eval_category(category: Any) -> str:
+    """Canonicalize category labels for evaluation-time class matching."""
+    label = str(category).strip()
+    if label.lower() in {"person", "pedestrian"}:
+        return "pedestrian"
+    return label
+
+
+def _apply_eval_category_aliases(batch_results: List[Dict]) -> List[Dict]:
+    """
+    Apply evaluation-time class aliases so equivalent labels are matched together.
+    """
+    aliased_results: List[Dict] = []
+    for sample in batch_results:
+        sample_copy = dict(sample)
+
+        gt_raw = sample_copy.get("ground_truth_cuboids")
+        if gt_raw is not None:
+            gt_aliased: List[Dict] = []
+            for gt in gt_raw or []:
+                gt_copy = dict(gt)
+                resolved = _canonical_eval_category(
+                    gt_copy.get("category", gt_copy.get("class", "Unknown"))
+                )
+                gt_copy["category"] = resolved
+                gt_aliased.append(gt_copy)
+            sample_copy["ground_truth_cuboids"] = gt_aliased
+
+        det_raw = sample_copy.get("detected_cuboids")
+        if det_raw is not None:
+            det_aliased: List[Dict] = []
+            for det in det_raw or []:
+                det_copy = dict(det)
+                det_copy["category"] = _canonical_eval_category(
+                    det_copy.get("category", "Unknown")
+                )
+                det_aliased.append(det_copy)
+            sample_copy["detected_cuboids"] = det_aliased
+
+        aliased_results.append(sample_copy)
+
+    return aliased_results
 
 
 def _normalize_gt_for_eval(raw_ground_truth: List[Dict]) -> List[Dict]:
@@ -59,7 +109,9 @@ def _normalize_gt_for_eval(raw_ground_truth: List[Dict]) -> List[Dict]:
         norm_gt["max_x"] = float(bbox_max[0])
         norm_gt["max_y"] = float(bbox_max[1])
         norm_gt["max_z"] = float(bbox_max[2])
-        norm_gt["category"] = norm_gt.get("category", norm_gt.get("class", "Person"))
+        norm_gt["category"] = _canonical_eval_category(
+            norm_gt.get("category", norm_gt.get("class", "Person"))
+        )
         normalized.append(norm_gt)
     return normalized
 
@@ -100,7 +152,8 @@ def get_ground_truth_objects_for_class_per_scene(
         gt_cls = [
             g
             for g in gt_all
-            if g.get("category", g.get("class", "Unknown")) == target_class
+            if _canonical_eval_category(g.get("category", g.get("class", "Unknown")))
+            == _canonical_eval_category(target_class)
         ]
 
         sample_id = str(sample.get("metadata", {}).get("sample_index", frame_idx))
@@ -123,7 +176,7 @@ def _extract_detection_classes(
         params = sample.get("metadata", {}).get("pipeline_params", {}) or {}
         class_names = params.get("class_names", []) or []
         for cls in class_names:
-            cls_norm = str(cls).strip()
+            cls_norm = _canonical_eval_category(cls)
             if cls_norm and cls_norm not in seen:
                 ordered.append(cls_norm)
                 seen.add(cls_norm)
@@ -132,7 +185,7 @@ def _extract_detection_classes(
 
     for sample in batch_results:
         for det in sample.get("detected_cuboids", []) or []:
-            cls_norm = str(det.get("category", "Unknown")).strip()
+            cls_norm = _canonical_eval_category(det.get("category", det.get("class", "Unknown")))
             if cls_norm and cls_norm not in seen:
                 ordered.append(cls_norm)
                 seen.add(cls_norm)
@@ -173,6 +226,99 @@ def _prepare_batch_results_for_eval(batch_results: List[Dict]) -> Tuple[List[Dic
     return prepared, n_inferred_empty
 
 
+def _batch_sample_stub_from_import(sample: Dict, frame_ordinal: int) -> Dict:
+    """Synthetic batch-queue row so batch metrics queues match uploaded exports."""
+    meta = dict(sample.get("metadata") or {})
+    ix = meta.get("sample_index")
+    return {
+        "sample_index": ix if ix is not None else frame_ordinal,
+        "dataset_path": meta.get("dataset_path", ""),
+        "dataset_type": meta.get("dataset_type", ""),
+        "image_path": meta.get("image_path", ""),
+        "point_cloud_path": meta.get("point_cloud_path", ""),
+    }
+
+
+def _parse_detection_export_document(
+    data: Any,
+    source_name: str,
+) -> Tuple[List[Dict], bool, Optional[str]]:
+    """
+    Parse Export-page compatible JSON into sample dicts.
+
+    Returns ``(samples, batch_tracking_flag_from_envelope, error_message)``.
+    Supported shapes:
+      - Batch envelope ``{"samples": [...], optional batch_tracking_enabled}``
+      - Single ``det3d_*.json`` object (metadata + detected_cuboids)
+      - JSON array of sample objects ``[{...}, {...}]``
+
+    Datumaro ``items`` exports are rejected with guidance to use cuboid JSON.
+    """
+    bte_flag = False
+    if isinstance(data, list):
+        samples_out: List[Dict] = []
+        for elem in data:
+            if isinstance(elem, dict) and isinstance(elem.get("detected_cuboids"), list):
+                samples_out.append(dict(elem))
+            else:
+                return [], False, f"{source_name}: array elements must be sample objects with `detected_cuboids`"
+        return samples_out, False, None
+    if not isinstance(data, dict):
+        return [], False, f"{source_name}: root must be JSON object or array"
+
+    datumaro_like = isinstance(data.get("items"), list) and isinstance(data.get("categories"), dict)
+    if datumaro_like:
+        return (
+            [],
+            False,
+            "Detected Datumaro/CVAT-style JSON (has `items` + `categories`). "
+            "For evaluation please upload **Save 3D cuboids to JSON** output (`det3d_*.json`) "
+            "or a batch `{ \"samples\": [...] }` payload from detection runs.",
+        )
+    samples_field = data.get("samples")
+    if isinstance(samples_field, list):
+        bte_flag = bool(data.get("batch_tracking_enabled"))
+        out_samples: List[Dict] = []
+        for elem in samples_field:
+            if isinstance(elem, dict) and isinstance(elem.get("detected_cuboids"), list):
+                out_samples.append(dict(elem))
+            else:
+                return (
+                    [],
+                    False,
+                    f"{source_name}: invalid `samples` entry (needs `detected_cuboids` list)",
+                )
+        return out_samples, bte_flag, None
+    det_list = data.get("detected_cuboids")
+    meta = data.get("metadata")
+    if isinstance(det_list, list) and isinstance(meta, dict):
+        return [dict(data)], False, None
+    return [], False, f"{source_name}: unrecognized layout (need `samples`, or `metadata` + `detected_cuboids`)"
+
+
+def _merge_uploaded_detection_files(uploaded_files: List[Any]) -> Tuple[List[Dict], bool, List[str]]:
+    """Merge uploaded JSON exports into one sample list."""
+    merged: List[Dict] = []
+    any_bte = False
+    errs: List[str] = []
+    for uf in uploaded_files:
+        name = uf.name or "upload.json"
+        raw = uf.read()
+        uf.seek(0)
+        decoded = raw.decode("utf-8").strip()
+        if not decoded:
+            errs.append(f"{name}: empty file")
+            continue
+        parsed = json.loads(decoded)
+        chunk, chunk_bte, err = _parse_detection_export_document(parsed, name)
+        any_bte = any_bte or chunk_bte
+        if err is not None:
+            errs.append(err)
+            continue
+        merged.extend(chunk)
+    return merged, any_bte, errs
+
+
 def _compute_per_class_per_frame_tables(
     batch_results: List[Dict],
     eval_classes: List[str],
@@ -188,8 +334,18 @@ def _compute_per_class_per_frame_tables(
             gt_all = _normalize_gt_cuboids(sample.get("ground_truth_cuboids", []) or [])
             det_all = sample.get("detected_cuboids", []) or []
 
-            gt_cls = [g for g in gt_all if g.get("category", g.get("class", "Unknown")) == cls]
-            det_cls = [d for d in det_all if d.get("category", "Unknown") == cls]
+            gt_cls = [
+                g
+                for g in gt_all
+                if _canonical_eval_category(g.get("category", g.get("class", "Unknown")))
+                == _canonical_eval_category(cls)
+            ]
+            det_cls = [
+                d
+                for d in det_all
+                if _canonical_eval_category(d.get("category", d.get("class", "Unknown")))
+                == _canonical_eval_category(cls)
+            ]
 
             m50 = compute_frame_metrics_at_iou(
                 gt_cls, det_cls, iou_threshold=0.5, match_by_category=True
@@ -261,6 +417,38 @@ def _sum_per_class_across_frames(
             }
         )
     return rows
+
+
+def _compute_kitti_difficulty_ap_tables(batch_results: List[Dict]) -> Dict[str, pd.DataFrame]:
+    """
+    Compute per-class KITTI AP tables for Easy/Moderate/Hard.
+    AP is shown both as PR-AUC and 11-point interpolated AP (R11).
+    """
+    tables: Dict[str, pd.DataFrame] = {}
+    for iou_value in (0.5, 0.25):
+        diff_stats = compute_kitti_difficulty_ap(
+            batch_results,
+            iou_threshold=float(iou_value),
+            match_by_category=True,
+        )
+        per_diff = diff_stats.get("per_difficulty_per_class", {}) or {}
+        rows: List[Dict] = []
+        for difficulty_label in ("easy", "moderate", "hard"):
+            per_class = per_diff.get(difficulty_label, {}) or {}
+            all_classes = sorted(per_class.keys())
+            for cls in all_classes:
+                cls_stats = per_class.get(cls, {}) or {}
+                rows.append(
+                    {
+                        "Difficulty": difficulty_label.capitalize(),
+                        "Class": cls,
+                        "GT count": int(cls_stats.get("n_gt", 0)),
+                        "AP (PR AUC)": f"{float(cls_stats.get('ap_pr', 0.0)) * 100:.1f}%",
+                        "AP_R11 (11-point)": f"{float(cls_stats.get('ap_r11', 0.0)) * 100:.1f}%",
+                    }
+                )
+        tables[f"iou_{str(iou_value).replace('.', '')}"] = pd.DataFrame(rows)
+    return tables
 
 
 def _json_sanitize(obj: Any) -> Any:
@@ -525,12 +713,19 @@ def _build_mismatch_export_payload(
     }
 
 
-def _render_point_cloud_plot(fig, export_basename: str) -> None:
+def _render_point_cloud_plot(
+    fig,
+    export_basename: str,
+    *,
+    show_legend: bool = True,
+    use_container_width: bool = False,
+) -> None:
     """Thin wrapper over shared point-cloud renderer."""
     shared_render_point_cloud_plot(
         fig=fig,
         export_basename=export_basename,
-        use_container_width=False,
+        use_container_width=use_container_width,
+        show_legend=show_legend,
     )
 
 
@@ -645,10 +840,136 @@ def _render_single_sample_eval():
         img_proj = draw_projected_cuboid_bboxes(image.copy(), cuboids_with_projection, gt_boxes_2d)
         st.image(img_proj, caption="Reprojected 3D Cuboids to 2D")
 
+    pipeline_state = st.session_state.get("pipeline_state")
+    step_3_result = (
+        pipeline_state.get("step_3", {}).get("result") if pipeline_state else None
+    )
+    sam_masks_eval = (
+        (step_3_result or {}).get("sam_masks") or []
+        if step_3_result
+        else []
+    )
+    if sam_masks_eval:
+        st.subheader("🎭 Segmentation Masks (same palette as Detection)")
+        mask_colors_eval = generate_distinct_colors(len(sam_masks_eval))
+        img_with_masks = overlay_masks_on_image(
+            image.copy(), sam_masks_eval, mask_colors_eval, alpha=0.5
+        )
+        mask_bboxes_eval = (step_3_result or {}).get("mask_bboxes", []) or []
+        detected_class_names_eval = (step_3_result or {}).get("class_names", []) or []
+        confidences_eval = (step_3_result or {}).get("confidences", []) or []
+
+        st.markdown("#### 2D Mask Visualization")
+        fig_masks, ax_masks = plt.subplots(1, 1, figsize=(12, 8))
+        ax_masks.imshow(img_with_masks)
+        ax_masks.axis("off")
+        for i, (bbox, class_name, confidence) in enumerate(
+            zip(mask_bboxes_eval, detected_class_names_eval, confidences_eval)
+        ):
+            if bbox and len(bbox) == 4:
+                x1, y1, x2, y2 = bbox
+                rect = patches.Rectangle(
+                    (x1, y1),
+                    x2 - x1,
+                    y2 - y1,
+                    linewidth=2,
+                    edgecolor=mask_colors_eval[i],
+                    facecolor="none",
+                )
+                ax_masks.add_patch(rect)
+                label = (
+                    f"{class_name}: {confidence:.2f}"
+                    if confidence is not None
+                    else class_name
+                )
+                ax_masks.text(
+                    x1,
+                    y1 - 5,
+                    label,
+                    color=mask_colors_eval[i],
+                    fontsize=10,
+                    bbox=dict(
+                        boxstyle="round,pad=0.3", facecolor="black", alpha=0.7
+                    ),
+                )
+        ax_masks.set_title(
+            "Detected Objects with Masks, Bounding Boxes, and Confidence Scores"
+        )
+        st.pyplot(fig_masks)
+        plt.close(fig_masks)
+
     if point_cloud_obj:
-        st.subheader("🎯 3D Comparison Visualization")
+        st.subheader("🎯 3D comparison — dense point cloud + solid cuboids (GT vs detected)")
+        st.caption(
+            "Downloads as HTML with large axes/legend fonts for comparing against ground-truth cubes."
+        )
         fig_unified = create_comparison_plot(point_cloud_obj, ground_truth_boxes, detected_cuboids)
         _render_point_cloud_plot(fig_unified, "evaluation_3d_comparison")
+
+        step_2_result = (
+            pipeline_state.get("step_2", {}).get("result") if pipeline_state else None
+        )
+        step_4_result = (
+            pipeline_state.get("step_4", {}).get("result") if pipeline_state else None
+        )
+        sparse_eval = (
+            (step_2_result or {}).get("colored_sparse_points")
+            if step_2_result
+            else None
+        )
+        assign_eval = (
+            (step_3_result or {}).get("mask_assignments")
+            if step_3_result
+            else None
+        )
+        best_ix_eval = (
+            (step_4_result or {}).get("best_cluster_sparse_indices")
+            if step_4_result
+            else None
+        )
+
+        if (
+            sparse_eval is not None
+            and len(sparse_eval) > 0
+            and assign_eval is not None
+            and len(assign_eval) == len(sparse_eval)
+            and sam_masks_eval
+        ):
+            st.subheader("🎯 3D comparison — cuboid edges + mask-colored sparse depth")
+            st.caption(
+                "Detected boxes as wireframes (mask color); sparse points: best-cluster emphasis, "
+                "other in-mask points fainter; points outside masks in light grey. "
+                "Export HTML separately to compare against the dense view above."
+            )
+            wf_colors = generate_distinct_colors(len(sam_masks_eval))
+            fig_wire = create_evaluation_mask_wireframe_figure(
+                sparse_points=np.asarray(sparse_eval, dtype=np.float64),
+                mask_assignments=np.asarray(assign_eval).reshape(-1),
+                detected_cuboids=detected_cuboids,
+                mask_colors=wf_colors,
+                best_cluster_sparse_indices=best_ix_eval,
+            )
+            _render_point_cloud_plot(fig_wire, "evaluation_3d_mask_wireframe_sparse")
+        elif pipeline_state:
+            with st.expander("ℹ️ Mask / wireframe 3D view unavailable", expanded=False):
+                reasons = []
+                if sparse_eval is None or len(sparse_eval) == 0:
+                    reasons.append("Step 2 `colored_sparse_points` missing or empty.")
+                if assign_eval is None:
+                    reasons.append("Step 3 `mask_assignments` missing.")
+                elif sparse_eval is not None and (
+                    len(assign_eval) != len(sparse_eval)
+                ):
+                    reasons.append(
+                        "`mask_assignments` length does not match sparse points (re-run Detection steps 2–4)."
+                    )
+                if not sam_masks_eval:
+                    reasons.append("No `sam_masks` from Step 3.")
+                if reasons:
+                    for r in reasons:
+                        st.markdown(f"- {r}")
+                else:
+                    st.markdown("- Unknown reason.")
 
 
 def _render_sim_azimuth_iou_block(
@@ -710,6 +1031,7 @@ def _render_batch_eval():
     batch_export = st.session_state.batch_export_results
     batch_results: List[Dict] = batch_export.get("samples", [])
     eval_batch_results, n_inferred_empty_gt = _prepare_batch_results_for_eval(batch_results)
+    eval_batch_results = _apply_eval_category_aliases(eval_batch_results)
     max_masks_hint = int(st.session_state.get("eval_mask_capacity_max", 0) or 0)
     trim_gt_by_mask_capacity = bool(
         st.session_state.get("eval_trim_gt_by_mask_capacity_enabled", True)
@@ -730,7 +1052,9 @@ def _render_batch_eval():
             else "OFF (using original GT counts)"
         )
     )
-    total_queued: int = len(st.session_state.get("batch_samples", []))
+    n_batch_loaded = len(batch_results)
+    queued_from_runner = len(st.session_state.get("batch_samples", []))
+    total_queued = max(queued_from_runner, n_batch_loaded)
 
     st.subheader("📦 Batch Sample Overview")
 
@@ -794,12 +1118,29 @@ def _render_batch_eval():
     # ------------------------------------------------------------------
     # Compute statistics
     # ------------------------------------------------------------------
+    omni3d_progress = st.progress(
+        0,
+        text="Omni3D class-agnostic mAP: preparing threshold sweep",
+    )
+
+    def _on_omni3d_progress(done: int, total: int, threshold: float) -> None:
+        progress_ratio = float(done) / float(total) if total > 0 else 1.0
+        omni3d_progress.progress(
+            min(100, int(round(progress_ratio * 100.0))),
+            text=(
+                "Omni3D class-agnostic mAP: "
+                f"{done}/{total} thresholds complete (latest IoU {threshold:.2f})"
+            ),
+        )
+
     with st.spinner("Computing batch metrics…"):
         stats = compute_batch_statistics(
             eval_batch_results,
-            total_queued=total_queued,
+            total_queued=max(total_queued, len(eval_batch_results)),
             match_by_category=True,
+            omni3d_progress_callback=_on_omni3d_progress,
         )
+    omni3d_progress.progress(100, text="Omni3D class-agnostic mAP: complete")
 
     ap_50 = stats["ap_50"]
     ap_25 = stats["ap_25"]
@@ -838,13 +1179,42 @@ def _render_batch_eval():
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Micro precision @0.25", f"{ap_25['precision'] * 100:.1f}%")
+        st.metric("AP@11 (pooled) @0.5", f"{ap_50.get('micro_ap_r11', 0.0) * 100:.1f}%")
     with col2:
-        st.metric("Micro recall @0.25", f"{ap_25['recall'] * 100:.1f}%")
+        st.metric("AP@11 (pooled) @0.25", f"{ap_25.get('micro_ap_r11', 0.0) * 100:.1f}%")
     with col3:
-        st.metric("Total GT objects", stats["total_ground_truth"])
+        st.metric("Micro precision @0.25", f"{ap_25['precision'] * 100:.1f}%")
     with col4:
+        st.metric("Micro recall @0.25", f"{ap_25['recall'] * 100:.1f}%")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Total GT objects", stats["total_ground_truth"])
+    with col2:
         st.metric("Total detections", stats["total_detections"])
+
+    omni3d_stats = stats.get("omni3d_class_agnostic", {}) or {}
+    omni3d_ap_per_threshold = omni3d_stats.get("ap_per_threshold", {}) or {}
+    if omni3d_ap_per_threshold:
+        st.subheader("🥊 Omni3D-Style Class-Agnostic 3D mAP (secondary)")
+        st.caption(
+            "Secondary comparison metric aligned with Omni3D protocol: all labels are treated as one "
+            "\"object\" class, AP is computed at IoU thresholds 0.05..0.50 (step 0.05), and mAP is "
+            "the mean over those thresholds."
+        )
+        st.metric(
+            "Class-agnostic mAP (IoU 0.05:0.50)",
+            f"{float(omni3d_stats.get('map', 0.0)) * 100:.1f}%",
+        )
+        omni3d_rows = []
+        for thr_str in sorted(omni3d_ap_per_threshold.keys(), key=lambda v: float(v)):
+            omni3d_rows.append(
+                {
+                    "IoU threshold": thr_str,
+                    "AP": f"{float(omni3d_ap_per_threshold.get(thr_str, 0.0)) * 100:.1f}%",
+                }
+            )
+        st.dataframe(pd.DataFrame(omni3d_rows), width="stretch")
 
     st.subheader("📈 Precision-Recall Curves")
     _ds_slug = _batch_primary_dataset_slug(eval_batch_results)
@@ -889,6 +1259,22 @@ def _render_batch_eval():
             _render_per_class_pr_curves(ap_25, ap_50, all_cats)
         else:
             st.info("No per-class metrics available for the configured detection classes.")
+
+    dataset_slug = _batch_primary_dataset_slug(eval_batch_results)
+    if dataset_slug == "kitti":
+        st.subheader("🚗 KITTI Difficulty AP Tables")
+        st.caption(
+            "Per-class AP by KITTI difficulty (Easy/Moderate/Hard) using KITTI rules: "
+            "Easy: h>=40px, occlusion<=0, truncation<=0.15; "
+            "Moderate: h>=25px, occlusion<=1, truncation<=0.30; "
+            "Hard: h>=25px, occlusion<=2, truncation<=0.50. "
+            "Both PR-AUC AP and 11-point AP_R11 are shown."
+        )
+        kitti_tables = _compute_kitti_difficulty_ap_tables(eval_batch_results)
+        st.markdown("**IoU >= 0.25**")
+        st.dataframe(kitti_tables["iou_025"], width="stretch")
+        st.markdown("**IoU >= 0.50**")
+        st.dataframe(kitti_tables["iou_05"], width="stretch")
 
     st.subheader("⬇️ Export Mismatched Annotations")
     st.caption(
@@ -1155,7 +1541,7 @@ def _infer_scene_bucket(sample_meta: Dict) -> str:
     return "unknown"
 
 
-def _compute_eval_stats(batch_results: List[Dict], total_queued: int) -> Dict:
+def _compute_eval_stats_with_per_class(batch_results: List[Dict], total_queued: int) -> Tuple[Dict, List[Dict]]:
     stats = compute_batch_statistics(
         batch_results,
         total_queued=total_queued,
@@ -1163,14 +1549,32 @@ def _compute_eval_stats(batch_results: List[Dict], total_queued: int) -> Dict:
     )
     m25 = stats["ap_25"]
     m50 = stats["ap_50"]
-    return {
+    overall = {
         "macro_f1_25": m25["macro_f1"],
         "macro_f1_50": m50["macro_f1"],
+        "f150": m50["f1"],
         "precision25": m25["precision"],
+        "precision50": m50["precision"],
         "recall25": m25["recall"],
+        "recall50": m50["recall"],
         "f125": m25["f1"],
         "n_samples": len(batch_results),
     }
+    classes = sorted(set(m25.get("per_class", {}).keys()) | set(m50.get("per_class", {}).keys()))
+    per_class_rows: List[Dict] = []
+    for cls in classes:
+        c25 = m25.get("per_class", {}).get(cls, {})
+        c50 = m50.get("per_class", {}).get(cls, {})
+        per_class_rows.append({
+            "class": cls,
+            "precision25": float(c25.get("precision", 0.0)),
+            "recall25": float(c25.get("recall", 0.0)),
+            "f125": float(c25.get("f1", 0.0)),
+            "precision50": float(c50.get("precision", 0.0)),
+            "recall50": float(c50.get("recall", 0.0)),
+            "f150": float(c50.get("f1", 0.0)),
+        })
+    return overall, per_class_rows
 
 
 @st.cache_resource
@@ -1318,11 +1722,37 @@ def _render_single_pr_curve_figure(
     ap_val = float(ap_bundle.get("micro_ap_pr", 0.0))
     fig, ax = plt.subplots(figsize=(8.2, 5.2), dpi=180)
     ax.set_facecolor("#FBFBFD")
-    _pr_fill_under_stair(ax, xr, yr, color=line_color, alpha=0.12)
-    ax.plot(xr, yr, linestyle="-", linewidth=2.4, color=line_color, label=f"Pooled AP={ap_val:.3f}")
+    if xr.size > 0 and yr.size > 0:
+        _pr_fill_under_stair(ax, xr, yr, color=line_color, alpha=0.12)
+        ax.plot(
+            xr,
+            yr,
+            linestyle="-",
+            linewidth=2.4,
+            color=line_color,
+            label=f"Pooled AP={ap_val:.3f}",
+            marker="o",
+            markersize=3.0,
+        )
+    else:
+        ax.plot([], [], linestyle="-", linewidth=2.4, color=line_color, label=f"Pooled AP={ap_val:.3f}")
     r_max = float(np.max(rec))
-    x_pad = max(1e-4, 0.02 * max(r_max, 1e-4))
-    ax.set_xlim(0.0, min(1.0, r_max + x_pad))
+    if r_max <= 1e-9:
+        # Degenerate PR case (typically no TP): keep full axis so the curve
+        # does not visually collapse to an "empty" plot at x ~= 0.
+        ax.set_xlim(0.0, 1.0)
+        if xr.size > 0 and yr.size > 0:
+            ax.scatter([0.0], [float(yr[-1])], color=line_color, s=28, zorder=5)
+            ax.text(
+                0.02,
+                min(0.98, float(yr[-1]) + 0.03),
+                "Recall stays at 0",
+                color=line_color,
+                fontsize=9,
+            )
+    else:
+        x_pad = max(1e-4, 0.02 * max(r_max, 1e-4))
+        ax.set_xlim(0.0, min(1.0, r_max + x_pad))
     ax.set_ylim(0.0, 1.02)
     ax.set_xlabel("Recall", fontsize=12)
     ax.set_ylabel("Precision", fontsize=12)
@@ -1518,11 +1948,21 @@ def _render_ablation_study_runner():
     with cfg1:
         primary_metric = st.selectbox(
             "Primary metric",
-            ["Micro-F1@0.25", "Macro-F1@0.25", "Macro-F1@0.50"],
+            ["Micro-F1@0.25", "Micro-F1@0.50", "Macro-F1@0.25", "Macro-F1@0.50"],
             index=0,
         )
     with cfg2:
         eps_raw = st.text_input("Adaptive DBSCAN eps sweep", "0.20,0.30,0.40,0.50,0.70,0.90")
+    run_mode = st.radio(
+        "Ablation run mode",
+        ["Ground removal only", "DBSCAN epsilon only", "Run both"],
+        horizontal=True,
+    )
+    report_cols = st.multiselect(
+        "Also report",
+        ["Precision@0.25", "Recall@0.25", "Precision@0.50", "Recall@0.50"],
+        default=["Precision@0.25", "Recall@0.25"],
+    )
 
     try:
         eps_values = [float(v.strip()) for v in eps_raw.split(",") if v.strip()]
@@ -1533,11 +1973,15 @@ def _render_ablation_study_runner():
         st.warning("Provide at least one epsilon value.")
         return
 
-    if not st.button("🚀 Run Ablation (rerun selected batch)", type="primary"):
+    if not st.button("🚀 Run Selected Ablation", type="primary"):
         payload = st.session_state.get("ablation_study_payload")
+        per_class_payload = st.session_state.get("ablation_study_per_class_payload")
         if payload:
             st.caption("Cached ablation results available below.")
             st.dataframe(pd.DataFrame(payload), width="stretch")
+        if per_class_payload:
+            st.caption("Cached per-class ablation results available below.")
+            st.dataframe(pd.DataFrame(per_class_payload), width="stretch")
         return
 
     detection_mod = _load_detection_page_module()
@@ -1552,41 +1996,62 @@ def _render_ablation_study_runner():
     total_queued = len(selected_batch)
 
     rows: List[Dict] = []
-    ground_variants: List[Tuple[str, Dict]] = []
-    p_auto = copy.deepcopy(base_original)
-    ground_variants.append(("scene-aware-ground", p_auto))
-    p_outdoor = copy.deepcopy(base_original)
-    p_outdoor["pipeline_indoor"] = copy.deepcopy(p_outdoor["pipeline"])
-    ground_variants.append(("single-outdoor-ground", p_outdoor))
-    p_indoor = copy.deepcopy(base_original)
-    p_indoor["pipeline"] = copy.deepcopy(p_indoor["pipeline_indoor"])
-    ground_variants.append(("single-indoor-ground", p_indoor))
+    per_class_rows: List[Dict] = []
+    run_ground = run_mode in {"Ground removal only", "Run both"}
+    run_dbscan = run_mode in {"DBSCAN epsilon only", "Run both"}
 
-    st.markdown("**Running ground-removal ablation...**")
-    for variant_name, params_variant in ground_variants:
-        results = _run_batch_with_params(detection_mod, selected_batch, params_variant, preloaded_bbox_data)
-        stats_all = _compute_eval_stats(results, total_queued=total_queued)
-        rows.append({"study": "ground_removal", "variant": variant_name, "scene": "all", **stats_all})
-        for scene in ["indoor", "outdoor"]:
-            subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
-            if subset:
-                rows.append({"study": "ground_removal", "variant": variant_name, "scene": scene, **_compute_eval_stats(subset, len(subset))})
+    if run_ground:
+        ground_variants: List[Tuple[str, Dict]] = []
+        p_auto = copy.deepcopy(base_original)
+        ground_variants.append(("scene-aware-ground", p_auto))
+        p_outdoor = copy.deepcopy(base_original)
+        p_outdoor["pipeline_indoor"] = copy.deepcopy(p_outdoor["pipeline"])
+        ground_variants.append(("single-outdoor-ground", p_outdoor))
+        p_indoor = copy.deepcopy(base_original)
+        p_indoor["pipeline"] = copy.deepcopy(p_indoor["pipeline_indoor"])
+        ground_variants.append(("single-indoor-ground", p_indoor))
 
-    st.markdown("**Running adaptive DBSCAN epsilon ablation...**")
-    for eps in eps_values:
-        p_eps = copy.deepcopy(base_original)
-        p_eps["clustering"]["clustering_algorithm"] = "adaptive_dbscan"
-        p_eps["clustering"]["adaptive_dbscan_base_eps"] = float(eps)
-        results = _run_batch_with_params(detection_mod, selected_batch, p_eps, preloaded_bbox_data)
-        stats_all = _compute_eval_stats(results, total_queued=total_queued)
-        rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": "all", **stats_all})
-        for scene in ["indoor", "outdoor"]:
-            subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
-            if subset:
-                rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": scene, **_compute_eval_stats(subset, len(subset))})
+        st.markdown("**Running ground-removal ablation...**")
+        for variant_name, params_variant in ground_variants:
+            results = _run_batch_with_params(detection_mod, selected_batch, params_variant, preloaded_bbox_data)
+            stats_all, class_all = _compute_eval_stats_with_per_class(results, total_queued=total_queued)
+            rows.append({"study": "ground_removal", "variant": variant_name, "scene": "all", **stats_all})
+            per_class_rows.extend(
+                [{"study": "ground_removal", "variant": variant_name, "scene": "all", **r} for r in class_all]
+            )
+            for scene in ["indoor", "outdoor"]:
+                subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
+                if subset:
+                    scene_stats, scene_class = _compute_eval_stats_with_per_class(subset, len(subset))
+                    rows.append({"study": "ground_removal", "variant": variant_name, "scene": scene, **scene_stats})
+                    per_class_rows.extend(
+                        [{"study": "ground_removal", "variant": variant_name, "scene": scene, **r} for r in scene_class]
+                    )
+
+    if run_dbscan:
+        st.markdown("**Running adaptive DBSCAN epsilon ablation...**")
+        for eps in eps_values:
+            p_eps = copy.deepcopy(base_original)
+            p_eps["clustering"]["clustering_algorithm"] = "adaptive_dbscan"
+            p_eps["clustering"]["adaptive_dbscan_base_eps"] = float(eps)
+            results = _run_batch_with_params(detection_mod, selected_batch, p_eps, preloaded_bbox_data)
+            stats_all, class_all = _compute_eval_stats_with_per_class(results, total_queued=total_queued)
+            rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": "all", **stats_all})
+            per_class_rows.extend(
+                [{"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": "all", **r} for r in class_all]
+            )
+            for scene in ["indoor", "outdoor"]:
+                subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
+                if subset:
+                    scene_stats, scene_class = _compute_eval_stats_with_per_class(subset, len(subset))
+                    rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": scene, **scene_stats})
+                    per_class_rows.extend(
+                        [{"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": scene, **r} for r in scene_class]
+                    )
 
     st.session_state.params = base_original
     st.session_state.ablation_study_payload = rows
+    st.session_state.ablation_study_per_class_payload = per_class_rows
     df = pd.DataFrame(rows)
     st.dataframe(df, width="stretch")
     st.download_button(
@@ -1596,13 +2061,45 @@ def _render_ablation_study_runner():
         mime="text/csv",
         width="stretch",
     )
+    per_class_df = pd.DataFrame(per_class_rows)
+    if not per_class_df.empty:
+        st.markdown("**Per-class ablation metrics**")
+        st.dataframe(per_class_df, width="stretch")
+        st.download_button(
+            "⬇️ Download per-class ablation metrics (CSV)",
+            data=per_class_df.to_csv(index=False),
+            file_name="ablation_metrics_per_class.csv",
+            mime="text/csv",
+            width="stretch",
+        )
 
     if primary_metric == "Micro-F1@0.25":
         metric_col = "f125"
+    elif primary_metric == "Micro-F1@0.50":
+        metric_col = "f150"
     elif primary_metric == "Macro-F1@0.25":
         metric_col = "macro_f1_25"
     else:
         metric_col = "macro_f1_50"
+
+    display_col_map = {
+        "Precision@0.25": "precision25",
+        "Recall@0.25": "recall25",
+        "Precision@0.50": "precision50",
+        "Recall@0.50": "recall50",
+    }
+    metric_and_reports = [metric_col] + [display_col_map[k] for k in report_cols if k in display_col_map]
+    metric_and_reports = list(dict.fromkeys(metric_and_reports))
+    if metric_and_reports:
+        report_df = df.copy()
+        for col in metric_and_reports:
+            if col in report_df.columns:
+                report_df[col] = report_df[col].astype(float) * 100.0
+        st.markdown("**Selected metric report (%)**")
+        st.dataframe(
+            report_df[["study", "variant", "scene", *metric_and_reports, "n_samples"]],
+            width="stretch",
+        )
     ground_df = df[df["study"] == "ground_removal"]
     if not ground_df.empty:
         fig1, ax1 = plt.subplots(figsize=(10, 5), dpi=140)
@@ -1693,11 +2190,44 @@ def main():
             ),
         )
 
+        up_files = st.file_uploader(
+            "Load exported detection JSON (from **4_Export**)",
+            type=["json"],
+            accept_multiple_files=True,
+            key="eval_import_detection_files",
+            help=(
+                "**Save 3D cuboids to JSON** (`det3d_*.json`) or a `{ \"samples\": [...] }` batch payload. "
+                "Multiple files concatenate in upload order."
+            ),
+        )
+        load_btn_disabled = up_files is None or len(up_files) == 0
+        load_clicked = st.button(
+            "Use uploaded JSON as batch evaluation",
+            key="eval_apply_detection_import",
+            disabled=load_btn_disabled,
+        )
+        if load_clicked:
+            merged, any_tracking, import_errs = _merge_uploaded_detection_files(up_files)
+            if import_errs and not merged:
+                for err_line in import_errs:
+                    st.error(err_line)
+            else:
+                for err_line in import_errs:
+                    st.warning(err_line)
+            if merged:
+                st.session_state.batch_export_results = {
+                    "samples": merged,
+                    "batch_tracking_enabled": any_tracking,
+                }
+                stubs = [_batch_sample_stub_from_import(s, idx) for idx, s in enumerate(merged)]
+                st.session_state.batch_samples = stubs
+                st.sidebar.success(f"Loaded **{len(merged)}** exported sample(s) for evaluation.")
+
     if not has_batch and not has_batch_selection and not has_single:
-        if 'sample' not in st.session_state or st.session_state.sample is None:
-            st.info("👈 Please load a sample from **1_Dataset_Extraction** page first.")
-        else:
-            st.info("👈 Please run the detection pipeline on **2_Detection** page first.")
+        st.info(
+            "Use **Load exported detection JSON** in the sidebar (from **4_Export**, e.g. `det3d_*.json`), "
+            "or load a dataset and run detection on **2_Detection**."
+        )
         return
 
     if has_batch and has_batch_selection and has_single:
@@ -1708,12 +2238,20 @@ def main():
             _render_ablation_study_runner()
         with tab_single:
             _render_single_sample_eval()
+    elif has_batch and has_single:
+        tab_batch, tab_single = st.tabs(["📚 Batch Evaluation", "🔬 Single Sample"])
+        with tab_batch:
+            _render_batch_eval()
+        with tab_single:
+            _render_single_sample_eval()
     elif has_batch and has_batch_selection:
         tab_batch, tab_ablation = st.tabs(["📚 Batch Evaluation", "🧪 Ablation Study"])
         with tab_batch:
             _render_batch_eval()
         with tab_ablation:
             _render_ablation_study_runner()
+    elif has_batch:
+        _render_batch_eval()
     elif has_batch_selection and has_single:
         tab_ablation, tab_single = st.tabs(["🧪 Ablation Study", "🔬 Single Sample"])
         with tab_ablation:

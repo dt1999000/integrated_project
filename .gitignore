@@ -33,6 +33,7 @@ pages/archive_folder/
 archive/
 models/
 output/
+docs/
 
 DETECTION_PIPELINE_CONSOLIDATION_PLAN.md
 POINTCLOUD_EXTENSION_PLAN.md
