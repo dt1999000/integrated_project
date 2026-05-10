@@ -164,6 +164,257 @@ def cuboid_kitti_format(center, yaw, length, width, height, color="blue", opacit
     # Use cuboid_from_corners to create the mesh
     return cuboid_from_corners(corners, color=color, opacity=opacity, name=name)
 
+def compute_cuboid_eight_corners(cuboid: Dict) -> Optional[np.ndarray]:
+    """
+    Return (8, 3) LiDAR corner coordinates for cuboid meshes / wireframes.
+
+    Supports corner-based cuboids, KITTI center/yaw/box dims, or axis-aligned min/max.
+    """
+    corners = cuboid.get("corners")
+    if corners is not None:
+        arr = np.asarray(corners, dtype=np.float64)
+        if arr.shape == (8, 3):
+            return arr
+
+    center = cuboid.get("center")
+    yaw = cuboid.get("yaw")
+    length = cuboid.get("length")
+    width = cuboid.get("width")
+    height = cuboid.get("height")
+    if (
+        center is not None
+        and yaw is not None
+        and length is not None
+        and width is not None
+        and height is not None
+    ):
+        center_np = np.asarray(center, dtype=np.float64).reshape(3)
+        l_half = float(length) / 2.0
+        w_half = float(width) / 2.0
+        h_half = float(height) / 2.0
+        corners_local = np.array([
+            [-l_half, -w_half, -h_half],
+            [ l_half, -w_half, -h_half],
+            [ l_half,  w_half, -h_half],
+            [-l_half,  w_half, -h_half],
+            [-l_half, -w_half,  h_half],
+            [ l_half, -w_half,  h_half],
+            [ l_half,  w_half,  h_half],
+            [-l_half,  w_half,  h_half],
+        ])
+        cos_yaw = np.cos(float(yaw))
+        sin_yaw = np.sin(float(yaw))
+        r_z = np.array([
+            [cos_yaw, -sin_yaw, 0],
+            [sin_yaw,  cos_yaw, 0],
+            [0.0, 0.0, 1.0],
+        ])
+        return (r_z @ corners_local.T).T + center_np
+
+    need = ("min_x", "min_y", "min_z", "max_x", "max_y", "max_z")
+    if all(k in cuboid for k in need):
+        x0, y0, z0 = float(cuboid["min_x"]), float(cuboid["min_y"]), float(cuboid["min_z"])
+        x1, y1, z1 = float(cuboid["max_x"]), float(cuboid["max_y"]), float(cuboid["max_z"])
+        return np.array([
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y1, z0],
+            [x0, y1, z0],
+            [x0, y0, z1],
+            [x1, y0, z1],
+            [x1, y1, z1],
+            [x0, y1, z1],
+        ], dtype=np.float64)
+
+    return None
+
+
+def _cuboid_wireframe_line_coords(corners: np.ndarray) -> Tuple[List, List, List]:
+    """Plotly line coordinates with None breaks between edges (12 edges)."""
+    edges = (
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    )
+    xs: List = []
+    ys: List = []
+    zs: List = []
+    for a, b in edges:
+        xs.extend([corners[a, 0], corners[b, 0], None])
+        ys.extend([corners[a, 1], corners[b, 1], None])
+        zs.extend([corners[a, 2], corners[b, 2], None])
+    return xs, ys, zs
+
+
+def _subsample_xyz_points(points: np.ndarray, max_points: int) -> np.ndarray:
+    if points is None or len(points) == 0:
+        return points
+    if len(points) <= max_points:
+        return points
+    idx = np.random.choice(len(points), max_points, replace=False)
+    return points[idx]
+
+
+def create_evaluation_mask_wireframe_figure(
+    sparse_points: np.ndarray,
+    mask_assignments: np.ndarray,
+    detected_cuboids: List[Dict],
+    mask_colors: List[Tuple[float, float, float]],
+    best_cluster_sparse_indices: Optional[Dict[int, np.ndarray]] = None,
+    title: str = "Detections: mask-colored sparse points + cuboid wireframes",
+    max_best_points_per_trace: int = 3000,
+    max_noise_points_per_trace: int = 3000,
+    max_unassigned_points: int = 6000,
+) -> go.Figure:
+    """
+    Second-view evaluation plot: sparse depth points colored by SAM mask assignment,
+    heavier rendering for best-cluster points and translucent for residual mask points,
+    unassigned points in light grey; detected cuboids shown as colored wireframes
+    (same mask palette as segmentation). Wireframe traces omit the legend; point
+    traces keep legend entries.
+    """
+    fig = go.Figure()
+
+    n_pts = len(sparse_points)
+    if mask_assignments is None or len(mask_assignments) != n_pts:
+        fig.update_layout(title=title + " (mask assignment mismatch — empty)")
+        return fig
+
+    n_masks = len(mask_colors)
+    if n_masks == 0:
+        fig.update_layout(title=title + " (no mask colors)")
+        return fig
+
+    best_by_mask: Dict[int, np.ndarray] = {}
+    if best_cluster_sparse_indices:
+        for mid, ix in best_cluster_sparse_indices.items():
+            if ix is not None and len(ix) > 0:
+                best_by_mask[int(mid)] = np.asarray(ix, dtype=np.int64)
+    split_best_vs_rest = len(best_by_mask) > 0
+
+    for mask_idx in range(n_masks):
+        rgb = mask_colors[mask_idx]
+        color_str = f"rgb({int(rgb[0] * 255)}, {int(rgb[1] * 255)}, {int(rgb[2] * 255)})"
+
+        glo = np.flatnonzero(mask_assignments == mask_idx)
+        if glo.size == 0:
+            continue
+
+        mask_xyz = sparse_points[glo]
+        best_ix = best_by_mask.get(mask_idx)
+        if split_best_vs_rest and best_ix is not None and len(best_ix) > 0:
+            is_best = np.isin(glo, best_ix)
+            best_points = mask_xyz[is_best]
+            noise_points = mask_xyz[~is_best]
+
+            if len(best_points) > 0:
+                vis = _subsample_xyz_points(best_points, max_best_points_per_trace)
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=vis[:, 0],
+                        y=vis[:, 1],
+                        z=vis[:, 2],
+                        mode="markers",
+                        marker=dict(
+                            size=4,
+                            color=color_str,
+                            opacity=0.95,
+                            line=dict(width=0.5, color=color_str),
+                        ),
+                        name=f"Mask {mask_idx + 1} best cluster",
+                    )
+                )
+
+            if len(noise_points) > 0:
+                vis_n = _subsample_xyz_points(noise_points, max_noise_points_per_trace)
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=vis_n[:, 0],
+                        y=vis_n[:, 1],
+                        z=vis_n[:, 2],
+                        mode="markers",
+                        marker=dict(size=2, color=color_str, opacity=0.22),
+                        name=f"Mask {mask_idx + 1} other points",
+                    )
+                )
+        else:
+            vis_all = _subsample_xyz_points(mask_xyz, max_best_points_per_trace)
+            fig.add_trace(
+                go.Scatter3d(
+                    x=vis_all[:, 0],
+                    y=vis_all[:, 1],
+                    z=vis_all[:, 2],
+                    mode="markers",
+                    marker=dict(
+                        size=4,
+                        color=color_str,
+                        opacity=0.95,
+                        line=dict(width=0.5, color=color_str),
+                    ),
+                    name=f"Mask {mask_idx + 1} points",
+                )
+            )
+
+    unassigned = np.flatnonzero(mask_assignments < 0)
+    if unassigned.size > 0:
+        ua = _subsample_xyz_points(sparse_points[unassigned], max_unassigned_points)
+        fig.add_trace(
+            go.Scatter3d(
+                x=ua[:, 0],
+                y=ua[:, 1],
+                z=ua[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=2,
+                    color="rgb(200, 200, 206)",
+                    opacity=0.45,
+                ),
+                name="Unassigned (no mask)",
+            )
+        )
+
+    for cuboid in detected_cuboids:
+        cc = compute_cuboid_eight_corners(cuboid)
+        if cc is None:
+            continue
+        bbox_idx = cuboid.get("source_bbox_idx")
+        cat = cuboid.get("category", "Unknown")
+        if bbox_idx is not None:
+            mc = mask_colors[int(bbox_idx) % len(mask_colors)]
+            wcol = f"rgb({int(mc[0] * 255)}, {int(mc[1] * 255)}, {int(mc[2] * 255)})"
+            hover_name = f"Wire F{bbox_idx}: {cat}"
+        else:
+            wcol = "rgb(180, 180, 180)"
+            hover_name = f"Wire: {cat}"
+
+        wx, wy, wz = _cuboid_wireframe_line_coords(cc)
+        fig.add_trace(
+            go.Scatter3d(
+                x=wx,
+                y=wy,
+                z=wz,
+                mode="lines",
+                line=dict(color=wcol, width=7),
+                name=hover_name,
+                showlegend=False,
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+        scene=dict(
+            xaxis_title="X (m)",
+            yaxis_title="Y (m)",
+            zaxis_title="Z (m)",
+            aspectmode="data",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+        height=700,
+    )
+    return fig
+
+
 def frustum_from_camera_and_corners(camera_origin: np.ndarray,
                                      base_corners: np.ndarray,
                                      color: str = "blue",
@@ -928,8 +1179,12 @@ def render_point_cloud_plot(
     fig: go.Figure,
     export_basename: str,
     use_container_width: bool = False,
+    show_legend: bool = True,
 ) -> None:
-    """Render a point-cloud plot with Streamlit display + structured HTML export."""
+    """Render a point-cloud plot with Streamlit display + structured HTML export.
+
+    When ``show_legend`` is False, no legend is shown in the app or in downloaded HTML.
+    """
 
     def _build_structured_pointcloud_html(plot_fig: go.Figure, plot_name: str) -> str:
         fig_dict = plot_fig.to_dict()
@@ -1012,14 +1267,10 @@ def render_point_cloud_plot(
             axis_cfg["range"] = range_override
         return axis_cfg
 
-    fig.update_layout(
-        legend=dict(
-            font=dict(size=display_legend_font_size),
-            title=dict(font=dict(size=display_legend_font_size)),
-            itemsizing="constant",
-        ),
-        title=dict(font=dict(size=display_caption_font_size)),
-        scene=dict(
+    display_layout: Dict[str, Any] = {
+        "title": dict(font=dict(size=display_caption_font_size)),
+        "scene": dict(
+            domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
             xaxis=_scene_axis(
                 "x",
                 "X (m)",
@@ -1042,7 +1293,22 @@ def render_point_cloud_plot(
                 display_axis_tick_font_size,
             ),
         ),
-    )
+    }
+    if show_legend:
+        display_layout["legend"] = dict(
+            font=dict(size=display_legend_font_size),
+            title=dict(font=dict(size=display_legend_font_size)),
+            itemsizing="constant",
+            x=0.99,
+            xanchor="right",
+            y=0.98,
+            yanchor="top",
+            orientation="v",
+            bgcolor="rgb(255, 255, 255)",
+        )
+    else:
+        display_layout["showlegend"] = False
+    fig.update_layout(**display_layout)
     export_config = {
         "toImageButtonOptions": {
             "format": "png",
@@ -1060,21 +1326,16 @@ def render_point_cloud_plot(
         st.plotly_chart(fig, config=export_config)
 
     export_fig = go.Figure(fig)
-    export_fig.update_layout(
-        width=1920,
-        height=1080,
-        autosize=True,
-        margin=dict(l=10, r=10, t=55, b=10),
-        legend=dict(
-            font=dict(size=export_legend_font_size),
-            title=dict(font=dict(size=export_legend_font_size)),
-            itemsizing="constant",
-        ),
-        title=dict(
+    export_layout: Dict[str, Any] = {
+        "width": 1920,
+        "height": 1080,
+        "autosize": True,
+        "margin": dict(l=10, r=10, t=55, b=10),
+        "title": dict(
             font=dict(size=export_caption_font_size),
             pad=dict(t=6, b=2),
         ),
-        scene=dict(
+        "scene": dict(
             domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
             xaxis=_scene_axis(
                 "x",
@@ -1098,7 +1359,22 @@ def render_point_cloud_plot(
                 export_axis_tick_font_size,
             ),
         ),
-    )
+    }
+    if show_legend:
+        export_layout["legend"] = dict(
+            font=dict(size=export_legend_font_size),
+            title=dict(font=dict(size=export_legend_font_size)),
+            itemsizing="constant",
+            x=0.99,
+            xanchor="right",
+            y=0.98,
+            yanchor="top",
+            orientation="v",
+            bgcolor="rgb(255, 255, 255)",
+        )
+    else:
+        export_layout["showlegend"] = False
+    export_fig.update_layout(**export_layout)
 
     st.download_button(
         "⬇️ Download interactive HTML (high quality)",
