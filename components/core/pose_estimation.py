@@ -6,7 +6,7 @@ from 3D point clouds. Supports PCA-based and L-shape fitting approaches.
 """
 
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 # Import templates from constants (avoid circular import by checking if already imported)
 try:
@@ -364,7 +364,7 @@ def fit_cuboid_to_points_outdoor(points: np.ndarray,
                                  max_step_center: int = 10,
                                  d_theta: float = 0.05,
                                  normals: Optional[np.ndarray] = None,
-                                 score_weights: Tuple[float, float, float] = (1.0, 0.5, 2.0),
+                                 score_weights: Sequence[float] = (1.0, 0.5, 2.0, 0.5),
                                  ground_z: Optional[float] = None) -> Dict:
     """
     Outdoor / automotive-style cuboid fitting with fixed template dimensions (e.g. from LLM).
@@ -384,6 +384,10 @@ def fit_cuboid_to_points_outdoor(points: np.ndarray,
     - Geometric consistency: local surface normals should align with the
       vector from the cuboid center to each point.
     - Outlier penalty: fraction of points that fall outside the cuboid.
+    - Tangent-direction coverage (B) on the same two edges: penalize a short
+      span of inlier projections along each face's tangent (corners or narrow
+      strips on an otherwise long side), weighted by ``w_cover``; see
+      ``score_weights``.
     
     Args:
         points: np.ndarray (N, 3) - 3D points in LiDAR coordinates
@@ -392,8 +396,8 @@ def fit_cuboid_to_points_outdoor(points: np.ndarray,
         max_step_center: Maximum number of steps for center search
         d_theta: Angular step size for yaw search (radians)
         normals: Optional (N, 3) array of surface normals for geometric consistency
-        score_weights: Tuple (w_dist, w_geo, w_out) - weights for distance, 
-                      geometric consistency, and outlier penalty terms
+        score_weights: (w_dist, w_geo, w_out) or (w_dist, w_geo, w_out, w_cover).
+                      If only three weights are given, w_cover defaults to 0.5.
         ground_z: If provided, cuboid bottom is fixed at this z (center z = ground_z + height/2).
     
     Returns:
@@ -409,7 +413,17 @@ def fit_cuboid_to_points_outdoor(points: np.ndarray,
         raise ValueError("normals must have shape (N, 3) if provided")
 
     length, width, height = map(float, dimensions)
-    w_dist, w_geo, w_out = map(float, score_weights)
+    sw = tuple(float(x) for x in score_weights)
+    if len(sw) == 3:
+        w_dist, w_geo, w_out = sw
+        w_cover = 0.5
+    elif len(sw) == 4:
+        w_dist, w_geo, w_out, w_cover = sw
+    else:
+        raise ValueError(
+            "score_weights must have length 3 (w_dist, w_geo, w_out) or 4 "
+            "(+ w_cover tangent coverage)"
+        )
     half_h = height / 2.0
 
     # Mean of the points
@@ -456,26 +470,56 @@ def fit_cuboid_to_points_outdoor(points: np.ndarray,
         lateral_centers = np.stack([center_front, center_back, center_right, center_left], axis=0)
         dists_to_origin = np.linalg.norm(lateral_centers, axis=1)
         two_closest_idx = np.argsort(dists_to_origin)[:2]
+
+        def _face_geometry(idx_local: int):
+            if idx_local == 0:
+                return u_xy, center_front, v_xy, half_w
+            if idx_local == 1:
+                return -u_xy, center_back, v_xy, half_w
+            if idx_local == 2:
+                return v_xy, center_right, u_xy, half_l
+            return -v_xy, center_left, u_xy, half_l
+
         sq_dists = []
+        face_specs = []
         for idx in two_closest_idx:
-            if idx == 0:
-                n_vec, p0 = u_xy, center_front
-            elif idx == 1:
-                n_vec, p0 = -u_xy, center_back
-            elif idx == 2:
-                n_vec, p0 = v_xy, center_right
-            else:
-                n_vec, p0 = -v_xy, center_left
+            n_vec, p0, tangent, half_along = _face_geometry(int(idx))
+            face_specs.append((n_vec, p0, tangent, half_along))
             diff = points_xy - p0[None, :]
             d_plane = np.abs(diff @ n_vec)
             sq_dists.append(d_plane ** 2)
         sq_dists = np.stack(sq_dists, axis=1)
         mean_min_sq_dist = float(np.mean(np.min(sq_dists, axis=1)))
-        return w_dist * mean_min_sq_dist + w_out * outlier_frac
+
+        inliers = ~outside
+        cover_penalty = 1.0
+        if np.any(inliers):
+            pi = points_xy[inliers]
+            d0 = np.abs((pi - face_specs[0][1]) @ face_specs[0][0])
+            d1 = np.abs((pi - face_specs[1][1]) @ face_specs[1][0])
+            assign_first = d0 <= d1
+            pen_parts = []
+            for fi in range(2):
+                n_vec, p0, tangent, half_along = face_specs[fi]
+                mask = assign_first if fi == 0 else ~assign_first
+                if not np.any(mask):
+                    pen_parts.append(1.0)
+                    continue
+                s_along = (pi[mask] - p0) @ tangent
+                span_ratio = float(np.ptp(s_along)) / (2.0 * half_along)
+                span_ratio = min(1.0, max(0.0, span_ratio))
+                pen_parts.append(1.0 - span_ratio)
+            cover_penalty = float(np.mean(pen_parts))
+
+        return (
+            w_dist * mean_min_sq_dist
+            + w_out * outlier_frac
+            + w_cover * cover_penalty
+        )
 
     def _score_for_hypothesis(center: np.ndarray, yaw: float, 
                               dims: Tuple[float, float, float],
-                              weights: Tuple[float, float, float]) -> float:
+                              weights: Tuple[float, float, float, float]) -> float:
         # Extract dimensions
         l, w_dim, h = dims
         half_l = l / 2.0
@@ -527,26 +571,45 @@ def fit_cuboid_to_points_outdoor(points: np.ndarray,
         # Two lateral faces whose centers are closest to origin
         two_closest_idx = np.argsort(dists_to_origin)[:2]
 
-        face_normals = []
-        for idx in two_closest_idx:
-            if idx == 0:
-                face_normals.append((u, center_front))
-            elif idx == 1:
-                face_normals.append((-u, center_back))
-            elif idx == 2:
-                face_normals.append((v, center_right))
-            elif idx == 3:
-                face_normals.append((-v, center_left))
+        def _face_geometry_3d(idx_local: int):
+            if idx_local == 0:
+                return u, center_front, v, half_w
+            if idx_local == 1:
+                return -u, center_back, v, half_w
+            if idx_local == 2:
+                return v, center_right, u, half_l
+            return -v, center_left, u, half_l
 
-        # Distance to visible lateral faces only (no top, no z-direction)
+        face_specs = [_face_geometry_3d(int(i)) for i in two_closest_idx]
+
         sq_dists = []
-        for n_vec, p0 in face_normals:
+        for n_vec, p0, _t, _h in face_specs:
             diff = points - p0[None, :]
             d_plane = np.abs(diff @ n_vec)
             sq_dists.append(d_plane ** 2)
-        sq_dists = np.stack(sq_dists, axis=1)  # (N, 2)
+        sq_dists = np.stack(sq_dists, axis=1)
         min_sq_dist = np.min(sq_dists, axis=1)
         mean_min_sq_dist = float(np.mean(min_sq_dist))
+
+        inliers = ~outside
+        cover_penalty = 1.0
+        if np.any(inliers):
+            pi = points[inliers]
+            d0 = np.abs((pi - face_specs[0][1]) @ face_specs[0][0])
+            d1 = np.abs((pi - face_specs[1][1]) @ face_specs[1][0])
+            assign_first = d0 <= d1
+            pen_parts = []
+            for fi in range(2):
+                n_vec, p0, tangent, half_along = face_specs[fi]
+                mask = assign_first if fi == 0 else ~assign_first
+                if not np.any(mask):
+                    pen_parts.append(1.0)
+                    continue
+                s_along = (pi[mask] - p0) @ tangent
+                span_ratio = float(np.ptp(s_along)) / (2.0 * half_along)
+                span_ratio = min(1.0, max(0.0, span_ratio))
+                pen_parts.append(1.0 - span_ratio)
+            cover_penalty = float(np.mean(pen_parts))
 
         # Geometric consistency term
         geo_term = 0.0
@@ -557,11 +620,12 @@ def fit_cuboid_to_points_outdoor(points: np.ndarray,
             cos_angles = np.sum(normals * dir_center_to_point, axis=1)
             geo_term = float(np.mean(1.0 - np.abs(cos_angles)))
 
-        w_d, w_g, w_o = weights
+        w_d, w_g, w_o, w_c = weights
         score = (
             w_d * mean_min_sq_dist +
             w_g * geo_term +
-            w_o * outlier_frac
+            w_o * outlier_frac +
+            w_c * cover_penalty
         )
         return score
     
@@ -585,7 +649,10 @@ def fit_cuboid_to_points_outdoor(points: np.ndarray,
         for n in range(max_step_center + 1):
             center = mu + step_center_search * n * ray_dir
             for yaw in np.arange(0.0, np.pi, d_theta):
-                score = _score_for_hypothesis(center, yaw, (length, width, height), (w_dist, w_geo, w_out))
+                score = _score_for_hypothesis(
+                    center, yaw, (length, width, height),
+                    (w_dist, w_geo, w_out, w_cover),
+                )
                 if score < best_score:
                     best_score = score
                     best_center = center.copy()
