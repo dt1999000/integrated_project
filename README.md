@@ -11,18 +11,6 @@ The app is split into four Streamlit pages that share state through `st.session_
 3. `3_Evaluation` compares detections with ground truth and computes metrics.
 4. `4_Export` writes results to JSON, KITTI-style tracklets, and CVAT-compatible exports.
 
-You need to create the models directory and add the pretrained weights for the detection and segmentation models you want to use. The app will look for these files when running the pipeline. The structure of the models directory should be as follows:
-
-```models/
-├── sam*.pth # SAM segmentation model weights
-├── yoloworld or yoloe*.pt # YOLOWorld/e detection model weights
-├── llm
-    |-- *.pth # LLM-based model weights
-├── some external models weights from hugging face, e.g. grounding dino/wedetect, etc.
-```
-get at least a sam segmentation model from e.g. https://docs.ultralytics.com/models/sam-2/#installation and a yoloworld model from https://docs.ultralytics.com/models/yolo-world/#available-models-supported-tasks-and-operating-modes
-For batch runs, make sure the full set of weights is already present before you start processing. The same models are reused for every sample in the queue.
-
 ## Recommended Workflow
 
 Follow this order for the smoothest experience:
@@ -82,6 +70,19 @@ streamlit run app.py
 ```
 
 This opens the main dashboard with the four pages in the sidebar.
+
+## Models Preparation
+You need to create the models directory and add the pretrained weights for the detection and segmentation models you want to use. The app will look for these files when running the pipeline. The structure of the models directory should be as follows:
+
+```models/
+├── sam*.pth # SAM segmentation model weights
+├── yoloworld or yoloe*.pt # YOLOWorld/e detection model weights
+├── llm
+    |-- *.pth # LLM-based model weights
+├── some external models weights from hugging face, e.g. grounding dino/wedetect, etc.
+```
+get at least a sam segmentation model from e.g. https://docs.ultralytics.com/models/sam-2/#installation and a yoloworld model from https://docs.ultralytics.com/models/yolo-world/#available-models-supported-tasks-and-operating-modes
+For batch runs, make sure the full set of weights is already present before you start processing. The same models are reused for every sample in the queue.
 
 ## How To Use Each Page
 
