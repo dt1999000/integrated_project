@@ -1542,10 +1542,29 @@ def _infer_scene_bucket(sample_meta: Dict) -> str:
 
 
 def _compute_eval_stats_with_per_class(batch_results: List[Dict], total_queued: int) -> Tuple[Dict, List[Dict]]:
+    """
+    Match Batch Evaluation metric prep: infer empty GT on annotated sets, apply
+    evaluation class aliases, optional mask-capacity GT trim (sidebar), then
+    compute with category-aware matching. Omni3D sweep runs without a progress
+    callback so ablation stays light on UI updates.
+    """
+    eval_rows, _n_inferred = _prepare_batch_results_for_eval(batch_results)
+    eval_rows = _apply_eval_category_aliases(eval_rows)
+    trim_gt_by_mask_capacity = bool(
+        st.session_state.get("eval_trim_gt_by_mask_capacity_enabled", True)
+    )
+    max_masks_hint = int(st.session_state.get("eval_mask_capacity_max", 0) or 0)
+    if trim_gt_by_mask_capacity:
+        trimmed = _trim_far_ground_truth_by_mask_capacity(
+            eval_rows,
+            max_masks_per_image=max_masks_hint,
+        )
+        eval_rows = trimmed[0]
     stats = compute_batch_statistics(
-        batch_results,
+        eval_rows,
         total_queued=total_queued,
-        match_by_category=False,
+        match_by_category=True,
+        omni3d_progress_callback=None,
     )
     m25 = stats["ap_25"]
     m50 = stats["ap_50"]
@@ -1606,6 +1625,8 @@ def _run_batch_with_params(
             frame_index=i,
             prev_image=None,
             preloaded_bbox_data=preloaded_bbox_data,
+            saved_image_path=str(sample_desc.get("image_path") or ""),
+            saved_point_cloud_path=str(sample_desc.get("point_cloud_path") or ""),
         )
         if export_res is not None:
             results.append(export_res)
@@ -1943,6 +1964,12 @@ def _render_ablation_study_runner():
         end_idx = min(len(batch_samples), int(mini_start) + int(mini_size))
         selected_batch = batch_samples[int(mini_start):end_idx]
     st.caption(f"Selected samples for rerun: **{len(selected_batch)}**")
+    st.caption(
+        "Replay uses **`batch_samples` entries** (`dataset_path`, `dataset_type`, `sample_index`; "
+        "plus optional saved image/point-cloud paths) through the same batch pipeline helper as "
+        "**2_Detection**. Metrics match **Batch Evaluation**: inferred empty GT for annotated loaders, "
+        "class aliases, sidebar **GT mask-capacity trim**, and **match_by_category** scoring."
+    )
 
     cfg1, cfg2 = st.columns(2)
     with cfg1:
@@ -1952,7 +1979,7 @@ def _render_ablation_study_runner():
             index=0,
         )
     with cfg2:
-        eps_raw = st.text_input("Adaptive DBSCAN eps sweep", "0.20,0.30,0.40,0.50,0.70,0.90")
+        eps_raw = st.text_input("DBSCAN eps sweep", "0.20,0.30,0.40,0.50,0.70,0.90")
     run_mode = st.radio(
         "Ablation run mode",
         ["Ground removal only", "DBSCAN epsilon only", "Run both"],
@@ -1973,86 +2000,90 @@ def _render_ablation_study_runner():
         st.warning("Provide at least one epsilon value.")
         return
 
-    if not st.button("🚀 Run Selected Ablation", type="primary"):
-        payload = st.session_state.get("ablation_study_payload")
-        per_class_payload = st.session_state.get("ablation_study_per_class_payload")
-        if payload:
-            st.caption("Cached ablation results available below.")
-            st.dataframe(pd.DataFrame(payload), width="stretch")
-        if per_class_payload:
-            st.caption("Cached per-class ablation results available below.")
-            st.dataframe(pd.DataFrame(per_class_payload), width="stretch")
+    run_clicked = st.button("🚀 Run Selected Ablation", type="primary")
+    payload = st.session_state.get("ablation_study_payload")
+    per_class_payload = st.session_state.get("ablation_study_per_class_payload")
+
+    if run_clicked:
+        detection_mod = _load_detection_page_module()
+        if "params" in st.session_state and st.session_state.params:
+            base_params = copy.deepcopy(st.session_state.params)
+            detection_mod.ensure_detection_params(base_params)
+        else:
+            base_params = detection_mod.default_detection_params()
+            detection_mod.ensure_detection_params(base_params)
+        base_original = copy.deepcopy(base_params)
+        preloaded_bbox_data = st.session_state.get("_batch_bbox_data")
+        total_queued = len(selected_batch)
+
+        rows: List[Dict] = []
+        per_class_rows: List[Dict] = []
+        run_ground = run_mode in {"Ground removal only", "Run both"}
+        run_dbscan = run_mode in {"DBSCAN epsilon only", "Run both"}
+
+        if run_ground:
+            ground_variants: List[Tuple[str, Dict]] = []
+            p_auto = copy.deepcopy(base_original)
+            ground_variants.append(("scene-aware-ground", p_auto))
+            p_outdoor = copy.deepcopy(base_original)
+            p_outdoor["pipeline_indoor"] = copy.deepcopy(p_outdoor["pipeline"])
+            ground_variants.append(("single-outdoor-ground", p_outdoor))
+            p_indoor = copy.deepcopy(base_original)
+            p_indoor["pipeline"] = copy.deepcopy(p_indoor["pipeline_indoor"])
+            ground_variants.append(("single-indoor-ground", p_indoor))
+
+            st.markdown("**Running ground-removal ablation...**")
+            for variant_name, params_variant in ground_variants:
+                results = _run_batch_with_params(detection_mod, selected_batch, params_variant, preloaded_bbox_data)
+                stats_all, class_all = _compute_eval_stats_with_per_class(results, total_queued=total_queued)
+                rows.append({"study": "ground_removal", "variant": variant_name, "scene": "all", **stats_all})
+                per_class_rows.extend(
+                    [{"study": "ground_removal", "variant": variant_name, "scene": "all", **r} for r in class_all]
+                )
+                for scene in ["indoor", "outdoor"]:
+                    subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
+                    if subset:
+                        scene_stats, scene_class = _compute_eval_stats_with_per_class(subset, len(subset))
+                        rows.append({"study": "ground_removal", "variant": variant_name, "scene": scene, **scene_stats})
+                        per_class_rows.extend(
+                            [{"study": "ground_removal", "variant": variant_name, "scene": scene, **r} for r in scene_class]
+                        )
+
+        if run_dbscan:
+            st.markdown("**Running DBSCAN epsilon ablation...**")
+            for eps in eps_values:
+                p_eps = copy.deepcopy(base_original)
+                p_eps["clustering"]["clustering_algorithm"] = "dbscan"
+                p_eps["clustering"]["dbscan_eps"] = float(eps)
+                results = _run_batch_with_params(detection_mod, selected_batch, p_eps, preloaded_bbox_data)
+                stats_all, class_all = _compute_eval_stats_with_per_class(results, total_queued=total_queued)
+                rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": "all", **stats_all})
+                per_class_rows.extend(
+                    [{"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": "all", **r} for r in class_all]
+                )
+                for scene in ["indoor", "outdoor"]:
+                    subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
+                    if subset:
+                        scene_stats, scene_class = _compute_eval_stats_with_per_class(subset, len(subset))
+                        rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": scene, **scene_stats})
+                        per_class_rows.extend(
+                            [{"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": scene, **r} for r in scene_class]
+                        )
+
+        st.session_state.params = base_original
+        st.session_state.ablation_study_payload = rows
+        st.session_state.ablation_study_per_class_payload = per_class_rows
+        payload = rows
+        per_class_payload = per_class_rows
+
+    if not payload:
+        st.caption("Run ablation once to populate results and downloads.")
         return
 
-    detection_mod = _load_detection_page_module()
-    if "params" in st.session_state and st.session_state.params:
-        base_params = copy.deepcopy(st.session_state.params)
-        detection_mod.ensure_detection_params(base_params)
-    else:
-        base_params = detection_mod.default_detection_params()
-        detection_mod.ensure_detection_params(base_params)
-    base_original = copy.deepcopy(base_params)
-    preloaded_bbox_data = st.session_state.get("_batch_bbox_data")
-    total_queued = len(selected_batch)
+    if not run_clicked:
+        st.caption("Showing cached ablation results.")
 
-    rows: List[Dict] = []
-    per_class_rows: List[Dict] = []
-    run_ground = run_mode in {"Ground removal only", "Run both"}
-    run_dbscan = run_mode in {"DBSCAN epsilon only", "Run both"}
-
-    if run_ground:
-        ground_variants: List[Tuple[str, Dict]] = []
-        p_auto = copy.deepcopy(base_original)
-        ground_variants.append(("scene-aware-ground", p_auto))
-        p_outdoor = copy.deepcopy(base_original)
-        p_outdoor["pipeline_indoor"] = copy.deepcopy(p_outdoor["pipeline"])
-        ground_variants.append(("single-outdoor-ground", p_outdoor))
-        p_indoor = copy.deepcopy(base_original)
-        p_indoor["pipeline"] = copy.deepcopy(p_indoor["pipeline_indoor"])
-        ground_variants.append(("single-indoor-ground", p_indoor))
-
-        st.markdown("**Running ground-removal ablation...**")
-        for variant_name, params_variant in ground_variants:
-            results = _run_batch_with_params(detection_mod, selected_batch, params_variant, preloaded_bbox_data)
-            stats_all, class_all = _compute_eval_stats_with_per_class(results, total_queued=total_queued)
-            rows.append({"study": "ground_removal", "variant": variant_name, "scene": "all", **stats_all})
-            per_class_rows.extend(
-                [{"study": "ground_removal", "variant": variant_name, "scene": "all", **r} for r in class_all]
-            )
-            for scene in ["indoor", "outdoor"]:
-                subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
-                if subset:
-                    scene_stats, scene_class = _compute_eval_stats_with_per_class(subset, len(subset))
-                    rows.append({"study": "ground_removal", "variant": variant_name, "scene": scene, **scene_stats})
-                    per_class_rows.extend(
-                        [{"study": "ground_removal", "variant": variant_name, "scene": scene, **r} for r in scene_class]
-                    )
-
-    if run_dbscan:
-        st.markdown("**Running adaptive DBSCAN epsilon ablation...**")
-        for eps in eps_values:
-            p_eps = copy.deepcopy(base_original)
-            p_eps["clustering"]["clustering_algorithm"] = "adaptive_dbscan"
-            p_eps["clustering"]["adaptive_dbscan_base_eps"] = float(eps)
-            results = _run_batch_with_params(detection_mod, selected_batch, p_eps, preloaded_bbox_data)
-            stats_all, class_all = _compute_eval_stats_with_per_class(results, total_queued=total_queued)
-            rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": "all", **stats_all})
-            per_class_rows.extend(
-                [{"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": "all", **r} for r in class_all]
-            )
-            for scene in ["indoor", "outdoor"]:
-                subset = [r for r in results if _infer_scene_bucket(r.get("metadata", {})) == scene]
-                if subset:
-                    scene_stats, scene_class = _compute_eval_stats_with_per_class(subset, len(subset))
-                    rows.append({"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": scene, **scene_stats})
-                    per_class_rows.extend(
-                        [{"study": "dbscan_eps", "variant": f"eps={eps:.2f}", "eps": float(eps), "scene": scene, **r} for r in scene_class]
-                    )
-
-    st.session_state.params = base_original
-    st.session_state.ablation_study_payload = rows
-    st.session_state.ablation_study_per_class_payload = per_class_rows
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(payload)
     st.dataframe(df, width="stretch")
     st.download_button(
         "⬇️ Download ablation metrics (CSV)",
@@ -2061,7 +2092,7 @@ def _render_ablation_study_runner():
         mime="text/csv",
         width="stretch",
     )
-    per_class_df = pd.DataFrame(per_class_rows)
+    per_class_df = pd.DataFrame(per_class_payload or [])
     if not per_class_df.empty:
         st.markdown("**Per-class ablation metrics**")
         st.dataframe(per_class_df, width="stretch")
@@ -2128,9 +2159,9 @@ def _render_ablation_study_runner():
         for scene in [s for s in ["indoor", "outdoor", "all"] if s in set(eps_df["scene"].tolist())]:
             dd = eps_df[eps_df["scene"] == scene].sort_values("eps")
             ax2.plot(dd["eps"].to_numpy(dtype=float), dd[metric_col].to_numpy(dtype=float) * 100, marker="o", linewidth=2.0, label=scene)
-        ax2.set_xlabel("Adaptive DBSCAN base epsilon")
+        ax2.set_xlabel("DBSCAN epsilon")
         ax2.set_ylabel(f"{primary_metric} (%)")
-        ax2.set_title("Adaptive DBSCAN Epsilon Sensitivity")
+        ax2.set_title("DBSCAN Epsilon Sensitivity")
         ax2.grid(True, linestyle="--", alpha=0.35)
         ax2.legend()
         st.pyplot(fig2, width="stretch")
