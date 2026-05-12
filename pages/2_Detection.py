@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 
 import cv2
+from matplotlib import patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
@@ -128,6 +129,65 @@ def _render_point_cloud_plot(
         use_container_width=use_container_width,
         show_legend=show_legend,
     )
+
+
+# Step 3 mask overlay (matplotlib): tune class/confidence labels on each box.
+STEP3_MASK_VIZ_LABEL_FONT_SIZE = 10 * 2.5
+# Step 3 figure title / caption (single line above the image).
+STEP3_CAPTION_FONT_SIZE = 10 * 2.5
+STEP3_CAPTION_TEXT = "3D Mask on SIM dataset"
+# Step 3 matplotlib overlay: toggle figure title and per-mask class/confidence text.
+SHOW_CAPTION = False
+SHOW_MASK_LABELS = False
+
+
+def _step3_build_mask_overlay_figure(
+    image: np.ndarray,
+    sam_masks: List[np.ndarray],
+    colors: List[Tuple[float, float, float]],
+    mask_bboxes: List,
+    detected_class_names: List[str],
+    confidences: List,
+    mask_alpha: float = 0.5,
+) -> plt.Figure:
+    """
+    Matplotlib figure for Step 3 (mask tint + 2D boxes + optional class/confidence labels).
+    Title: ``SHOW_CAPTION``, ``STEP3_CAPTION_TEXT``, ``STEP3_CAPTION_FONT_SIZE``.
+    Labels: ``SHOW_MASK_LABELS``, ``STEP3_MASK_VIZ_LABEL_FONT_SIZE``.
+    """
+    img_with_masks = overlay_masks_on_image(image, sam_masks, colors, alpha=mask_alpha)
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    ax.imshow(img_with_masks)
+    ax.axis("off")
+    fs = STEP3_MASK_VIZ_LABEL_FONT_SIZE
+    text_y_pad = max(fs * 0.55, 18.0)
+    for i, (bbox, class_name, confidence) in enumerate(
+        zip(mask_bboxes, detected_class_names, confidences)
+    ):
+        if bbox and len(bbox) == 4:
+            x1, y1, x2, y2 = bbox
+            rect = mpatches.Rectangle(
+                (x1, y1),
+                x2 - x1,
+                y2 - y1,
+                linewidth=2,
+                edgecolor=colors[i],
+                facecolor="none",
+            )
+            ax.add_patch(rect)
+            if SHOW_MASK_LABELS:
+                label = f"{class_name}: {confidence:.2f}" if confidence is not None else class_name
+                ax.text(
+                    x1,
+                    y1 - text_y_pad,
+                    label,
+                    color=colors[i],
+                    fontsize=fs,
+                    bbox=dict(boxstyle="round,pad=0.45", facecolor="black", alpha=0.7),
+                )
+    if SHOW_CAPTION:
+        ax.set_title(STEP3_CAPTION_TEXT, fontsize=STEP3_CAPTION_FONT_SIZE)
+    return fig
 
 
 def _update_mask_capacity_hint(step_3_result: Optional[Dict], sample_meta_data: Dict) -> None:
@@ -2589,10 +2649,8 @@ def main():
                     sparse_depth = result['sparse_depth_map']
                     fig, ax = plt.subplots(figsize=(8, 6))
                     vmax = sparse_depth[sparse_depth > 0].max() if np.sum(sparse_depth > 0) > 0 else 100.0
-                    im = ax.imshow(sparse_depth, cmap='viridis', vmin=0, vmax=vmax)
-                    ax.set_title("Sparse Depth Map")
+                    ax.imshow(sparse_depth, cmap='viridis', vmin=0, vmax=vmax)
                     ax.axis('off')
-                    plt.colorbar(im, ax=ax, label="Depth (m)")
                     st.pyplot(fig)
                     plt.close()
                 
@@ -2771,30 +2829,17 @@ def main():
                 
                 # 2D Visualization: Masks overlay with bounding boxes and labels
                 st.markdown("#### 2D Mask Visualization")
-                img_with_masks = overlay_masks_on_image(image, sam_masks, colors, alpha=0.5)
-                
-                # Draw bounding boxes and labels with confidence scores
-                import matplotlib.patches as patches
-                fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-                ax.imshow(img_with_masks)
-                ax.axis('off')
-                
-                for i, (bbox, class_name, confidence) in enumerate(zip(mask_bboxes, detected_class_names, confidences)):
-                    if bbox and len(bbox) == 4:
-                        x1, y1, x2, y2 = bbox
-                        rect = patches.Rectangle(
-                            (x1, y1), x2 - x1, y2 - y1,
-                            linewidth=2, edgecolor=colors[i], facecolor='none'
-                        )
-                        ax.add_patch(rect)
-                        # Add label with confidence
-                        label = f"{class_name}: {confidence:.2f}" if confidence is not None else class_name
-                        ax.text(x1, y1 - 5, label, color=colors[i], fontsize=10, 
-                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
-                
-                ax.set_title("Detected Objects with Masks, Bounding Boxes, and Confidence Scores")
+                fig = _step3_build_mask_overlay_figure(
+                    image=image,
+                    sam_masks=sam_masks,
+                    colors=colors,
+                    mask_bboxes=mask_bboxes,
+                    detected_class_names=detected_class_names,
+                    confidences=confidences,
+                    mask_alpha=0.5,
+                )
                 st.pyplot(fig)
-                plt.close()
+                plt.close(fig)
                 
                 # Summary table of detected objects
                 if detected_class_names:
