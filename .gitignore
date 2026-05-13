@@ -7,7 +7,6 @@ v1.0-trainval01_blobs.tgz
 dataset/
 .venv/
 __pycache__/
-*.png
 *.jpg
 *.jpeg
 *.gif
