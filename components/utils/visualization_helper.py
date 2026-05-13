@@ -1321,7 +1321,7 @@ def render_point_cloud_plot(
     }
 
     if use_container_width:
-        st.plotly_chart(fig, use_container_width=True, config=export_config)
+        st.plotly_chart(fig, width="stretch", config=export_config)
     else:
         st.plotly_chart(fig, config=export_config)
 
