@@ -737,7 +737,7 @@ def _render_single_sample_eval():
     """Render the per-sample evaluation panel."""
     sample = st.session_state.sample
     sample_meta_data = sample['sample_meta_data']
-    detected_cuboids = st.session_state.cuboids
+    detected_cuboids = list(st.session_state.get("cuboids") or [])
 
     ground_truth_boxes: List[Dict] = []
     if 'export_results' in st.session_state and 'ground_truth_cuboids' in st.session_state.export_results:
@@ -2193,12 +2193,10 @@ def main():
         and st.session_state.batch_export_results.get("samples")
     )
     has_batch_selection = bool(st.session_state.get("batch_samples"))
-    has_single = (
-        'sample' in st.session_state
-        and st.session_state.sample is not None
-        and 'cuboids' in st.session_state
-        and st.session_state.cuboids
-    )
+    # Single-sample eval must not require non-empty detections: empty `cuboids`
+    # is valid (all-FN / empty frame), and `cuboids` may be unset until Step 5
+    # while `sample` + `ground_truth_annotations` already exist from extraction.
+    has_single = st.session_state.get("sample") is not None
 
     if "eval_trim_gt_by_mask_capacity_enabled" not in st.session_state:
         st.session_state["eval_trim_gt_by_mask_capacity_enabled"] = True

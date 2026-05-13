@@ -281,6 +281,9 @@ def default_detection_params() -> Dict:
         "use_gpu": True,
         "sunrgbd_use_label_bboxes_step3": False,
         "use_gt_2d_bboxes_step3": False,
+        # When Step 3 uses dataset GT 2D boxes: comma/newline-separated class names from the
+        # label file. Empty means include every GT instance with a valid 2D box.
+        "gt_step3_target_classes_text": "",
     }
 
 
@@ -491,6 +494,82 @@ def _get_current_sam_integration(
     return sam_integration
 
 
+def _resolve_ground_truth_boxes_for_sample(
+    sample_meta_data: Dict,
+    image_shape: Tuple[int, ...],
+) -> List[Dict[str, Any]]:
+    """
+    Same GT 2D box list as Step 3 uses: ``sample_meta_data['ground_truth_boxes']`` when present,
+    else SUNRGBD lazy-load from ``annotation_path`` / scene label files.
+    """
+    dataset_type = str(sample_meta_data.get("dataset_type", "")).lower()
+    gt_boxes = list(sample_meta_data.get("ground_truth_boxes", []) or [])
+    if not gt_boxes and dataset_type == "sunrgbd":
+        annotation_path = sample_meta_data.get("annotation_path")
+        if not annotation_path:
+            scene_root = sample_meta_data.get("scene_root")
+            scene_id = sample_meta_data.get("scene_id")
+            if scene_root and scene_id:
+                base_root = Path(scene_root)
+                label_v2 = base_root / "label" / f"{scene_id}.txt"
+                label_v1 = base_root / "label_v1" / f"{scene_id}.txt"
+                if label_v1.exists():
+                    annotation_path = str(label_v1)
+                elif label_v2.exists():
+                    annotation_path = str(label_v2)
+        if annotation_path:
+            gt_boxes = SUNRGBDDatasetLoader._load_ground_truth_boxes(annotation_path, image_shape)
+    return gt_boxes
+
+
+def _parse_gt_step3_target_class_text(text: Optional[str]) -> List[str]:
+    """Split comma/newline-separated class names for GT Step 3 filtering. Empty input → []."""
+    if text is None:
+        return []
+    raw = str(text).strip()
+    if not raw:
+        return []
+    names: List[str] = []
+    for line in raw.replace("\r\n", "\n").split("\n"):
+        for chunk in line.split(","):
+            t = chunk.strip()
+            if t:
+                names.append(t)
+    return names
+
+
+def _class_names_for_step3_segmentation(params: Dict) -> List[str]:
+    """
+    Class list passed to ``step_3_sam_segmentation``.
+
+    Open-vocabulary path uses sidebar ``class_names``. GT-2D-box path uses
+    ``gt_step3_target_classes_text`` when set; an empty parsed list means no filter
+    (all annotation boxes with valid 2D).
+    """
+    use_gt = bool(
+        params.get("use_gt_2d_bboxes_step3", params.get("sunrgbd_use_label_bboxes_step3", False))
+    )
+    if use_gt:
+        return _parse_gt_step3_target_class_text(params.get("gt_step3_target_classes_text"))
+    return list(params.get("class_names") or [])
+
+
+def _unique_gt_annotation_labels(gt_boxes: List[Dict[str, Any]]) -> List[str]:
+    labels: set[str] = set()
+    for gt in gt_boxes:
+        bbox_2d = gt.get("bbox_2d")
+        if not isinstance(bbox_2d, dict):
+            continue
+        left = int(bbox_2d.get("left", 0))
+        top = int(bbox_2d.get("top", 0))
+        right = int(bbox_2d.get("right", 0))
+        bottom = int(bbox_2d.get("bottom", 0))
+        if right <= left or bottom <= top:
+            continue
+        labels.add(str(gt.get("class", gt.get("category", "Unknown"))))
+    return sorted(labels)
+
+
 def _build_step3_from_bboxes(
     bbox_data: Dict,
     image: np.ndarray,
@@ -608,22 +687,7 @@ def _build_step3_from_gt_2d_bboxes(
     }
 
     dataset_type = str(sample_meta_data.get("dataset_type", "")).lower()
-    gt_boxes = sample_meta_data.get("ground_truth_boxes", []) or []
-    if not gt_boxes and dataset_type == "sunrgbd":
-        annotation_path = sample_meta_data.get("annotation_path")
-        if not annotation_path:
-            scene_root = sample_meta_data.get("scene_root")
-            scene_id = sample_meta_data.get("scene_id")
-            if scene_root and scene_id:
-                base_root = Path(scene_root)
-                label_v2 = base_root / "label" / f"{scene_id}.txt"
-                label_v1 = base_root / "label_v1" / f"{scene_id}.txt"
-                if label_v1.exists():
-                    annotation_path = str(label_v1)
-                elif label_v2.exists():
-                    annotation_path = str(label_v2)
-        if annotation_path:
-            gt_boxes = SUNRGBDDatasetLoader._load_ground_truth_boxes(annotation_path, image.shape)
+    gt_boxes = _resolve_ground_truth_boxes_for_sample(sample_meta_data, image.shape)
 
     annotations: List[Dict[str, Any]] = []
     sam_masks: List[np.ndarray] = []
@@ -707,7 +771,9 @@ def step_3_sam_segmentation(
         sample_meta_data: Sample metadata
         image: HxWx3 RGB image
         sparse_points: Nx3 array of backprojected sparse depth points
-        class_names: List of class names to detect (e.g., ["car", "person", "bicycle"])
+        class_names: List of class names for open-vocabulary segmentation, or for the
+            dataset-GT-2D path a filter list parsed from ``gt_step3_target_classes_text``;
+            when that list is empty, every GT instance with a valid 2D box is used.
         sam_model_type: 'sam2_t' or 'sam3'
         yolo_model_path: Optional path to YOLO-World model (SAM2 + YOLO detector)
         conf_threshold: Confidence threshold for open-vocab detections (default: 0.25)
@@ -1336,7 +1402,7 @@ def run_full_pipeline(params: Dict, preloaded_bbox_data: Optional[Dict] = None) 
             projection=step_2_result['projection'],
         )
     else:
-        class_names = params.get('class_names', [])
+        class_names = _class_names_for_step3_segmentation(params)
         print(f'class_names: {class_names}')
         step_3_result = step_3_sam_segmentation(
             sample_meta_data=st.session_state.sample['sample_meta_data'],
@@ -2081,7 +2147,8 @@ def main():
             ),
             help=(
                 "Use dataset ground-truth 2D boxes to build Step 3 masks instead of open-vocabulary "
-                "2D detection. Supported for KITTI and SUNRGBD."
+                "2D detection. Supported for KITTI and SUNRGBD. When enabled, use the Step 3 text area "
+                "to filter by label class names, or leave it empty for all GT boxes."
             ),
         )
         st.session_state.params["use_gt_2d_bboxes_step3"] = _gt_bbox_override
@@ -2721,13 +2788,56 @@ def main():
             st.caption("Generate SAM masks and assign points to masks")
             if not step_2_completed:
                 st.warning("⚠️ Requires Step 2")
+            else:
+                _ds_gt = (sample_meta_data.get("dataset_type") or "").lower()
+                _use_gt_2d = bool(
+                    st.session_state.params.get(
+                        "use_gt_2d_bboxes_step3",
+                        st.session_state.params.get("sunrgbd_use_label_bboxes_step3", False),
+                    )
+                )
+                if _use_gt_2d and _ds_gt in {"sunrgbd", "kitti"}:
+                    st.markdown("##### GT Step 3: annotation class filter")
+                    _gt_boxes_preview = _resolve_ground_truth_boxes_for_sample(
+                        sample_meta_data, image.shape
+                    )
+                    _ann_labels = _unique_gt_annotation_labels(_gt_boxes_preview)
+                    if _ann_labels:
+                        st.caption(
+                            "Classes with a valid 2D box in this sample: "
+                            + ", ".join(_ann_labels)
+                        )
+                    else:
+                        st.caption(
+                            "No GT 2D boxes in sample metadata or SUNRGBD label files for this frame."
+                        )
+                    _ta_key = "gt_step3_target_classes_text_area"
+                    if _ta_key not in st.session_state:
+                        st.session_state[_ta_key] = st.session_state.params.get(
+                            "gt_step3_target_classes_text", ""
+                        )
+                    _entered = st.text_area(
+                        "Target classes (comma or newline; optional)",
+                        height=88,
+                        placeholder=(
+                            "e.g. chair, table, bed\n"
+                            "Leave empty to include every GT box from the annotation."
+                        ),
+                        help=(
+                            "Names must match the dataset label (case-insensitive). "
+                            "Empty field uses all ground-truth 2D boxes. "
+                            "Sidebar “Class names” is not used for this Step 3 mode."
+                        ),
+                        key=_ta_key,
+                    )
+                    st.session_state.params["gt_step3_target_classes_text"] = _entered
         
         with col2:
             if st.button("▶️ Run Step 3", key="run_step_3", disabled=not step_2_completed):
                 with st.spinner("Running Step 3..."):
                     try:
                         step_2_result = st.session_state.pipeline_state['step_2']['result']
-                        class_names = st.session_state.params.get('class_names', ['car', 'person', 'bicycle'])
+                        class_names = _class_names_for_step3_segmentation(st.session_state.params)
                         result = step_3_sam_segmentation(
                             sample_meta_data=sample_meta_data,
                             image=image,

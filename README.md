@@ -2,6 +2,7 @@
 
 Streamlit application for loading autonomous-driving datasets, running a 3D object detection pipeline, evaluating results, and exporting annotations and outputs.
 
+
 ## What This Project Does
 
 The app is split into four Streamlit pages that share state through `st.session_state`:
@@ -10,6 +11,22 @@ The app is split into four Streamlit pages that share state through `st.session_
 2. `2_Detection` runs the detection pipeline step by step or end to end.
 3. `3_Evaluation` compares detections with ground truth and computes metrics.
 4. `4_Export` writes results to JSON, KITTI-style tracklets, and CVAT-compatible exports.
+
+## Pipeline UI
+
+Screenshots of the main Streamlit pages, in workflow order:
+
+### Dataset extraction (`1_Dataset_Extraction`)
+
+![Dataset Extraction page](images/1_Dataset_Extraction.png)
+
+### Detection (`2_Detection`)
+
+![Detection page](images/2_Detection.png)
+
+### Evaluation (`3_Evaluation`)
+
+![Evaluation page](images/3_Evaluation.png)
 
 ## Recommended Workflow
 
@@ -172,6 +189,7 @@ components/utils/           # Export and visualization helpers
 models/                     # Pretrained model weights and configs
 dataset/                    # Example/working data inputs
 output/                     # Generated results and exports
+images/                     # README screenshots and other static images
 ```
 
 ## Practical Tips
